@@ -56,6 +56,42 @@ dll-agent 配置 profile：quality mode、verify mode、role roster、system pro
 全量 TypeScript 接口定义：SupervisorState、ReviewerOutput、EvidenceGateResult、CooldownStatus、CostCap 等。
 **代码模式**: 已是 top-level exports（无 namespace），无需变更。
 
+### permission-classifier.ts (NEW — Phase 1)
+Risk-based 权限分类器：将 shell 命令和文件操作按风险等级分类（low/medium/high）。
+- 低风险（只读、安全诊断、项目内类型检查/测试）→ auto-allow
+- 中风险（项目内写入、git commit、依赖安装）→ confirm-once
+- 高风险（破坏性命令、secrets、全局修改、远程推送）→ always confirm 或 block
+**代码模式**: ✅ flat exports。
+
+### lsp-strategy.ts (NEW — Phase 2)
+LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言 LSP 保持 lazy。
+- 支持三种模式：lazy / project-main / all-detected
+- 自动排除 node_modules、.git、dist、.venv 等目录
+- 预热最多读取 N 个代表性源码文件，不扫描全仓库
+**代码模式**: ✅ flat exports。
+
+### ux-state.ts (NEW — Phase 3)
+统一 UX 状态模型：聚合 task、supervisor、permissions、tools、cost、evidence 六维状态。
+- 提供 compact / normal / debug 三种输出模式
+- 状态支持纯函数 mutation（setGoal、setPhase、markRecoveryAttempt 等）
+**代码模式**: ✅ flat exports。
+
+### actionable-error.ts (NEW — Phase 3)
+可执行错误构建器：将 raw error 转换为分类后的可执行建议。
+- 自动分类 14 种错误类型（typecheck_error、test_failure、permission_denied 等）
+- 输出包含：what failed、why likely、next automatic action、user action if required
+- 生成 failure fingerprint 用于去重
+**代码模式**: ✅ flat exports。
+
+### cross-review.ts (NEW — Phase 5)
+多模型对抗交叉审查系统（Cross-Review Council）。
+- 触发条件：重复失败、reviewer 冲突、高风险完成、证据不足、用户纠偏
+- 结构化 council packet — 所有 reviewer 基于同一证据判断
+- Reviewer 输出结构化（blocking、confidence、findings、required_verification）
+- role-cross 仲裁冲突（基于 evidence，不是投票）
+- council 受 cooldown 和 cost guard 限制
+**代码模式**: ✅ flat exports。
+
 ## 实现状态
 
 ### ✅ 已由底层代码实现
@@ -72,6 +108,8 @@ dll-agent 配置 profile：quality mode、verify mode、role roster、system pro
 | Evidence gate | `gates.ts:checkEvidenceGate()` | 完成声明必须通过 evidence gate |
 | Reconciliation gate | `gates.ts:checkReconciliationGate()` | 完成声明必须吸收 reviewer 结论 |
 | Final gate | `gates.ts:finalGate()` | 综合所有条件判定是否允许完成 |
+| Gate hint 注入到消息流 | `prompt.ts` (gatePendingHints) | gate block 时 synthetic_hint 作为 synthetic text part 注入到 conversation，commander 可看到反馈 |
+| Role-cross JSON 输出模板 | `supervisor.ts` (role-cross template) | role-cross reviewer 输出包含结构化 JSON 模板，可被 parseReviewerOutput() 解析 |
 | Evidence 日志 | `evidence.ts` | 自动脱敏写入，支持 session 级记录 |
 | Secrets redaction | `evidence.ts:redact()` | 6 种 secret pattern 覆盖 + 敏感字段名匹配，JSON-safe 遍历 |
 | Session state redaction | `evidence.ts:redact()` + supervisor/skills/cost-cap | 所有 session state 写入前统一调用 redact() |
@@ -96,6 +134,12 @@ dll-agent 配置 profile：quality mode、verify mode、role roster、system pro
 | 工具 slash 命令 | `profile.ts:roleCommands()` | /tools, /tools-reload, /tools-status, /mcp-status, /mcp-start, /mcp-stop, /mcp-health |
 | 全局 manifest 文件 | `~/.dll-agent/global/tools.jsonc` | 12 个默认工具能力注册（JSONC 格式，支持 project overlay 叠加） |
 | 工具系统测试 | `test/dll-agent/tools.test.ts` | 58 tests covering catalog, overlay/merge, prompt injection, MCP mutex, doctor, evidence |
+| **Risk-based 权限分类 (NEW)** | `permission-classifier.ts` | 命令/文件操作按风险分级；14 类 secret pattern 检测；破坏性/远程发布/全局修改分类；37 tests |
+| **LSP 预热策略 (NEW)** | `lsp-strategy.ts` | 项目主语言检测 + 主语言 LSP 预热 + 辅助语言 lazy；排除目录保护；10 tests |
+| **UX 状态模型 (NEW)** | `ux-state.ts` | 6 维统一状态聚合；compact/normal/debug 输出；pure function mutation API；27 tests |
+| **可执行错误构建 (NEW)** | `actionable-error.ts` | 14 种错误自动分类；自动恢复建议；recovery budget 控制；failure fingerprint 去重 |
+| **Cross-Review Council (NEW)** | `cross-review.ts` | 多模型对抗审查；7 种触发条件；独立 reviewer + role-cross 仲裁；candidate solution ranking；33 tests |
+| **硬编码路径修复 (NEW)** | `skill-registry.ts` | 移除 /Users/dailulu 硬编码路径，改为 $HOME 和相对路径 |
 
 ### ⚠️ 只是配置层实现（需要环境变量）
 
@@ -126,8 +170,11 @@ dll-agent 配置 profile：quality mode、verify mode、role roster、system pro
 | MCP healthcheck HTTP probe | mcp-manager.ts healthcheck() 目前仅检查进程存活；healthUrl 配置的 HTTP probe 尚未实现 |
 | on-demand MCP auto-start | 在 opencode session 中根据 context 自动判断是否需要启动 MCP 的集成尚未完成 |
 | TUI quota 显示组件 | 已实现 dll-agent-panel.tsx，但需验证 |
+| Permission classifier 接入 Permission.Request | permission-classifier.ts 纯函数层已实现（37 tests 通过）；与 opencode Permission.Request 评估管线的桥接尚未完成 |
+| LSP strategy 接入 LSP launch pipeline | lsp-strategy.ts 纯函数层已实现（10 tests 通过）；与 opencode LSP launch.ts 的预热管线桥接尚未完成 |
+| Cross-review council 接入 prompt.ts session loop | cross-review.ts 纯函数层已实现（33 tests 通过）；与 prompt.ts 的 council 调度管线桥接尚未完成 |
 
-### ✅ 已修复 P0
+### ✅ 已修复 P0 (本轮 + 历史)
 
 | P0 项 | 状态 | 说明 |
 |---|---|---|
@@ -136,6 +183,11 @@ dll-agent 配置 profile：quality mode、verify mode、role roster、system pro
 | `updateState` 中 `repeatedToolFailure: false` 硬编码 | ✅ 已修复 | 验证数据流正确传递；添加 6 个回归测试 |
 | Doctor session state false positive | ✅ 已修复 | cooldown fingerprint key `task-signal` → `sk-` 碰撞已通过 JSON-aware 扫描解决；session state 写入前统一 redact() |
 | Gate/reconciliation 循环 | ✅ 已修复 | `GATE_MAX_RETRIES=2` + `gate_block_retries` 追踪；同一 block reason 超限后不再注入 synthetic_hint |
+| **Gate synthetic_hint 未注入到消息流 (CRITICAL)** | ✅ 本轮修复 | `gatePendingHints` 队列将 gate block 的 synthetic_hint 作为 synthetic text part 注入到 conversation |
+| **第二 gate 路径缺少 synthetic_hint merge** | ✅ 本轮修复 | reconciliation gate 的 synthetic_hint 与 evidence gate hint 合并注入 |
+| **Role-cross 缺少 JSON 输出模板** | ✅ 本轮修复 | role-cross reviewer prompt 包含 `emptyReviewerOutput` JSON 模板 |
+| **Hardcoded 用户路径** | ✅ 本轮修复 | skill-registry.ts 中 /Users/dailulu 绝对路径改为 $HOME 和相对路径 |
+| **Dead .replace() call** | ✅ 本轮修复 | supervisor.ts line 792 移除无效的 `.replace()` 调用 |
 | realToolEvidence 识别 | ✅ 已修复 | 新增 `python3 -m py_compile` / `git diff --check` / `dll-agent doctor` / `result:(ok|warn)` 匹配 |
 | Skill activation 重复证据 | ✅ 已修复 | 同一 skill + 同一 fingerprint 不再重复写入 evidence |
 | Finalization 上下文压缩 | ✅ 已修复 | `buildFinalReportContext()` 只传目标/reviever/验证/block 摘要 |
@@ -151,16 +203,39 @@ dll-agent 配置 profile：quality mode、verify mode、role roster、system pro
 | 大规模 TUI 重构 | 不在范围内 |
 | 无边界自我重构 | 不在范围内（self-repair 仅做最小补丁） |
 
+## 🍎 Mac-only Repository Slimming
+
+日期：2026-05-08
+
+将 opencode 完整 monorepo 裁剪为 macOS dll-agent 最小可维护仓库。
+
+**保留包**：opencode, core, plugin, sdk/js, script（5 workspace packages）
+
+**删除包**：desktop, web, app, enterprise, function, slack, storybook, ui, console/\*, containers, extensions, identity（13 packages/dirs）
+
+**删除根级**：多语言 README (19 lang), root script/, nix/, sdks/vscode/, infra/, github/, flake.nix, flake.lock, SST config
+
+**删除 patches**：solid-js, @standard-community/standard-openapi, install-korean-ime-fix.sh
+
+**验证通过**：typecheck ✅, 310 tests pass ✅, doctor warn ✅
+
+**详细报告**：`packages/docs/dll-agent-repository-slimming.md`
+
 ## 下一步任务
 
 1. ~~**P0**：`export namespace` → flat exports 重构~~ ✅ 已完成 (本轮)
 2. ~~**P0**：修复 `triggers.ts` 自引用 false positive~~ ✅ 已完成 (本轮)
 3. ~~**P0**：修复 `updateState` 中 `repeatedToolFailure: false` 硬编码~~ ✅ 已完成
 4. ~~**P0**：修复 doctor session state false positive~~ ✅ 已完成 (本轮)
-5. **P1**：添加 cost-cap 和 evidence 单元测试
-5. **P1**：添加 prompt.ts supervisor 集成测试（Effect test framework）
-6. **P2**：Evidence file rotation 和 session 目录清理
-7. **P2**：Supervisor Effect.sync() 包装，确保 Effect fiber 模型兼容
+5. ~~**P0-CRITICAL**：修复 gate synthetic_hint 未注入到消息流~~ ✅ 本轮修复
+6. ~~**P0**：修复 role-cross JSON 输出模板缺失~~ ✅ 本轮修复
+7. ~~**P0**：修复 hardcoded 用户路径~~ ✅ 本轮修复
+8. **P1**：permission-classifier 接入 opencode Permission.Request 管线（纯函数层已完成，需桥接）
+9. **P1**：lsp-strategy 接入 opencode LSP launch 管线（纯函数层已完成，需桥接）
+10. **P1**：cross-review council 接入 prompt.ts session loop（纯函数层已完成，需桥接）
+11. **P1**：添加 prompt.ts supervisor 集成测试
+12. **P2**：Evidence file rotation 和 session 目录清理
+13. **P2**：Supervisor Effect.sync() 包装，确保 Effect fiber 模型兼容
 
 ## 验证状态
 

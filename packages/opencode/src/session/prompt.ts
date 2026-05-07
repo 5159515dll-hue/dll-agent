@@ -1424,6 +1424,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         const supervisorPendingSubtasks: MessageV2.SubtaskPart[] = []
+        const gatePendingHints: string[] = []
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1640,6 +1641,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       risk: state.risk,
                       block_reason: gateResult.block_reason,
                     })
+                    gatePendingHints.push(gateResult.synthetic_hint)
 
                   // Phase 3+4: 高风险且无真证据 → 自动注入 verifier subtask（fallback agent）
                   if (state.risk === "high" && !metrics.realToolEvidence) {
@@ -1856,6 +1858,24 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const isLastStep = step >= maxSteps
           msgs = yield* insertReminders({ messages: msgs, agent, session })
 
+          // dll-agent: inject pending gate hints as synthetic text parts
+          if (gatePendingHints.length > 0) {
+            const hints = gatePendingHints.splice(0)
+            const userMsg = msgs.findLast((m) => m.info.role === "user")
+            if (userMsg) {
+              for (const hint of hints) {
+                userMsg.parts.push({
+                  id: PartID.ascending(),
+                  messageID: userMsg.info.id,
+                  sessionID: userMsg.info.sessionID,
+                  type: "text",
+                  text: hint,
+                  synthetic: true,
+                })
+              }
+            }
+          }
+
           const msg: MessageV2.Assistant = {
             id: MessageID.ascending(),
             parentID: lastUser.id,
@@ -2023,6 +2043,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   gateResult.block_reason = gateResult.block_reason
                     ? `${gateResult.block_reason}; ${reconResult.block_reason}`
                     : reconResult.block_reason
+                  gateResult.synthetic_hint = [gateResult.synthetic_hint, reconResult.synthetic_hint]
+                    .filter(Boolean)
+                    .join("\n")
                   evidenceWrite("gate.reconciliation_blocked", {
                     reason: reconResult.block_reason,
                     completed_reviews: state.completed_reviews,
@@ -2035,6 +2058,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     risk: state.risk,
                     block_reason: gateResult.block_reason,
                   })
+                  if (gateResult.synthetic_hint) gatePendingHints.push(gateResult.synthetic_hint)
                   continue
                 }
               } catch {
