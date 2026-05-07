@@ -6,6 +6,7 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { useTheme } from "@tui/context/theme"
 import { Locale } from "@/util/locale"
 import { enabled as dllEnabled, quality as dllQuality, verify as dllVerify } from "@/dll-agent/profile"
+import { idleAwareInterval, isIdleBySupervisorState } from "./dll-agent-idle"
 
 function enabled() {
   return dllEnabled()
@@ -91,14 +92,14 @@ function readCostStatus() {
   }
 }
 
-function readSessionCapUsd() {
+const SESSION_CAP_USD: number = (() => {
   const env = process.env.DLL_AGENT_COST_CAP_USD
   if (env) {
     const n = parseFloat(env)
     if (Number.isFinite(n) && n > 0) return n
   }
   return 5.0
-}
+})()
 
 function formatCostUsd(value: number) {
   if (!Number.isFinite(value) || value <= 0) return "$0.00"
@@ -140,11 +141,10 @@ function quotaLine(value: any) {
   return "unknown"
 }
 
-function quotaAgeLine() {
-  const q = readQuotaFile()
-  if (!q?.updated_at) return ""
-  const age = Math.floor((Date.now() / 1000 - q.updated_at))
-  const ttl = q.ttl_sec ?? 300
+function quotaAgeLine(value: any) {
+  if (!value?.updated_at) return ""
+  const age = Math.floor((Date.now() / 1000 - value.updated_at))
+  const ttl = value.ttl_sec ?? 300
   const stale = age > ttl
   const min = Math.floor(age / 60)
   const sec = age % 60
@@ -164,9 +164,20 @@ export function DllAgentHomeStatus() {
   })
   const width = createMemo(() => Math.max(62, Math.min(compact() ? 82 : 110, dimensions().width - 8)))
 
+  // Idle-aware: 15s active, 60s idle (quota doesn't change rapidly)
   onMount(() => {
-    const timer = setInterval(() => setQuota(readQuotaFile()), 15_000)
-    onCleanup(() => clearInterval(timer))
+    let lastAge = 0
+    const cleanup = idleAwareInterval(
+      () => {
+        const q = readQuotaFile()
+        setQuota(q)
+        lastAge = q?.updated_at ? (Date.now() / 1000 - q.updated_at) : 0
+      },
+      15_000,
+      60_000,
+      () => lastAge > 120,
+    )
+    onCleanup(cleanup)
   })
 
   return (
@@ -201,7 +212,7 @@ export function DllAgentHomeStatus() {
         <For each={["deepseek", "kimi", "openai", "zai"]}>
           {(name) => <text fg={theme.textMuted}>{name}: {quotaLine(quota()?.providers?.[name])}</text>}
         </For>
-        <text fg={theme.textMuted}>updated: {quotaAgeLine()}</text>
+        <text fg={theme.textMuted}>updated: {quotaAgeLine(quota())}</text>
       </box>
     </Show>
   )
@@ -242,11 +253,19 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
   const [costStatus, setCostStatus] = createSignal(readCostStatus())
 
   onMount(() => {
-    const timer = setInterval(() => {
-      setSupervisor(readSupervisorState())
-      setCostStatus(readCostStatus())
-    }, 5_000)
-    onCleanup(() => clearInterval(timer))
+    let lastUpdated = ""
+    const cleanup = idleAwareInterval(
+      () => {
+        const sv = readSupervisorState()
+        setSupervisor(sv)
+        setCostStatus(readCostStatus())
+        lastUpdated = sv?.updated_at ?? ""
+      },
+      10_000, // active: 10s
+      30_000, // idle: 30s
+      () => isIdleBySupervisorState(lastUpdated, 60_000),
+    )
+    onCleanup(cleanup)
   })
 
   const riskColor = createMemo(() => {
@@ -275,10 +294,9 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
   const costLine = createMemo(() => {
     const c = costStatus()
     if (!c) return null
-    const sessionCap = readSessionCapUsd()
     const total = formatCostUsd(c.session_total_usd)
-    const cap = formatCostUsd(sessionCap)
-    const pct = sessionCap > 0 ? Math.round((c.session_total_usd / sessionCap) * 100) : 0
+    const cap = formatCostUsd(SESSION_CAP_USD)
+    const pct = SESSION_CAP_USD > 0 ? Math.round((c.session_total_usd / SESSION_CAP_USD) * 100) : 0
     const flag = c.session_cap_exceeded ? " CAP!" : pct >= 80 ? ` ${pct}%` : ""
     return `local est. ${total}/${cap}${flag}`
   })

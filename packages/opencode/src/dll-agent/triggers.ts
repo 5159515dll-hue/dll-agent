@@ -125,7 +125,23 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     repeatedToolFailure: [...repeated.values()].some((count) => count >= 2),
     contextTokens,
     contextPercent,
-    longContextSignal: longContextPattern.test(allText) || contextPercent >= 40,
+    longContextSignal: (() => {
+      // 防止审查员名称导致误触发：
+      // 当文本以 [dll-agent supervisor auto-trigger] 或 [dll-agent finalization 开头，
+      // 说明这是系统注入的 compact context / reviewer prompt，不应触发长上下文审查。
+      // 额外的保护：当 allText 很短（< 200 字符）且无非上下文关键词（排除单独出现 "context"），
+      // 不触发，避免指挥官回复"审查员确认了 context..."一行触发无限循环。
+      if (contextPercent >= 40) return true
+      if (longContextPattern.test(allText)) {
+        // "context" 单独出现且文本很短 → 很可能是对审查员的引用，不是真正的长上下文任务
+        const isBareContextWord = /^context$/im.test(allText) && allText.length < 500
+        if (isBareContextWord) return false
+        // "长上下文" + "审查员" 同时出现 → 是对审查员的引用
+        if (/长上下文.*审查员/i.test(allText)) return false
+        return true
+      }
+      return false
+    })(),
     finalClaim: finalClaimPattern.test(lastAssistantText),
     verificationEvidence: evidencePattern.test(allText),
     realToolEvidence: verifiedToolEvidence(messages),

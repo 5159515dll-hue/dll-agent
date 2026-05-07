@@ -2,7 +2,7 @@ import fs from "fs"
 import os from "os"
 import path from "path"
 import { afterEach, describe, expect, test } from "bun:test"
-import { buildVerifierSubtask, pickVerifierAgent, decide, recordReviewerCall, markReviewerCompleted, isReadOnlyReviewer, updateState, buildFinalReportContext } from "../../src/dll-agent/supervisor"
+import { buildVerifierSubtask, pickVerifierAgent, decide, recordReviewerCall, markReviewerCompleted, isReadOnlyReviewer, updateState, buildFinalReportContext, loadCooldown } from "../../src/dll-agent/supervisor"
 import type { MessageV2 } from "../../src/session/message-v2"
 
 const cleanupSessions: string[] = []
@@ -313,5 +313,119 @@ describe("DllAgentSupervisor auto-verifier (P0-verification)", () => {
     ]
     const decision = decide(messages, sid, 1)
     expect(decision.verifierTask).toBeUndefined()
+  })
+})
+
+describe("DllAgentSupervisor reviewer fingerprint loop prevention", () => {
+  function userMsgWithSynthetic(id: string, parts: any[]): MessageV2.WithParts {
+    return {
+      info: {
+        id,
+        sessionID: "ses_test",
+        role: "user",
+        time: { created: 0 },
+        agent: "commander",
+        model: { providerID: "deepseek", modelID: "deepseek-v4-pro" },
+      } as any,
+      parts,
+    }
+  }
+
+  test("long-context-archivist should NOT re-trigger after synthetic user message insertion", () => {
+    const sid = sessionID("fingerprint_loop")
+
+    // Step 1: Initial trigger with real user message
+    const realUserID = "msg_real_user_1"
+    const messages1: any[] = [
+      userMsgWithSynthetic(realUserID, [
+        { type: "text", text: "请修复CPU占用过高的问题。这是一个很长的上下文任务，涉及 context 和长上下文处理。", id: "p1", messageID: realUserID, sessionID: "ses_test" },
+      ]),
+      asstMsg("好的，让我分析一下。"),
+    ]
+
+    // Force longContextSignal by passing a low contextLimit to ensure contextPercent >= 40
+    const decision1 = decide(messages1, sid, 1, 400)
+    expect(decision1.reviewers).toContain("long-context-archivist")
+
+    // Record the reviewer call with the original fingerprint
+    const fpKey = "long-context-archivist"
+    recordReviewerCall(
+      sid,
+      fpKey,
+      1,
+      decision1.fingerprints?.[fpKey],
+      decision1.reasons[fpKey],
+      realUserID,
+    )
+
+    // Verify fingerprint was stored
+    const cd1 = loadCooldown(sid)
+    const fp1 = decision1.fingerprints?.[fpKey]
+    expect(cd1.review_fingerprints?.[fp1!]).toBeDefined()
+
+    // Step 2: simulate reviewer completes, synthetic user message injected
+    const syntheticID = "msg_synthetic_summarize"
+    const messages2: any[] = [
+      ...messages1,
+      userMsgWithSynthetic(syntheticID, [
+        { type: "text", text: "Summarize the task tool output above and continue with your task.", id: "p_syn", messageID: syntheticID, sessionID: "ses_test", synthetic: true },
+      ]),
+      asstMsg("长上下文审查员确认了代码中存在高频刷新模式。现在继续执行。"), // contains "长上下文" and "context"
+    ]
+
+    // Step 3: decide() again. With fixed latestRealUser, should NOT re-trigger.
+    const decision2 = decide(messages2, sid, 3, 400)
+    // The fingerprint should match (same original user) and be in cooldown
+    expect(decision2.reviewers).not.toContain("long-context-archivist")
+  })
+
+  test("long-context-archivist fingerprint stability with synthetic messages", () => {
+    const sid = sessionID("fingerprint_stability")
+
+    const realUserID = "msg_real_user_2"
+    const messages1: any[] = [
+      userMsgWithSynthetic(realUserID, [
+        { type: "text", text: "请检查context文档和长上下文日志中的问题。", id: "p1", messageID: realUserID, sessionID: "ses_test" },
+      ]),
+      asstMsg("开始分析。"),
+    ]
+
+    const decision1 = decide(messages1, sid, 1, 400)
+    recordReviewerCall(
+      sid,
+      "long-context-archivist" as any,
+      1,
+      decision1.fingerprints?.["long-context-archivist"],
+      decision1.reasons["long-context-archivist"],
+      realUserID,
+    )
+
+    // Mark as completed
+    markReviewerCompleted(sid, "long-context-archivist" as any, {
+      version: 1,
+      reviewer: "long-context-archivist",
+      trigger_reason: "test",
+      verdict: "pass" as any,
+      findings: [],
+      score: 100,
+      block_completion: false,
+      next_actions: [],
+      evidence_confidence: 100,
+      ts: new Date().toISOString(),
+    })
+
+    // Round 2: synthetic summary message injected
+    const syntheticID = "msg_synthetic_2"
+    const messages2: any[] = [
+      ...messages1,
+      userMsgWithSynthetic(syntheticID, [
+        { type: "text", text: "Summarize the task tool output above and continue with your task.", id: "p_syn2", messageID: syntheticID, sessionID: "ses_test", synthetic: true },
+      ]),
+      asstMsg("审查完成，context上下文检查通过，继续执行长上下文任务。"),
+    ]
+
+    const decision2 = decide(messages2, sid, 3, 400)
+    // Should NOT re-trigger because fingerprint points to the same original user
+    expect(decision2.reviewers).not.toContain("long-context-archivist")
   })
 })

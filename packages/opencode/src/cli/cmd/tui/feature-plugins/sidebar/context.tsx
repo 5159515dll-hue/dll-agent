@@ -2,6 +2,7 @@ import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import fs from "fs"
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { idleAwareInterval } from "@tui/component/dll-agent-idle"
 
 const id = "internal:sidebar-context"
 
@@ -83,11 +84,21 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     const childMsgs = children.flatMap((c) => props.api.state.session.messages(c.id))
     return [...own, ...childMsgs]
   })
-  const cost = createMemo(() => allMsgs().reduce((sum, item) => sum + (item.role === "assistant" ? item.cost : 0), 0))
   const [quota, setQuota] = createSignal(readQuotaFile())
   onMount(() => {
-    const timer = setInterval(() => setQuota(readQuotaFile()), 15_000)
-    onCleanup(() => clearInterval(timer))
+    // Idle-aware: 15s active, 60s idle (use signal value to avoid double file read in isIdle check)
+    let lastAge = 0
+    const cleanup = idleAwareInterval(
+      () => {
+        const q = readQuotaFile()
+        setQuota(q)
+        lastAge = q?.updated_at ? (Date.now() / 1000 - q.updated_at) : 0
+      },
+      15_000,
+      60_000,
+      () => lastAge > 120,
+    )
+    onCleanup(cleanup)
   })
   const modelSpend = createMemo(() => {
     const rows = new Map<
@@ -101,12 +112,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         cost: number
       }
     >()
+    let totalCost = 0
 
     for (const item of allMsgs()) {
       if (item.role !== "assistant") continue
       const tokens =
         item.tokens.input + item.tokens.output + item.tokens.reasoning + item.tokens.cache.read + item.tokens.cache.write
-      if (tokens <= 0 && item.cost <= 0) continue
+      const cost = item.cost ?? 0
+      totalCost += cost
+      if (tokens <= 0 && cost <= 0) continue
 
       const provider = props.api.state.provider.find((provider) => provider.id === item.providerID)
       const model = provider?.models[item.modelID]
@@ -123,11 +137,14 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         }
       prev.calls += 1
       prev.tokens += tokens
-      prev.cost += item.cost
+      prev.cost += cost
       rows.set(key, prev)
     }
 
-    return [...rows.values()].sort((a, b) => b.cost - a.cost || b.tokens - a.tokens).slice(0, 6)
+    return {
+      rows: [...rows.values()].sort((a, b) => b.cost - a.cost || b.tokens - a.tokens).slice(0, 6),
+      totalCost,
+    }
   })
 
   const state = createMemo(() => {
@@ -155,13 +172,13 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       </text>
       <text fg={theme().textMuted}>{state().tokens.toLocaleString()} tokens (all types incl. cache)</text>
       <text fg={theme().textMuted}>{state().percent ?? 0}% used</text>
-      <text fg={theme().textMuted}>local est. spend {money.format(cost())}</text>
+      <text fg={theme().textMuted}>local est. spend {money.format(modelSpend().totalCost)}</text>
       <box paddingTop={1}>
         <text fg={theme().text}>
           <b>Model usage (local est.)</b>
         </text>
-        <Show when={modelSpend().length > 0} fallback={<text fg={theme().textMuted}>no paid calls yet</text>}>
-          <For each={modelSpend()}>
+        <Show when={modelSpend().rows.length > 0} fallback={<text fg={theme().textMuted}>no paid calls yet</text>}>
+          <For each={modelSpend().rows}>
             {(item) => (
               <box paddingBottom={1}>
                 <text fg={theme().textMuted}>

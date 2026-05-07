@@ -254,7 +254,16 @@ function normalizeFingerprintPart(value: string) {
 function latestRealUser(messages: MessageV2.WithParts[]) {
   return [...messages]
     .reverse()
-    .find((message) => message.info.role === "user" && messageText(message).trim().length > 0)
+    .find((message) => {
+      if (message.info.role !== "user") return false
+      if (messageText(message).trim().length === 0) return false
+      // 过滤纯合成消息：reviewer subtask 完成后 prompt.ts 会注入 "Summarize ..." 合成用户消息。
+      // 若不跳过，该消息会成为 latestRealUser，使 makeTriggerFingerprint 生成新指纹，
+      // 导致 isCooldown 找不到原始指纹，审查员被无限重复触发。
+      const textParts = message.parts.filter((p) => p.type === "text")
+      if (textParts.length > 0 && textParts.every((p) => "synthetic" in p && (p as any).synthetic)) return false
+      return true
+    })
 }
 
 function makeTriggerFingerprint(messages: MessageV2.WithParts[], reviewer: ReviewerRole, reason: string) {
@@ -318,7 +327,14 @@ function recentToolFailureSummary(messages: MessageV2.WithParts[]) {
   return lines.slice(-5)
 }
 
+const gitDiffCache = new Map<string, { result: string; ts: number }>()
+const GIT_DIFF_CACHE_TTL_MS = 30_000
+
 function gitDiffSummary(paths: string[]) {
+  const key = paths.slice(0, 8).sort().join("|")
+  const cached = gitDiffCache.get(key)
+  if (cached && Date.now() - cached.ts < GIT_DIFF_CACHE_TTL_MS) return cached.result
+
   try {
     const cwd = process.env.DLL_AGENT_ROOT || process.cwd()
     const args = ["-C", cwd, "diff", "--stat", "--", ...paths.filter((p) => !p.startsWith("/Users/")).slice(0, 8)]
@@ -328,9 +344,13 @@ function gitDiffSummary(paths: string[]) {
       maxBuffer: 12_000,
       stdio: ["ignore", "pipe", "ignore"],
     })
-    return truncate(output.trim(), 2_000)
+    const result = truncate(output.trim(), 2_000)
+    gitDiffCache.set(key, { result, ts: Date.now() })
+    return result
   } catch {
-    return ""
+    const result = ""
+    gitDiffCache.set(key, { result, ts: Date.now() })
+    return result
   }
 }
 
@@ -777,6 +797,9 @@ function buildSubtask(
       `3. Propose actionable recovery steps.`,
       ``,
       `This role crossing ends after this review round. Output in machine-readable JSON format.`,
+      `\`\`\`json`,
+      JSON.stringify(emptyReviewerOutput("role-cross", reason), null, 2),
+      `\`\`\``,
     ].join("\n"),
   }
 
@@ -789,7 +812,7 @@ function buildSubtask(
     description: `Auto reviewer: ${reviewer} triggered by ${reason}`,
     command: "dll-agent-supervisor",
     model: modelMap[reviewer],
-    prompt: promptTemplates[reviewer].replace("repeated_tool_failure=${metrics.repeatedToolFailure}", ""),
+    prompt: promptTemplates[reviewer],
   }
 }
 
