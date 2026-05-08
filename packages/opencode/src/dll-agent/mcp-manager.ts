@@ -8,6 +8,7 @@
 import fs from "fs"
 import path from "path"
 import os from "os"
+import { execFileSync, execSync } from "child_process"
 import { write as writeEvidence } from "./evidence"
 import type { McpStartPolicy } from "./tool-catalog"
 
@@ -61,6 +62,19 @@ export interface McpServerStatus {
   lastError?: string
   retryCount: number
   cooldownUntil?: string
+}
+
+export interface McpCleanupResult {
+  stopped: string[]
+  stale: string[]
+  errors: string[]
+}
+
+export interface McpHealthcheckResult {
+  healthy: boolean
+  detail: string
+  probe?: "pid" | "http" | "skipped"
+  statusCode?: number
 }
 
 const STATE_DIR = path.join(os.homedir(), ".dll-agent", "mcp")
@@ -185,11 +199,97 @@ export function markStopped(name: string) {
   releaseLock(name)
 }
 
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Reconcile persisted MCP state with the real process table.
+ * Dead PIDs are marked stopped so stale "running" state does not survive.
+ */
+export function reconcileMcpStatus(name: string): McpServerStatus {
+  const status = loadStatus(name)
+  if (status.status === "running" && status.pid && !isPidAlive(status.pid)) {
+    status.status = "stopped"
+    status.lastError = `pid ${status.pid} not found`
+    status.pid = undefined
+    saveStatus(status)
+    releaseLock(name)
+    writeEvidence("mcp.reconciled_stale_pid", { server: name })
+  }
+  return status
+}
+
+/**
+ * Stop a managed MCP server by PID. This only acts on PIDs recorded in
+ * dll-agent MCP state, avoiding broad pattern-based process killing.
+ */
+export function stopManagedServer(name: string): { stopped: boolean; reason: string } {
+  const status = reconcileMcpStatus(name)
+  if (!status.pid) {
+    markStopped(name)
+    return { stopped: false, reason: "not running" }
+  }
+  if (status.pid === process.pid) {
+    return { stopped: false, reason: "refuse to stop current process" }
+  }
+  try {
+    process.kill(status.pid, "SIGTERM")
+    markStopped(name)
+    writeEvidence("mcp.stopped", { server: name, pid: status.pid })
+    return { stopped: true, reason: "stopped" }
+  } catch (error) {
+    degrade({
+      name,
+      command: [],
+      isolated: true,
+      autoRestart: false,
+      maxRetries: 0,
+      timeoutMs: 0,
+      cooldownMs: 60_000,
+    }, String(error))
+    return { stopped: false, reason: String(error) }
+  }
+}
+
+/**
+ * Cleanup lifecycle state for managed MCP servers. A running server whose
+ * health timestamp is older than maxIdleMs is stopped; dead PIDs are marked
+ * stopped. Unknown external Playwright processes are not killed here.
+ */
+export function cleanupManagedMcp(decls: McpServerDecl[], maxIdleMs = 30 * 60 * 1000): McpCleanupResult {
+  const result: McpCleanupResult = { stopped: [], stale: [], errors: [] }
+  const now = Date.now()
+  for (const decl of decls) {
+    try {
+      const status = reconcileMcpStatus(decl.name)
+      if (status.status !== "running") continue
+      const last = status.lastHealthAt ? new Date(status.lastHealthAt).getTime() : 0
+      if (!last || now - last > maxIdleMs) {
+        const stopped = stopManagedServer(decl.name)
+        if (stopped.stopped) result.stopped.push(decl.name)
+        else result.stale.push(`${decl.name}:${stopped.reason}`)
+      }
+    } catch (error) {
+      result.errors.push(`${decl.name}:${String(error)}`)
+    }
+  }
+  if (result.stopped.length || result.stale.length || result.errors.length) {
+    writeEvidence("mcp.cleanup", result)
+  }
+  return result
+}
+
 /**
  * 获取所有注册 server 的状态列表（用于 TUI 显示）。
  */
 export function allStatus(decls: McpServerDecl[]): McpServerStatus[] {
-  return decls.map((d) => loadStatus(d.name))
+  return decls.map((d) => reconcileMcpStatus(d.name))
 }
 
 /**
@@ -240,8 +340,8 @@ export function isOnDemand(policy: McpStartPolicy): boolean {
  * healthcheck：检查 MCP server 是否健康。
  * 通过 healthUrl（如果配置）或进程存活检测。
  */
-export function healthcheck(decl: McpServerDecl): { healthy: boolean; detail: string } {
-  const status = loadStatus(decl.name)
+export function healthcheck(decl: McpServerDecl): McpHealthcheckResult {
+  const status = reconcileMcpStatus(decl.name)
   if (status.status !== "running") return { healthy: false, detail: `status is ${status.status}` }
 
   // Process alive check
@@ -253,8 +353,26 @@ export function healthcheck(decl: McpServerDecl): { healthy: boolean; detail: st
     }
   }
 
+  let healthUrlProbe: McpHealthcheckResult | undefined
+  if (decl.healthUrl) {
+    const probe = probeHealthUrl(decl.healthUrl, decl.timeoutMs)
+    healthUrlProbe = probe
+    if (!probe.healthy) {
+      status.lastError = probe.detail
+      saveStatus(status)
+      writeEvidence("mcp.health_check", {
+        server: decl.name,
+        healthy: false,
+        healthUrl: decl.healthUrl,
+        detail: probe.detail,
+      })
+      return probe
+    }
+  }
+
   // Update health timestamp
   status.lastHealthAt = new Date().toISOString()
+  status.lastError = undefined
   saveStatus(status)
 
   writeEvidence("mcp.health_check", {
@@ -263,7 +381,52 @@ export function healthcheck(decl: McpServerDecl): { healthy: boolean; detail: st
     pid: status.pid,
   })
 
-  return { healthy: true, detail: "ok" }
+  return {
+    healthy: true,
+    detail: healthUrlProbe?.detail ?? (decl.healthUrl ? "ok (http healthUrl)" : "ok"),
+    probe: healthUrlProbe?.probe ?? (decl.healthUrl ? "http" : "pid"),
+  }
+}
+
+function isLocalHealthUrl(url: URL): boolean {
+  return ["127.0.0.1", "localhost", "::1", "[::1]"].includes(url.hostname)
+}
+
+export function probeHealthUrl(
+  rawUrl: string,
+  timeoutMs = 5_000,
+  runner: typeof execFileSync = execFileSync,
+): McpHealthcheckResult {
+  let parsed: URL
+  try {
+    parsed = new URL(rawUrl)
+  } catch {
+    return { healthy: false, detail: "invalid healthUrl", probe: "http" }
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { healthy: false, detail: `unsupported healthUrl protocol: ${parsed.protocol}`, probe: "http" }
+  }
+  if (!isLocalHealthUrl(parsed)) {
+    return { healthy: true, detail: "remote healthUrl skipped by local-only probe policy", probe: "skipped" }
+  }
+
+  const maxSeconds = Math.max(1, Math.ceil(Math.min(timeoutMs, 30_000) / 1000))
+  try {
+    runner("curl", ["-fsS", "--max-time", String(maxSeconds), rawUrl], {
+      encoding: "utf8",
+      timeout: Math.min(timeoutMs + 1_000, 31_000),
+      stdio: "ignore",
+    })
+    return { healthy: true, detail: "ok", probe: "http" }
+  } catch (error: any) {
+    const statusCode = typeof error?.status === "number" ? error.status : undefined
+    return {
+      healthy: false,
+      detail: statusCode ? `healthUrl probe failed with exit ${statusCode}` : "healthUrl probe failed",
+      probe: "http",
+      statusCode,
+    }
+  }
 }
 
 /**
@@ -272,7 +435,7 @@ export function healthcheck(decl: McpServerDecl): { healthy: boolean; detail: st
 export function detailedStatus(decls: McpServerDecl[]): Record<string, McpServerStatus & { healthy: boolean; start_policy: McpStartPolicy; heavy: boolean }> {
   const result: Record<string, McpServerStatus & { healthy: boolean; start_policy: McpStartPolicy; heavy: boolean }> = {}
   for (const d of decls) {
-    const status = loadStatus(d.name)
+    const status = reconcileMcpStatus(d.name)
     const health = healthcheck(d)
     result[d.name] = {
       ...status,
@@ -289,7 +452,7 @@ export function detailedStatus(decls: McpServerDecl[]): Record<string, McpServer
  */
 export function checkPort(port: number): { free: boolean; process?: string } {
   try {
-    const result = require("child_process").execSync(`lsof -i :${port} -t`, { encoding: "utf8" }).trim()
+    const result = execSync(`lsof -i :${port} -t`, { encoding: "utf8" }).trim()
     if (result) return { free: false, process: result }
     return { free: true }
   } catch {

@@ -6,6 +6,7 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { useTheme } from "@tui/context/theme"
 import { Locale } from "@/util/locale"
 import { enabled as dllEnabled, quality as dllQuality, verify as dllVerify } from "@/dll-agent/profile"
+import { buildCompactSummary, defaultUxState, type UxState } from "@/dll-agent/ux-state"
 import { idleAwareInterval, isIdleBySupervisorState } from "./dll-agent-idle"
 
 function enabled() {
@@ -30,6 +31,20 @@ const money = new Intl.NumberFormat("en-US", {
   style: "currency",
   currency: "USD",
 })
+
+const cny = new Intl.NumberFormat("zh-CN", {
+  style: "currency",
+  currency: "CNY",
+})
+
+const CNY_PROVIDERS = new Set(["deepseek", "kimi", "zai"])
+
+function formatProviderCost(cost: number, providerID: string): string {
+  if (CNY_PROVIDERS.has(providerID)) {
+    return cny.format(cost * 7.2)
+  }
+  return money.format(cost)
+}
 
 function readQuotaFile() {
   const file = process.env.DLL_AGENT_QUOTA_FILE
@@ -136,7 +151,10 @@ function quotaLine(value: any) {
     if (item?.total_balance) return `balance ${item.currency} ${item.total_balance}`
   }
   if (balances && typeof balances === "object") {
-    if (typeof balances.available_balance === "number") return `balance ${money.format(balances.available_balance)}`
+    if (typeof balances.available_balance === "number") {
+      const currency = balances.currency ?? "CNY"
+      return `balance ${currency} ${Number(balances.available_balance).toFixed(2)}`
+    }
   }
   return "unknown"
 }
@@ -311,7 +329,7 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
     const exceededMap = c.provider_cap_exceeded ?? {}
     const parts = entries.map(([provider, cost]) => {
       const flag = exceededMap[provider] ? "!" : ""
-      return `${provider}${flag}=${formatCostUsd(cost)}`
+      return `${provider}${flag}=${formatProviderCost(cost, provider)}`
     })
     return Locale.truncate(`local est.: ${parts.join("  ")}`, Math.max(28, dimensions().width - 6))
   })
@@ -320,6 +338,51 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
     const w = costStatus()?.last_warning
     if (!w) return null
     return Locale.truncate(`! ${w}`, Math.max(28, dimensions().width - 6))
+  })
+
+  const uxLine = createMemo(() => {
+    const s = supervisor()
+    const c = costStatus()
+    if (!s) return null
+    const m = s.metrics ?? {}
+    const ux: UxState = {
+      ...defaultUxState(),
+      task: {
+        goal: s.phase || "default",
+        phase: s.phase,
+        plan: null,
+        blocker: s.block_reason,
+        risk: (s.risk as any) ?? "low",
+        modifiedFiles: [],
+        verificationStatus: m.real_tool_evidence ? "passed" as const : m.verification_evidence ? "partial" as const : "not_run" as const,
+        nextAction: s.blocked_completion ? "resolve blockers" : s.required_reviews.length > 0 ? "complete reviews" : null,
+        requiresUserInput: false,
+        userInputReason: null,
+      },
+      supervisor: {
+        active: s.blocked_completion || s.required_reviews.length > 0,
+        recoveryActive: s.required_reviews.includes("chief-engineer" as any),
+        recoveryAttempts: 0,
+        maxRecoveryAttempts: 5,
+        reviewers: {
+          required: s.required_reviews as any[],
+          completed: s.completed_reviews as any[],
+          queued: s.queued_reviewers ?? [],
+          running: s.running_reviewers ?? [],
+        },
+        gateBlocked: s.blocked_completion,
+        gateBlockReason: s.block_reason,
+        gateRetriesExhausted: s.reviewer_conflict,
+        crossReviewActive: s.reviewer_conflict,
+      },
+      cost: {
+        sessionTotalUsd: c?.session_total_usd ?? 0,
+        capUsd: SESSION_CAP_USD,
+        exceeded: c?.session_cap_exceeded ?? false,
+        lastWarning: c?.last_warning ?? null,
+      },
+    }
+    return buildCompactSummary(ux)
   })
 
   return (
@@ -346,6 +409,9 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
         </Show>
         <Show when={costWarningLine()}>
           <text fg="#f59e0b">{costWarningLine()}</text>
+        </Show>
+        <Show when={uxLine()}>
+          <text fg={theme.textMuted}>{uxLine()}</text>
         </Show>
       </box>
     </Show>

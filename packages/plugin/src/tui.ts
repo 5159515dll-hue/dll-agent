@@ -348,6 +348,7 @@ export type TuiHostSlotMap = {
   }
   sidebar_content: {
     session_id: string
+    title?: string
   }
   sidebar_footer: {
     session_id: string

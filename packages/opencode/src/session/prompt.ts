@@ -36,13 +36,23 @@ import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { enabled as profileEnabled, autoAllowAll as profileAutoAllow, quality as profileQuality, verify as profileVerify, roleRoster as profileRoleRoster, roleCommands as profileRoleCommands, systemPrompt as profileSystemPrompt, writeEvidence as profileWriteEvidence } from "@/dll-agent/profile"
-import { decide as supervisorDecide, updateState as supervisorUpdateState, loadState as supervisorLoadState, saveState as supervisorSaveState, isCooldown as supervisorIsCooldown, recordReviewerCall, generateSubtasks, buildVerifierSubtask, markReviewerCompleted, setQueuedReviewers, setRunningReviewers, isReadOnlyReviewer, reviewerRuntimeMs as getReviewerRuntimeMs } from "@/dll-agent/supervisor"
-import { checkEvidenceGate, checkReconciliationGate, isGateRetryExhausted } from "@/dll-agent/gates"
+import { decide as supervisorDecide, updateState as supervisorUpdateState, loadState as supervisorLoadState, saveState as supervisorSaveState, isCooldown as supervisorIsCooldown, recordReviewerCall, generateSubtasks, buildVerifierSubtask, buildTaskCompletionSubtask, markReviewerCompleted, setQueuedReviewers, setRunningReviewers, isReadOnlyReviewer, reviewerRuntimeMs as getReviewerRuntimeMs, modelContextLimit } from "@/dll-agent/supervisor"
+import { checkEvidenceGate, checkReconciliationGate, isGateRetryExhausted, buildGateBlockSummary } from "@/dll-agent/gates"
 import { checkCap as checkCostCap, trackLastCall } from "@/dll-agent/cost-cap"
+import { checkCrossReviewTrigger } from "@/dll-agent/cross-review-bridge"
 import { metrics as computeTriggerMetrics, messageText } from "@/dll-agent/triggers"
 import { activate as activateSkills, loadActive as loadActiveSkills, persist as persistSkills } from "@/dll-agent/skills"
 import type { SkillSignal } from "@/dll-agent/skill-registry"
 import { write as evidenceWrite } from "@/dll-agent/evidence"
+import { buildGlobalEffective, buildEffectiveManifest, loadProjectOverlay } from "@/dll-agent/tool-overlay"
+import { GLOBAL_DEFAULT_TOOLS, DEFAULT_MANIFEST } from "@/dll-agent/tool-catalog"
+import { buildPromptIndex } from "@/dll-agent/tool-prompt"
+import { buildActionableError, formatActionableError } from "@/dll-agent/actionable-error"
+import { checkContinuationGate, isContinuationBudgetExhausted, parseKimiContinuationOutput, consumeContinuationPacket } from "@/dll-agent/continuation-gate"
+import { checkDeduplication, buildDedupContextSummary } from "@/dll-agent/deduplication-gate"
+import { orchestrateCapabilities, type CapabilityOrchestrationResult } from "@/dll-agent/capability-orchestrator"
+import { runCapabilityActions } from "@/dll-agent/capability-action-runner"
+import { reconcileSessionState } from "@/dll-agent/session-reconciler"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -1425,6 +1435,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         const supervisorPendingSubtasks: MessageV2.SubtaskPart[] = []
         const gatePendingHints: string[] = []
+        let capabilityRuntime: CapabilityOrchestrationResult | undefined
+        let lastCapabilityFingerprint: string | undefined
+        const executedCapabilityActions = new Set<string>()
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1475,8 +1488,56 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
               // 2. Supervisor 决策
               const availableAgents = (yield* agents.list()).map((a) => a.name)
-              const decision = supervisorDecide(msgs, sessionID, step + 1, undefined, availableAgents)
-              const updatedState = supervisorUpdateState(sessionID, decision)
+              const contextLimit = modelContextLimit(lastUser.model.providerID, lastUser.model.modelID)
+              const decision = supervisorDecide(msgs, sessionID, step + 1, contextLimit, availableAgents)
+              let updatedState = supervisorUpdateState(sessionID, decision)
+              updatedState = reconcileSessionState({
+                sessionID,
+                projectDir: ctx.directory,
+                state: updatedState,
+              }).state
+
+              // 2a. Capability orchestration — bridge the declarative capability
+              // registry into the live session loop. This is intentionally before
+              // skill activation and before tool resolution so selected skills/MCPs
+              // can affect the next model call.
+              try {
+                const recentUserText = msgs
+                  .slice(-5)
+                  .filter((m) => m.info.role === "user")
+                  .map((m) => messageText(m))
+                  .join("\n")
+                const filesInvolved: string[] = []
+                for (const m of msgs.slice(-24)) {
+                  for (const p of m.parts) {
+                    if (p.type !== "tool" || p.state.status !== "completed") continue
+                    const inp = p.state.input as Record<string, unknown> | undefined
+                    const fp = typeof inp?.filePath === "string" ? inp.filePath : ""
+                    if (fp) filesInvolved.push(fp)
+                  }
+                }
+                capabilityRuntime = orchestrateCapabilities({
+                  sessionID,
+                  projectDir: ctx.directory,
+                  userGoal: recentUserText,
+                  messageID: lastUser.id,
+                  filesInvolved,
+                  failureType: decision.metrics.repeated_tool_failure ? "repeated_tool_failure" : undefined,
+                  allowMcpAutoConnect: true,
+                  allowMutatingActions: true,
+                })
+                if (capabilityRuntime.fingerprint !== lastCapabilityFingerprint) {
+                  lastCapabilityFingerprint = capabilityRuntime.fingerprint
+                  yield* slog.info("capability runtime orchestrated", {
+                    fingerprint: capabilityRuntime.fingerprint,
+                    required: capabilityRuntime.plan.required_tags,
+                    selected: capabilityRuntime.plan.selected.map((m) => m.entry.id),
+                    gaps: capabilityRuntime.unresolvedGaps.map((g) => g.tag),
+                  })
+                }
+              } catch (capErr) {
+                yield* slog.error("capability orchestration error", { error: String(capErr) })
+              }
 
               // 2b. Skill 激活（按需，最多 3 个）— 持久化供 bash tool 拦截 forbiddenCommands
               try {
@@ -1509,16 +1570,70 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   userText: recentUserText,
                   files: editedFiles,
                   repoMarkers: [".git", "package.json"],
-                  intents: [],
+                  intents: capabilityRuntime?.skillIntents ?? [],
                   currentStep: step + 1,
                   sessionID,
-                  signals,
+                  signals: [...signals, ...(capabilityRuntime?.skillSignals ?? [])],
                 })
                 persistSkills(skillResult.activated, sessionID)
                 updatedState.active_skills = skillResult.activated.map((a) => a.skill.name)
                 supervisorSaveState(sessionID, updatedState)
               } catch (skillErr) {
                 yield* slog.error("skill activation error", { error: String(skillErr) })
+              }
+
+              // 2c. Cross-review council check — 多模型对抗审查触发
+              try {
+                const lastUserMsg = [...msgs].reverse().find((m) => m.info.role === "user")
+                // Phase 6: Compute real recoveryAttempts and scopeExpanded from supervisor state
+                const recoveryAttempts = updatedState.continuation_count ?? 0
+                // Scope expansion: compare file paths in recent tool calls against initial task scope
+                // Heuristic: if files edited span >2 distinct top-level directories, consider scope expanded
+                const editedFilePaths = new Set<string>()
+                for (const m of msgs.slice(-24)) {
+                  for (const p of m.parts) {
+                    if (p.type !== "tool" || p.state.status !== "completed") continue
+                    const inp = p.state.input as Record<string, unknown> | undefined
+                    const fp = typeof inp?.filePath === "string" ? inp.filePath : ""
+                    if (fp) editedFilePaths.add(fp)
+                  }
+                }
+                const distinctDirs = new Set(
+                  [...editedFilePaths].map((fp) => fp.split("/").slice(0, 2).join("/"))
+                )
+                const scopeExpanded = distinctDirs.size > 3
+                const council = checkCrossReviewTrigger({
+                  state: updatedState,
+                  repeatedFailureCount: decision.metrics.repeated_tool_failure ? 3 : decision.metrics.tool_failures,
+                  reviewerConflict: decision.metrics.reviewer_conflict_signal,
+                  isHighRiskCompletion: decision.metrics.final_claim && !decision.metrics.verification_evidence,
+                  hasInsufficientEvidence: decision.metrics.final_claim && !decision.metrics.real_tool_evidence,
+                  userCorrectionCount: decision.metrics.user_corrections,
+                  scopeExpanded,
+                  recoveryAttempts,
+                  sessionId: sessionID,
+                  userGoal: lastUserMsg ? messageText(lastUserMsg).slice(0, 500) : "",
+                  filesChanged: [...editedFilePaths].slice(0, 10),
+                })
+                if (council.shouldConvene && council.reviewers.length > 0) {
+                  for (const reviewer of council.reviewers) {
+                    decision.fingerprints ??= {}
+                    const fingerprint = `council:${council.reason}:${reviewer}:${updatedState.phase}`
+                    if (supervisorIsCooldown(sessionID, reviewer, step + 1, fingerprint)) continue
+                    if (!decision.reviewers.includes(reviewer)) {
+                      decision.reviewers.push(reviewer)
+                      decision.reasons[reviewer] = `cross-review council: ${council.reason}`
+                      decision.fingerprints[reviewer] = fingerprint
+                    }
+                  }
+                  decision.should_review = true
+                  yield* slog.info("cross-review council convened", {
+                    reason: council.reason,
+                    reviewers: council.reviewers,
+                  })
+                }
+              } catch (councilErr) {
+                yield* slog.error("cross-review council error", { error: String(councilErr) })
               }
 
               // 3. 如果有需要触发的 reviewer，注入 subtask
@@ -1585,11 +1700,70 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // ─── dll-agent evidence gate ────────────────────────────────
             if (profileEnabled()) {
               try {
-                const state = supervisorLoadState(sessionID)
+                const state = reconcileSessionState({
+                  sessionID,
+                  projectDir: ctx.directory,
+                  state: supervisorLoadState(sessionID),
+                }).state
                 const metrics = computeTriggerMetrics(msgs)
                 const lastAssistantText = messageText(lastAssistantMsg)
 
                 const costCheck = checkCostCap(sessionID, msgs)
+
+                // Phase 7 — Deduplication Gate: inject prior result context so models
+                // can see what's already been completed and avoid redundant re-execution.
+                try {
+                  const dedupContext = buildDedupContextSummary(sessionID)
+                  if (dedupContext) {
+                    gatePendingHints.push(dedupContext)
+                    yield* slog.info("dedup context injected", {
+                      has_prior_results: true,
+                    })
+                  }
+                } catch {
+                  // Dedup context injection is advisory; must not block the loop
+                }
+
+                // Phase 5 — Continuation Gate: 在 evidence gate 之前检查是否有 blocking unfinished
+                const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
+                const continuationResult = checkContinuationGate({
+                  assistantText: lastAssistantText,
+                  isCompletionClaim: metrics.finalClaim,
+                  state,
+                  sessionID,
+                  userGoal: lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : "",
+                })
+                if (!continuationResult.passed) {
+                  const budgetCheck = isContinuationBudgetExhausted({
+                    continuationCount: state.continuation_count ?? 0,
+                    repairCounts: state.repair_counts ?? {},
+                    blockingItems: continuationResult.blocking_items,
+                  })
+                  if (!budgetCheck.exhausted) {
+                    if (continuationResult.synthetic_hint) {
+                      gatePendingHints.push(continuationResult.synthetic_hint)
+                    }
+                    const kimiSubtask = buildTaskCompletionSubtask(
+                      sessionID,
+                      lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : "",
+                      lastAssistantText,
+                      state,
+                    )
+                    tasks.push(kimiSubtask)
+                    yield* slog.info("continuation gate triggered Kimi task-completion check", {
+                      block_reason: continuationResult.block_reason,
+                      blocking_items: continuationResult.blocking_items.length,
+                    })
+                  } else {
+                    yield* slog.warn("continuation budget exhausted", {
+                      reason: budgetCheck.reason,
+                      continuation_count: state.continuation_count ?? 0,
+                    })
+                    gatePendingHints.push(
+                      `<dll-agent-continuation-gate>\nContinuation budget exhausted: ${budgetCheck.reason}\nManual user intervention required.\n</dll-agent-continuation-gate>`
+                    )
+                  }
+                }
 
                 const gateResult = checkEvidenceGate({
                   assistantText: lastAssistantText,
@@ -1599,7 +1773,31 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   allReviewsCompleted: state.required_reviews.length === 0,
                   hasUnresolvedConflict: state.reviewer_conflict,
                   costExceeded: costCheck.exceeded,
+                  sessionID,
+                  projectDir: ctx.directory,
                 }, msgs)
+
+                if (metrics.finalClaim && capabilityRuntime) {
+                  const capabilityBlocks = [
+                    ...capabilityRuntime.unresolvedGaps.map((g) => `missing capability: ${g.tag}`),
+                    ...capabilityRuntime.blockedReasons,
+                  ]
+                  if (capabilityBlocks.length > 0) {
+                    gateResult.passed = false
+                    const block = `capability requirements unresolved: ${capabilityBlocks.slice(0, 4).join("; ")}`
+                    gateResult.block_reason = gateResult.block_reason
+                      ? `${gateResult.block_reason}; ${block}`
+                      : block
+                    gateResult.synthetic_hint = [
+                      gateResult.synthetic_hint,
+                      `<dll-agent-capability-gate>\n${block}\nResolve, verify, or explicitly disclose these capability gaps before claiming completion.\n</dll-agent-capability-gate>`,
+                    ].filter(Boolean).join("\n")
+                    evidenceWrite("gate.capability_blocked", {
+                      fingerprint: capabilityRuntime.fingerprint,
+                      blocks: capabilityBlocks,
+                    }, sessionID)
+                  }
+                }
 
                 // Phase 4: reconciliation gate — completion 必须显式吸收 reviewer 结论
                 const reconResult = checkReconciliationGate({
@@ -1630,11 +1828,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       block_reason: blockReason,
                       retries: state.gate_block_retries?.[blockReason],
                     })
-                    // 不注入 hint — 输出 HARD STOP 摘要，避免循环
+                    gatePendingHints.push(buildGateBlockSummary(blockReason, gateResult, state, true))
                     evidenceWrite("gate.retry_exhausted", {
                       block_reason: blockReason,
                       retries: state.gate_block_retries?.[blockReason],
                     }, sessionID)
+                    break
                   } else {
                     // 注入 evidence gate hint，不 break
                     yield* slog.info("evidence gate blocked exit, injecting hint", {
@@ -1642,6 +1841,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       block_reason: gateResult.block_reason,
                     })
                     gatePendingHints.push(gateResult.synthetic_hint)
+
+                    // Actionable recovery suggestion for gate blocks
+                    try {
+                      const actionable = buildActionableError({
+                        whatFailed: blockReason,
+                        stderr: blockReason,
+                      })
+                      if (actionable.nextAutomaticAction) {
+                        gatePendingHints.push(
+                          `\n[actionable] ${actionable.category}: ${actionable.nextAutomaticAction}`
+                        )
+                      }
+                    } catch {
+                      // best-effort
+                    }
 
                   // Phase 3+4: 高风险且无真证据 → 自动注入 verifier subtask（fallback agent）
                   if (state.risk === "high" && !metrics.realToolEvidence) {
@@ -1817,6 +2031,42 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 // task.agent 是 reviewer 名称（如 requirements-inspector）
                 markReviewerCompleted(sessionID, task.agent as any)
                 setRunningReviewers(sessionID, [])
+                // Phase 5: consume continuation packet from Kimi task-completion-archivist output
+                if (task.agent === "task-completion-archivist") {
+                  try {
+                    const lastSubtaskMsg = [...msgs].reverse().find(
+                      (m) => m.info.role === "assistant" && m.parts.some((p) => p.type === "text"),
+                    )
+                    if (lastSubtaskMsg) {
+                      const outputText = messageText(lastSubtaskMsg)
+                      const parsed = parseKimiContinuationOutput(outputText)
+                      if (parsed.parsed && parsed.packet) {
+                        const consumed = consumeContinuationPacket(parsed.packet)
+                        if (consumed.shouldContinue) {
+                          yield* slog.info("continuation packet consumed, injecting action items", {
+                            actionItemCount: consumed.actionItems.length,
+                            summary: consumed.summary,
+                          })
+                          // Inject continuation hint for commander
+                          const contHint = [
+                            `<dll-agent-continuation-result>`,
+                            consumed.summary,
+                            ``,
+                            `Action items:`,
+                            ...consumed.actionItems.map((a, i) =>
+                              `${i + 1}. [${a.role}] ${a.action} (verify: ${a.verification})`
+                            ),
+                            `</dll-agent-continuation-result>`,
+                          ].join("\n")
+                          gatePendingHints.push(contHint)
+                        }
+                      }
+                    }
+                  } catch (contErr) {
+                    // best-effort, never block the loop
+                    yield* slog.error("continuation packet consumption error", { error: String(contErr) })
+                  }
+                }
               } catch {
                 // Non-critical
               }
@@ -1902,6 +2152,66 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
 
+            if (profileEnabled() && !session.parentID && capabilityRuntime) {
+              if (!executedCapabilityActions.has(capabilityRuntime.fingerprint)) {
+                executedCapabilityActions.add(capabilityRuntime.fingerprint)
+                try {
+                  const actionResults = runCapabilityActions({
+                    sessionID,
+                    projectDir: ctx.directory,
+                    actions: capabilityRuntime.actions,
+                    userGoal: capabilityRuntime.plan.rationale,
+                  })
+                  const failed = actionResults.filter((r) => r.status === "failed" || r.status === "blocked")
+                  if (failed.length > 0) {
+                    evidenceWrite("capability.action_attention", {
+                      fingerprint: capabilityRuntime.fingerprint,
+                      failed: failed.map((r) => ({
+                        entry_id: r.entry_id,
+                        status: r.status,
+                        reason: r.reason,
+                      })),
+                    }, sessionID)
+                  }
+                } catch (actionErr) {
+                  evidenceWrite("capability.actions_failed", {
+                    fingerprint: capabilityRuntime.fingerprint,
+                    error: String(actionErr),
+                  }, sessionID)
+                  yield* slog.error("capability action runner failed", { error: String(actionErr) })
+                }
+              }
+            }
+
+            if (profileEnabled() && !session.parentID && capabilityRuntime?.mcpRequests.length) {
+              for (const request of capabilityRuntime.mcpRequests) {
+                if (!request.auto_connect) continue
+                try {
+                  const statusBefore = yield* mcp.status()
+                  if (statusBefore[request.name]?.status === "connected") continue
+                  yield* mcp.add(request.name, request.config)
+                  const statusAfter = yield* mcp.status()
+                  evidenceWrite("capability.mcp_connected", {
+                    name: request.name,
+                    entry_id: request.entry_id,
+                    status: statusAfter[request.name]?.status ?? "unknown",
+                    fingerprint: capabilityRuntime.fingerprint,
+                  }, sessionID)
+                } catch (mcpErr) {
+                  evidenceWrite("capability.mcp_connect_failed", {
+                    name: request.name,
+                    entry_id: request.entry_id,
+                    error: String(mcpErr),
+                    fingerprint: capabilityRuntime.fingerprint,
+                  }, sessionID)
+                  yield* slog.error("capability MCP connect failed", {
+                    name: request.name,
+                    error: String(mcpErr),
+                  })
+                }
+              }
+            }
+
             const tools = yield* resolveTools({
               agent,
               session,
@@ -1965,6 +2275,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               } catch {
                 // best-effort, never block prompt build
               }
+              try {
+                if (capabilityRuntime?.systemSummary) {
+                  system.push(capabilityRuntime.systemSummary)
+                }
+              } catch {
+                // best-effort
+              }
+              // Tool prompt index (minimal, ≤1200 chars) — best-effort
+              try {
+                const projectDir = process.env.DLL_AGENT_ROOT || process.cwd()
+                const overlay = loadProjectOverlay(projectDir)
+                const manifest = buildEffectiveManifest(GLOBAL_DEFAULT_TOOLS, DEFAULT_MANIFEST, overlay, projectDir)
+                const toolIndex = buildPromptIndex(manifest)
+                if (toolIndex) system.push(toolIndex)
+              } catch {
+                // best-effort
+              }
             }
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
@@ -2016,7 +2343,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // ─── dll-agent evidence gate (second break path) ────────────
             if (profileEnabled()) {
               try {
-                const state = supervisorLoadState(sessionID)
+                const state = reconcileSessionState({
+                  sessionID,
+                  projectDir: ctx.directory,
+                  state: supervisorLoadState(sessionID),
+                }).state
                 const metrics = computeTriggerMetrics(msgs)
                 const lastAsst = msgs.findLast((m) => m.info.role === "assistant")
                 const lastAsstText = messageText(lastAsst)
@@ -2030,7 +2361,31 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   allReviewsCompleted: state.required_reviews.length === 0,
                   hasUnresolvedConflict: state.reviewer_conflict,
                   costExceeded: costCheck.exceeded,
+                  sessionID,
+                  projectDir: ctx.directory,
                 }, msgs)
+
+                if (metrics.finalClaim && capabilityRuntime) {
+                  const capabilityBlocks = [
+                    ...capabilityRuntime.unresolvedGaps.map((g) => `missing capability: ${g.tag}`),
+                    ...capabilityRuntime.blockedReasons,
+                  ]
+                  if (capabilityBlocks.length > 0) {
+                    gateResult.passed = false
+                    const block = `capability requirements unresolved: ${capabilityBlocks.slice(0, 4).join("; ")}`
+                    gateResult.block_reason = gateResult.block_reason
+                      ? `${gateResult.block_reason}; ${block}`
+                      : block
+                    gateResult.synthetic_hint = [
+                      gateResult.synthetic_hint,
+                      `<dll-agent-capability-gate>\n${block}\nResolve, verify, or explicitly disclose these capability gaps before claiming completion.\n</dll-agent-capability-gate>`,
+                    ].filter(Boolean).join("\n")
+                    evidenceWrite("gate.capability_blocked", {
+                      fingerprint: capabilityRuntime.fingerprint,
+                      blocks: capabilityBlocks,
+                    }, sessionID)
+                  }
+                }
 
                 // Phase 4: reconciliation hard-block on second gate path too
                 const reconResult = checkReconciliationGate({
@@ -2053,11 +2408,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }
 
                 if (!gateResult.passed) {
-                  // 不 break，继续 loop，让 commander 处理证据缺失
+                  const blockReason = gateResult.block_reason ?? "unknown"
+                  const exhausted = isGateRetryExhausted(state, blockReason)
                   yield* slog.info("evidence gate blocked exit", {
                     risk: state.risk,
                     block_reason: gateResult.block_reason,
+                    exhausted,
                   })
+                  if (exhausted) {
+                    gatePendingHints.push(buildGateBlockSummary(blockReason, gateResult, state, true))
+                    evidenceWrite("gate.retry_exhausted", {
+                      block_reason: blockReason,
+                      retries: state.gate_block_retries?.[blockReason],
+                      path: "second-break",
+                    }, sessionID)
+                    break
+                  }
                   if (gateResult.synthetic_hint) gatePendingHints.push(gateResult.synthetic_hint)
                   continue
                 }

@@ -3,6 +3,7 @@ import fs from "fs"
 import os from "os"
 import path from "path"
 import { write, redact } from "../../src/dll-agent/evidence"
+import { rotateEvidenceWithOptions } from "../../src/dll-agent/evidence-rotation"
 
 let tmpDir: string
 let evidenceFile: string
@@ -53,6 +54,64 @@ describe("DllAgentEvidence rotation (P0-4)", () => {
     const content = fs.readFileSync(evidenceFile, "utf8")
     expect(content).not.toContain("sk-abcdefghijklmn")
     expect(content).toContain("REDACTED")
+  })
+})
+
+describe("DllAgentEvidence session cleanup", () => {
+  test("removes oldest sessions over the cap but preserves active session", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "dll-rotation-"))
+    try {
+      const sessions = path.join(base, "sessions")
+      fs.mkdirSync(sessions, { recursive: true })
+      for (const name of ["old1", "old2", "active"]) {
+        const dir = path.join(sessions, name)
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(path.join(dir, "evidence.jsonl"), "{}\n")
+      }
+      const oldTime = new Date(Date.now() - 10_000)
+      fs.utimesSync(path.join(sessions, "old1"), oldTime, oldTime)
+      fs.utimesSync(path.join(sessions, "old2"), new Date(Date.now() - 5_000), new Date(Date.now() - 5_000))
+
+      const result = rotateEvidenceWithOptions({
+        baseDir: base,
+        maxSessionDirs: 2,
+        activeSessionID: "active",
+        sessionRetentionDays: 365,
+      })
+
+      expect(result.sessionsRemoved).toBe(1)
+      expect(fs.existsSync(path.join(sessions, "active"))).toBe(true)
+      expect(fs.existsSync(path.join(sessions, "old1"))).toBe(false)
+      expect(fs.existsSync(path.join(sessions, "old2"))).toBe(true)
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  test("trims evidence files inside retained sessions", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "dll-rotation-"))
+    try {
+      const dir = path.join(base, "sessions", "ses_trim")
+      fs.mkdirSync(dir, { recursive: true })
+      for (let i = 0; i < 4; i++) {
+        const file = path.join(dir, `evidence-${i}.jsonl`)
+        fs.writeFileSync(file, "{}\n")
+        const when = new Date(Date.now() - (4 - i) * 1000)
+        fs.utimesSync(file, when, when)
+      }
+
+      const result = rotateEvidenceWithOptions({
+        baseDir: base,
+        maxEvidencePerSession: 2,
+        maxSessionDirs: 10,
+        sessionRetentionDays: 365,
+      })
+
+      expect(result.evidenceRemoved).toBe(2)
+      expect(fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl")).length).toBe(2)
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true })
+    }
   })
 })
 

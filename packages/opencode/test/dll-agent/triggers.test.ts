@@ -195,6 +195,16 @@ describe("DllAgentTriggers.verifiedToolEvidence", () => {
     ])
     expect(ok).toBe(false)
   })
+
+  test("browser audit artifact output is real tool evidence even when report has FAIL counts", () => {
+    const ok = verifiedToolEvidence([
+      bashTool(
+        "node audit-full-browser.mjs",
+        "Report saved to: files/full-crm-browser-flow-audit-report.md\n| ❌ FAIL | 5 |\nScreenshots captured: 55",
+      ),
+    ])
+    expect(ok).toBe(true)
+  })
 })
 
 describe("DllAgentTriggers.metrics self-injection filter (P0)", () => {
@@ -318,5 +328,113 @@ describe("DllAgentTriggers.metrics reviewer output filter (P0-2)", () => {
       asstMsg("The reviewerConflictSignal should be checked against user messages only."),
     ])
     expect(m.reviewerConflictSignal).toBe(false)
+  })
+})
+
+// ─── Phase 6: New trigger signals ──────────────────────────────────────────
+
+describe("DllAgentTriggers.Phase6.kimiCompletionCheckSignal", () => {
+  test("triggers when completion claim contains unfinished TODO", () => {
+    const m = metrics([
+      asstMsg("全部任务已完成，但仍有 TODO：文档更新"),
+      asstMsg("all done, TODO: clean up pending"),
+    ])
+    expect(m.finalClaim).toBe(true)
+    expect(m.kimiCompletionCheckSignal).toBe(true)
+  })
+
+  test("triggers when completion claim mentions 未完成", () => {
+    const m = metrics([asstMsg("任务已完成，但未完成：集成测试未运行")])
+    expect(m.kimiCompletionCheckSignal).toBe(true)
+  })
+
+  test("does NOT trigger without completion claim", () => {
+    const m = metrics([asstMsg("Let me investigate the TODO list first.")])
+    expect(m.kimiCompletionCheckSignal).toBe(false)
+  })
+
+  test("does NOT trigger when completion claim has no unfinished indicators", () => {
+    const m = metrics([asstMsg("All tasks completed and verified. Ready to merge.")])
+    expect(m.finalClaim).toBe(true)
+    expect(m.kimiCompletionCheckSignal).toBe(false)
+  })
+})
+
+describe("DllAgentTriggers.Phase6.glmCompletionClaimSignal", () => {
+  test("triggers when completion claim has no real tool evidence", () => {
+    const m = metrics([asstMsg("All tasks are done, verified and completed.")])
+    expect(m.glmCompletionClaimSignal).toBe(true)
+  })
+
+  test("does NOT trigger without completion claim", () => {
+    const m = metrics([asstMsg("Still working on the bug fix...")])
+    expect(m.glmCompletionClaimSignal).toBe(false)
+  })
+})
+
+describe("DllAgentTriggers.Phase6.kimiPreReportSignal", () => {
+  test("triggers when context is high (>=30%) and final claim detected", () => {
+    // Use lastAssistant tokens to simulate high token count
+    const highTokenAsst = {
+      info: {
+        id: "msg_asst_high",
+        sessionID: "ses_test",
+        role: "assistant" as const,
+        time: { created: 0 },
+        agent: "commander",
+        model: { providerID: "deepseek", modelID: "deepseek-v4-pro" },
+        tokens: { input: 350000, output: 50000, reasoning: 0, cache: { read: 0, write: 0 } },
+      } as any,
+      parts: [{ type: "text" as const, text: "All done, completed successfully!", id: "p", messageID: "m", sessionID: "ses_test" } as any],
+    }
+    const m = metrics([highTokenAsst], 1_000_000)
+    expect(m.contextPercent).toBe(40)
+    expect(m.kimiPreReportSignal).toBe(true)
+  })
+
+  test("does NOT trigger when context is below 30%", () => {
+    const lowTokenAsst = {
+      info: {
+        id: "msg_asst_low",
+        sessionID: "ses_test",
+        role: "assistant" as const,
+        time: { created: 0 },
+        agent: "commander",
+        model: { providerID: "deepseek", modelID: "deepseek-v4-pro" },
+        tokens: { input: 100000, output: 50000, reasoning: 0, cache: { read: 0, write: 0 } },
+      } as any,
+      parts: [{ type: "text" as const, text: "All done!", id: "p", messageID: "m", sessionID: "ses_test" } as any],
+    }
+    const m = metrics([lowTokenAsst], 1_000_000)
+    expect(m.kimiPreReportSignal).toBe(false)
+  })
+})
+
+describe("DllAgentTriggers.Phase6.scopeExpandedSignal", () => {
+  test("triggers when correction pattern and scope expansion detected", () => {
+    const m = metrics([userMsg("不对，你扩大了范围，增加了额外功能")])
+    expect(m.scopeExpandedSignal).toBe(true)
+  })
+
+  test("does NOT trigger in normal flow", () => {
+    const m = metrics([userMsg("继续执行下一步")])
+    expect(m.scopeExpandedSignal).toBe(false)
+  })
+})
+
+describe("DllAgentTriggers.Phase6.phaseSwitchSignal", () => {
+  test("triggers when user changes direction explicitly", () => {
+    const m = metrics([userMsg("先不要做那个了，换个方向，先修这个bug")])
+    expect(m.phaseSwitchSignal).toBe(true)
+  })
+
+  test("triggers when user says 暂停 + new task", () => {
+    const m = metrics([userMsg("暂停当前任务，改为检查 token 使用")])
+    expect(m.phaseSwitchSignal).toBe(true)
+  })
+
+  test("does NOT trigger in normal continuation", () => {
+    const m = metrics([userMsg("继续刚才的工作")])
+    expect(m.phaseSwitchSignal).toBe(false)
   })
 })

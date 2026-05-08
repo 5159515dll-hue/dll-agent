@@ -19,6 +19,7 @@ export type PhaseName = string
 export type ReviewerRole =
   | "requirements-inspector"
   | "long-context-archivist"
+  | "task-completion-archivist"
   | "chief-engineer"
   | "final-auditor"
   | "role-cross"
@@ -120,6 +121,12 @@ export interface SupervisorState {
   running_reviewers?: string[]
   /** gate block 重试计数: block_reason → 已重试次数 (防止无限循环) */
   gate_block_retries?: Record<string, number>
+  /** 已迁移/归档的旧 gate retry，避免历史阻断污染当前 readiness */
+  gate_block_history?: Record<string, { retries: number; archived_at: string; reason: string }>
+  /** Continuation tracking (防止无限 continuation 循环) */
+  continuation_count?: number
+  repair_counts?: Record<string, number>
+  last_continuation_packet_id?: string
   /** 最后更新时间 */
   updated_at: string
 }
@@ -135,6 +142,16 @@ export interface SupervisorMetricsSnapshot {
   reviewer_conflict_signal: boolean
   repeated_tool_failure: boolean
   real_tool_evidence: boolean
+  /** Phase 6: Kimi completion check signal */
+  kimi_completion_check_signal?: boolean
+  /** Phase 6: GLM completion claim signal */
+  glm_completion_claim_signal?: boolean
+  /** Phase 6: Kimi pre-report signal */
+  kimi_pre_report_signal?: boolean
+  /** Phase 6: Scope expansion signal */
+  scope_expanded_signal?: boolean
+  /** Phase 6: Phase switch signal */
+  phase_switch_signal?: boolean
 }
 
 // ─── Trigger 决策 ───────────────────────────────────────────────────────────
@@ -211,9 +228,11 @@ export const DEFAULT_COST_CAP: CostCapConfig = {
   session_cap_usd: 5.0,
   provider_caps: {
     deepseek: 3.0,
-    kimi: 1.5,
+    // Phase 6: Increase Kimi cap — Kimi is ~5x cheaper per token than DeepSeek
+    // and should be used MORE for summarization/context compression tasks.
+    kimi: 2.5,
     openai: 1.0,
-    zai: 1.0,
+    zai: 1.5,
   },
   single_call_cap_usd: 1.0,
 }
@@ -248,6 +267,10 @@ export interface EvidenceGateInput {
   hasUnresolvedConflict: boolean
   /** 成本是否超出上限 */
   costExceeded: boolean
+  /** 当前 session，用于读取 Result Ledger */
+  sessionID?: string
+  /** 当前项目目录，用于读取 Artifact Ledger */
+  projectDir?: string
 }
 
 export interface EvidenceGateResult {
@@ -262,6 +285,84 @@ export interface EvidenceGateResult {
   /** 应注入的 synthetic hint（如果未通过） */
   synthetic_hint: string | null
 }
+
+// ─── Continuation Gate ──────────────────────────────────────────────────────
+
+export type CompletionStatus =
+  | "VERIFIED_COMPLETE"
+  | "PARTIAL_CONTINUED"
+  | "BLOCKED_USER_REQUIRED"
+  | "BLOCKED_BUDGET_EXHAUSTED"
+  | "UNVERIFIED_COMPLETE"
+  | "FAILED"
+
+export type UnfinishedKind =
+  | "blocking_unfinished"
+  | "non_blocking_followup"
+  | "requires_user_input"
+
+export interface UnfinishedItem {
+  id: string
+  kind: UnfinishedKind
+  description: string
+  why_blocking?: string
+  evidence_refs: string[]
+  required_action: string
+  recommended_role: ReviewerRole
+  verification_required: string[]
+  risk_level: RiskLevel
+}
+
+export interface ContinuationPacket {
+  packet_type: "task_continuation"
+  packet_id: string
+  session_id: string
+  user_goal: string
+  current_phase: string
+  completion_claim: string
+  completion_status: CompletionStatus
+  blocking_unfinished: UnfinishedItem[]
+  non_blocking_followup: UnfinishedItem[]
+  requires_user_input: UnfinishedItem[]
+  already_completed: string[]
+  files_involved: string[]
+  commands_run: string[]
+  verification_results: string[]
+  reviewer_blocks: string[]
+  next_execution_plan: {
+    step: number
+    role: ReviewerRole
+    action: string
+    verification: string
+  }[]
+  stop_reason: string | null
+  redaction_status: "redacted"
+}
+
+export interface ContinuationGateResult {
+  passed: boolean
+  completion_status: CompletionStatus
+  has_blocking_unfinished: boolean
+  has_user_input_required: boolean
+  has_non_blocking: boolean
+  blocking_items: UnfinishedItem[]
+  continuation_packet: ContinuationPacket | null
+  synthetic_hint: string | null
+  block_reason: string | null
+}
+
+export const CONTINUATION_BUDGET = {
+  /** 同一 continuation packet 最多自动执行轮数 */
+  max_auto_rounds: 2,
+  /** 同一 blocking item 最多自动修复次数 */
+  max_repairs_per_item: 2,
+  /** 每个 task 最多 continuation 次数 */
+  max_continuations: 5,
+  /** 每轮最多触发的额外 reviewer */
+  max_reviewers_per_continuation: 1,
+  /** 每个 session 最多 cross-review council 次数 */
+  max_council_per_session: 3,
+} as const
 
 // ─── Evidence 记录（增强版）─────────────────────────────────────────────────
 
@@ -300,3 +401,10 @@ export type EvidenceRecordType =
   | "agent.profile.enabled"
   | "agent.get"
   | "system.environment"
+  // Phase 7: Result Ledger evidence types
+  | "result.produced"
+  | "result.reused"
+  | "result.invalidated"
+  | "result.dedup_blocked"
+  | "result.dedup_allowed"
+  | "result.stale_detected"

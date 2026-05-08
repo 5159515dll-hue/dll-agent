@@ -109,6 +109,7 @@ interface SkillDefinition {
 - 测试/typecheck/doctor 失败信号 → 由 supervisor 传递
 - 上下文过长信号 → 由 supervisor 传递
 - evidence 缺失信号 → 由 gate 传递
+- capability runtime intents → 由 `capability-orchestrator.ts` 根据 registry/planner 选中的能力标签传递
 
 **限制规则（底层代码实现）：**
 
@@ -182,7 +183,7 @@ interface SkillDefinition {
 | 特性 | 状态 | 文件 |
 |---|---|---|
 | SkillDefinition 接口（完整字段） | ✅ 已实现 | `skill-registry.ts:12-88` |
-| 8 个内置技能定义 | ✅ 已实现 | `skill-registry.ts:90-290` |
+| 9 个内置技能定义 | ✅ 已实现 | `skill-registry.ts:90-290` |
 | self-upgrade 技能 | ✅ 已实现 | `skill-registry.ts` (第 9 个技能) |
 | 激活/停用/cooldown/fingerprint 逻辑 | ✅ 已实现 | `skills.ts` |
 | 三层加载（metadata/summary/full） | ✅ 已实现 | `skill-loader.ts` |
@@ -190,6 +191,7 @@ interface SkillDefinition {
 | 持久化到 ~/.dll-agent/sessions/ | ✅ 已实现 | `skills.ts:persist()` |
 | bash 命令拦截（forbiddenCommands） | ✅ 已实现 | `skills.ts:checkForbiddenCommand()` |
 | Evidence 记录技能激活 | ✅ 已实现 | `skills.ts:activate()` 侧 |
+| Capability-derived intents | ✅ 已实现 | `prompt.ts` 将 `capabilityRuntime.skillIntents` 传入 `activateSkills()`，新能力可通过 registry triggers 驱动 skill 激活 |
 | 工具失败信号接入 trigger | ⚠️ 部分实现 | 通过 supervisor 传递，未直接 hook |
 | 测试覆盖 | ✅ 39 tests pass | `test/dll-agent/` |
 | TypeScript 类型检查 | ✅ tsgo --noEmit 通过 | |

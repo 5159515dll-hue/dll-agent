@@ -17,6 +17,11 @@ import { classifyCommand, classifyFileOp } from "./permission-classifier"
 import { lspDoctorCheck } from "./lsp-bridge"
 import { getStorageStats } from "./evidence-rotation"
 import { checkEvidenceGate, checkReconciliationGate, finalGate } from "./gates"
+import { checkContinuationGate } from "./continuation-gate"
+import { CAPABILITY_ORCHESTRATOR_VERSION } from "./capability-orchestrator"
+import { scanArtifactLedger } from "./artifact-ledger"
+import { buildEvidenceSnapshot } from "./evidence-normalizer"
+import { evaluateCompletionReadiness } from "./completion-readiness"
 import type { RiskLevel } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
 import { execSync } from "child_process"
@@ -297,6 +302,79 @@ function checkMultiModelHandoff(): DoctorCheck[] {
     evidence: null,
   })
 
+  // Continuation gate check: does it detect blocking unfinished items?
+  const contState = {
+    version: 1 as const, phase: "test", risk: "medium" as const,
+    required_reviews: [], completed_reviews: [],
+    blocked_completion: false, block_reason: null, reviewer_conflict: false,
+    metrics: { tool_failures: 0, permission_denied: 0, user_corrections: 0,
+      context_percent: 0, context_tokens: 0, final_claim: true,
+      verification_evidence: false, reviewer_conflict_signal: false,
+      repeated_tool_failure: false, real_tool_evidence: false },
+    updated_at: new Date().toISOString(),
+  }
+  const contResult = checkContinuationGate({
+    assistantText: "Task complete. 未完成: key bridge not wired.",
+    isCompletionClaim: true,
+    state: contState,
+    sessionID: "doctor-check",
+  })
+  checks.push({
+    name: "continuation-gate",
+    severity: !contResult.passed ? "PASS" :
+      contResult.has_non_blocking ? "WARN" : "FAIL",
+    message: !contResult.passed
+      ? "Continuation gate correctly blocks completion with unfinished items"
+      : contResult.has_non_blocking
+      ? "Continuation gate detects non-blocking unfinished items"
+      : "Continuation gate did NOT detect unfinished items — may indicate detection gap",
+    nextAction: contResult.passed && !contResult.has_non_blocking
+      ? "Review UNFINISHED_INDICATOR_PATTERNS in continuation-gate.ts"
+      : null,
+    evidence: contResult.block_reason,
+  })
+
+  return checks
+}
+
+function checkArtifactEvidence(projectRoot?: string): DoctorCheck[] {
+  const checks: DoctorCheck[] = []
+  if (!projectRoot) {
+    checks.push({
+      name: "artifact-ledger",
+      severity: "WARN",
+      message: "Project root unavailable; artifact ledger check skipped",
+      nextAction: "Run doctor from a project directory",
+      evidence: null,
+    })
+    return checks
+  }
+
+  try {
+    const artifactSnapshot = scanArtifactLedger(projectRoot)
+    const evidenceSnapshot = buildEvidenceSnapshot({ projectDir: projectRoot })
+    const readiness = evaluateCompletionReadiness({ snapshot: evidenceSnapshot })
+    const blockers = [...new Set([...artifactSnapshot.blockers, ...evidenceSnapshot.blockers])]
+    checks.push({
+      name: "artifact-ledger",
+      severity: blockers.length > 0 ? "WARN" : "PASS",
+      message: artifactSnapshot.artifacts.length > 0
+        ? `Artifact ledger found ${artifactSnapshot.artifacts.length} artifact(s), ${artifactSnapshot.screenshotCount} screenshot(s), ${artifactSnapshot.auditReports.length} audit report(s), readiness=${readiness.status}`
+        : "No task artifacts detected in common artifact locations",
+      nextAction: blockers.length > 0
+        ? "Resolve report blockers: redact secrets, fix FAILs, remove contradictory completion claims, or disclose PARTIAL/BLOCKED"
+        : null,
+      evidence: blockers.join("; ") || `completion_readiness=${readiness.status}`,
+    })
+  } catch (error) {
+    checks.push({
+      name: "artifact-ledger",
+      severity: "WARN",
+      message: "Could not inspect task artifacts",
+      nextAction: "Check files/, test-screenshots/, output/, and .playwright-mcp manually",
+      evidence: String(error),
+    })
+  }
   return checks
 }
 
@@ -307,18 +385,36 @@ function checkResourceHealth(): DoctorCheck[] {
 
   // Check for dangling bun/opencode background processes
   try {
-    const ps = execSync("ps aux 2>/dev/null | grep -E '(bun|opencode)' | grep -v grep | wc -l", {
+    const psOutput = execSync("ps -axo pid,%cpu,command 2>/dev/null", {
       encoding: "utf8",
       timeout: 2_000,
-    }).trim()
-    const count = parseInt(ps, 10)
+    })
+    const processLines = psOutput
+      .split("\n")
+      .slice(1)
+      .filter((line) => /\b(bun|opencode)\b/.test(line))
+      .filter((line) => !/dll-agent doctor|rg -i|grep/.test(line))
+    const count = processLines.length
+    const hot = processLines
+      .map((line) => line.trim().match(/^(\d+)\s+([0-9.]+)\s+(.+)$/))
+      .filter((match): match is RegExpMatchArray => Boolean(match))
+      .filter((match) => Number(match[2]) >= 20)
+      .map((match) => `${match[1]}:${match[2]}%`)
     if (count > 5) {
       checks.push({
         name: "background-processes",
         severity: "WARN",
         message: `${count} bun/opencode background processes found — may indicate stale or leaked processes`,
-        nextAction: "Run: ps aux | grep -E '(bun|opencode)' and investigate stale processes",
-        evidence: `count=${count}`,
+        nextAction: "Run: ps -axo pid,%cpu,command | grep -E 'bun|opencode'; kill only stale session PIDs",
+        evidence: `count=${count}${hot.length ? `, hot=${hot.join(",")}` : ""}`,
+      })
+    } else if (hot.length > 0) {
+      checks.push({
+        name: "background-processes",
+        severity: "WARN",
+        message: `High-CPU bun/opencode process detected (${hot.join(", ")})`,
+        nextAction: `Inspect the matching session; if stale, run: kill ${hot.map((item) => item.split(":")[0]).join(" ")}`,
+        evidence: `count=${count}, hot=${hot.join(",")}`,
       })
     } else {
       checks.push({
@@ -336,6 +432,98 @@ function checkResourceHealth(): DoctorCheck[] {
       message: "Could not check background processes (ps not available)",
       nextAction: "Manually check process count",
       evidence: null,
+    })
+  }
+
+  // Check for Playwright MCP processes that outlive a session.
+  try {
+    const psOutput = execSync("ps -axo pid,ppid,%cpu,etime,command 2>/dev/null | grep 'playwright-mcp' | grep -v grep", {
+      encoding: "utf8",
+      timeout: 2_000,
+    }).trim()
+    const lines = psOutput ? psOutput.split("\n").map((line) => line.trim()).filter(Boolean) : []
+    const pids = lines
+      .map((line) => line.match(/^(\d+)\s+/)?.[1])
+      .filter(Boolean)
+    if (pids.length > 0) {
+      checks.push({
+        name: "playwright-mcp-processes",
+        severity: "WARN",
+        message: `${pids.length} playwright-mcp process(es) are running; verify they belong to active sessions`,
+        nextAction: `If stale, stop via /mcp-stop playwright or run: kill ${pids.join(" ")}`,
+        evidence: `pids=${pids.join(",")}`,
+      })
+    } else {
+      checks.push({
+        name: "playwright-mcp-processes",
+        severity: "PASS",
+        message: "No playwright-mcp residual processes detected",
+        nextAction: null,
+        evidence: null,
+      })
+    }
+  } catch {
+    checks.push({
+      name: "playwright-mcp-processes",
+      severity: "PASS",
+      message: "No playwright-mcp residual processes detected",
+      nextAction: null,
+      evidence: null,
+    })
+  }
+
+  // Check quota status freshness and provider refresh errors.
+  try {
+    const quotaFile = process.env.DLL_AGENT_QUOTA_FILE ?? path.join(os.homedir(), ".dll-agent", "quota", "status.json")
+    if (fs.existsSync(quotaFile)) {
+      const quota = JSON.parse(fs.readFileSync(quotaFile, "utf8")) as {
+        updated_at?: number
+        ttl_sec?: number
+        refresh_errors?: { provider?: string; error?: string }[] | null
+        providers?: Record<string, { status?: string; message?: string }>
+      }
+      const updated = quota.updated_at ?? 0
+      const ttl = quota.ttl_sec ?? 300
+      const age = updated ? Math.max(0, Math.floor(Date.now() / 1000 - updated)) : Number.POSITIVE_INFINITY
+      const errors = [
+        ...(quota.refresh_errors ?? []).map((e) => `${e.provider ?? "unknown"}:${e.error ?? "error"}`),
+        ...Object.entries(quota.providers ?? {})
+          .filter(([, provider]) => provider?.status === "error")
+          .map(([name, provider]) => `${name}:${provider.message ?? "error"}`),
+      ]
+      if (age > ttl || errors.length > 0) {
+        checks.push({
+          name: "quota-refresh",
+          severity: "WARN",
+          message: `Quota status ${age > ttl ? `stale (${age}s > TTL ${ttl}s)` : "has provider refresh errors"}`,
+          nextAction: "Run: /Users/dailulu/.local/bin/dll-agent-quota (or restart dll-agent if refresh is managed at launch)",
+          evidence: `file=${quotaFile}, age=${Number.isFinite(age) ? age : "missing"}, ttl=${ttl}, errors=${errors.slice(0, 3).join(";") || "none"}`,
+        })
+      } else {
+        checks.push({
+          name: "quota-refresh",
+          severity: "PASS",
+          message: `Quota status fresh (${age}s <= TTL ${ttl}s)`,
+          nextAction: null,
+          evidence: `file=${quotaFile}`,
+        })
+      }
+    } else {
+      checks.push({
+        name: "quota-refresh",
+        severity: "WARN",
+        message: "Quota status file is missing",
+        nextAction: "Run: /Users/dailulu/.local/bin/dll-agent-quota",
+        evidence: `file=${quotaFile}`,
+      })
+    }
+  } catch (error) {
+    checks.push({
+      name: "quota-refresh",
+      severity: "WARN",
+      message: "Could not parse quota status",
+      nextAction: "Regenerate quota status with dll-agent-quota",
+      evidence: String(error),
     })
   }
 
@@ -428,6 +616,241 @@ function checkResourceHealth(): DoctorCheck[] {
   return checks
 }
 
+// ─── Capability System Checks ────────────────────────────────────────────────
+
+function checkCapabilityHealth(projectRoot?: string): DoctorCheck[] {
+  const checks: DoctorCheck[] = []
+
+  checks.push({
+    name: "capability-orchestrator",
+    severity: "PASS",
+    message: `Capability runtime orchestrator loaded (v${CAPABILITY_ORCHESTRATOR_VERSION})`,
+    nextAction: null,
+    evidence: "module=capability-orchestrator.ts",
+  })
+
+  try {
+    if (projectRoot) {
+      const promptFile = path.join(projectRoot, "packages", "opencode", "src", "session", "prompt.ts")
+      if (fs.existsSync(promptFile)) {
+        const prompt = fs.readFileSync(promptFile, "utf8")
+        const wired =
+          prompt.includes("orchestrateCapabilities(") &&
+          prompt.includes("capabilityRuntime?.mcpRequests") &&
+          prompt.includes("mcp.add(")
+        checks.push({
+          name: "capability-runtime-wiring",
+          severity: wired ? "PASS" : "FAIL",
+          message: wired
+            ? "Capability planner is wired into session prompt runtime and MCP connect path"
+            : "Capability modules exist but are not wired into prompt runtime",
+          nextAction: wired ? null : "Wire capability-orchestrator.ts into session/prompt.ts before resolveTools()",
+          evidence: `file=${promptFile}`,
+        })
+      }
+    }
+  } catch (error) {
+    checks.push({
+      name: "capability-runtime-wiring",
+      severity: "WARN",
+      message: "Could not verify capability runtime wiring",
+      nextAction: "Inspect session/prompt.ts for orchestrateCapabilities() and MCP.Service.add/connect integration",
+      evidence: String(error),
+    })
+  }
+
+  // Check: registry files exist and are parseable
+  try {
+    const regDir = path.join(os.homedir(), ".dll-agent", "capabilities")
+    const regFile = path.join(regDir, "registry.json")
+    const discFile = path.join(regDir, "discovered.json")
+
+    if (fs.existsSync(regFile)) {
+      try {
+        const reg = JSON.parse(fs.readFileSync(regFile, "utf8"))
+        const entryCount = Array.isArray(reg.entries) ? reg.entries.length : 0
+        checks.push({
+          name: "capability-registry-global",
+          severity: entryCount > 0 ? "PASS" : "WARN",
+          message: entryCount > 0
+            ? `Global registry has ${entryCount} entries`
+            : "Global registry file exists but has no entries",
+          nextAction: entryCount === 0 ? "Run capability discovery" : null,
+          evidence: `file=${regFile}`,
+        })
+      } catch {
+        checks.push({
+          name: "capability-registry-global",
+          severity: "FAIL",
+          message: "Global registry file is corrupted (unparseable JSON)",
+          nextAction: "Regenerate registry from builtins or remove corrupted file",
+          evidence: `file=${regFile}`,
+        })
+      }
+    } else {
+      checks.push({
+        name: "capability-registry-global",
+        severity: "WARN",
+        message: "Global registry file does not exist",
+        nextAction: "Run capability discovery to populate registry",
+        evidence: `missing=${regFile}`,
+      })
+    }
+
+    // Discovered layer
+    if (fs.existsSync(discFile)) {
+      try {
+        const disc = JSON.parse(fs.readFileSync(discFile, "utf8"))
+        const entryCount = Array.isArray(disc.entries) ? disc.entries.length : 0
+        checks.push({
+          name: "capability-registry-discovered",
+          severity: "PASS",
+          message: `Discovered layer has ${entryCount} entries`,
+          nextAction: null,
+          evidence: `file=${discFile}`,
+        })
+      } catch {
+        checks.push({
+          name: "capability-registry-discovered",
+          severity: "WARN",
+          message: "Discovered registry file is corrupted",
+          nextAction: "Clear discovery cache and re-run discovery",
+          evidence: `file=${discFile}`,
+        })
+      }
+    }
+
+    // Discovery cache staleness
+    const cacheFile = path.join(regDir, "discovery-cache.json")
+    if (fs.existsSync(cacheFile)) {
+      try {
+        const cache = JSON.parse(fs.readFileSync(cacheFile, "utf8"))
+        const age = Date.now() - new Date(cache.last_run_at).getTime()
+        const staleness = age > 24 * 60 * 60 * 1000 ? "STALE" : "OK"
+        checks.push({
+          name: "capability-discovery-cache",
+          severity: staleness === "STALE" ? "WARN" : "PASS",
+          message: staleness === "STALE"
+            ? `Discovery cache is stale (${Math.round(age / 3600000)}h old)`
+            : `Discovery cache is fresh (${Math.round(age / 3600000)}h ago)`,
+          nextAction: staleness === "STALE" ? "Re-run capability discovery" : null,
+          evidence: `age_hours=${Math.round(age / 3600000)}`,
+        })
+      } catch {
+        checks.push({
+          name: "capability-discovery-cache",
+          severity: "WARN",
+          message: "Discovery cache is corrupted",
+          nextAction: "Clear and re-run discovery",
+          evidence: `file=${cacheFile}`,
+        })
+      }
+    }
+
+    // Project registry
+    if (projectRoot) {
+      const projFile = path.join(projectRoot, ".dll-agent", "capabilities.json")
+      if (fs.existsSync(projFile)) {
+        checks.push({
+          name: "capability-registry-project",
+          severity: "PASS",
+          message: "Project-level capability registry exists",
+          nextAction: null,
+          evidence: `file=${projFile}`,
+        })
+      }
+    }
+  } catch (err) {
+    checks.push({
+      name: "capability-system",
+      severity: "WARN",
+      message: "Could not inspect capability registry files",
+      nextAction: "Check ~/.dll-agent/capabilities/ directory",
+      evidence: String(err),
+    })
+  }
+
+  // Check: MCP lifecycle residuals via runtime state
+  try {
+    const runtimeDir = path.join(os.homedir(), ".dll-agent", "runtime")
+    if (fs.existsSync(runtimeDir)) {
+      const files = fs.readdirSync(runtimeDir).filter((f) => f.endsWith(".json"))
+      let staleCount = 0
+      let failedCount = 0
+      for (const file of files) {
+        try {
+          const state = JSON.parse(fs.readFileSync(path.join(runtimeDir, file), "utf8"))
+          if (state.status === "failed") failedCount++
+          if (state.status === "idle" && !state.pid) staleCount++
+        } catch { /* skip */ }
+      }
+      if (failedCount > 0) {
+        checks.push({
+          name: "capability-runtime-failed",
+          severity: "WARN",
+          message: `${failedCount} capability runtime(s) in failed state`,
+          nextAction: "Review failed capabilities and clear stale states",
+          evidence: `runtime_dir=${runtimeDir}, failed=${failedCount}`,
+        })
+      }
+      if (staleCount > 5) {
+        checks.push({
+          name: "capability-runtime-stale",
+          severity: "WARN",
+          message: `${staleCount} stale runtime states (no PID, idle)`,
+          nextAction: "Run capability lifecycle cleanup",
+          evidence: `runtime_dir=${runtimeDir}, stale=${staleCount}`,
+        })
+      } else if (files.length > 0) {
+        checks.push({
+          name: "capability-runtime",
+          severity: "PASS",
+          message: `${files.length} capability runtime state(s), ${staleCount} stale`,
+          nextAction: null,
+          evidence: `runtime_dir=${runtimeDir}`,
+        })
+      }
+    }
+  } catch {
+    // Optional check
+  }
+
+  // Check: source/confidence anomalies
+  try {
+    const regFile = path.join(os.homedir(), ".dll-agent", "capabilities", "registry.json")
+    if (fs.existsSync(regFile)) {
+      const reg = JSON.parse(fs.readFileSync(regFile, "utf8"))
+      const entries = Array.isArray(reg.entries) ? reg.entries : []
+      const docSummaryEntries = entries.filter((e: any) => e.source_type === "doc-summary" && e.confidence > 0.5)
+      if (docSummaryEntries.length > 0) {
+        checks.push({
+          name: "capability-confidence-anomaly",
+          severity: "WARN",
+          message: `${docSummaryEntries.length} doc-summary entries with confidence > 0.5`,
+          nextAction: "Doc-summary sources should have confidence capped at 0.5",
+          evidence: `count=${docSummaryEntries.length}`,
+        })
+      }
+      const lowConfidenceHighRisk = entries.filter(
+        (e: any) => e.risk_level === "high" && e.confidence < 0.5 && e.status === "available",
+      )
+      if (lowConfidenceHighRisk.length > 0) {
+        checks.push({
+          name: "capability-risk-confidence-mismatch",
+          severity: "WARN",
+          message: `${lowConfidenceHighRisk.length} high-risk capabilities with low confidence (<0.5) marked as available`,
+          nextAction: "Review these entries — should they be degraded?",
+          evidence: `count=${lowConfidenceHighRisk.length}`,
+        })
+      }
+    }
+  } catch {
+    // Optional check
+  }
+
+  return checks
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
@@ -445,12 +868,16 @@ export function runDoctor(projectRoot?: string): DoctorReport {
 
   // Evidence health
   allChecks.push(...checkEvidenceHealth())
+  allChecks.push(...checkArtifactEvidence(root))
 
   // Multi-model handoff checks
   allChecks.push(...checkMultiModelHandoff())
 
   // Resource health checks
   allChecks.push(...checkResourceHealth())
+
+  // Capability system checks
+  allChecks.push(...checkCapabilityHealth(root))
 
   const passCount = allChecks.filter((c) => c.severity === "PASS").length
   const warnCount = allChecks.filter((c) => c.severity === "WARN").length

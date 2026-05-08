@@ -121,6 +121,30 @@ dll-agent 的全局默认 tools / skills / MCP 注册与按需加载系统。
 | `/mcp-start <name>` | 启动指定 MCP（检查注册/移除/healthcheck/确认/进程/端口/mutex） |
 | `/mcp-stop <name>` | 停止指定 MCP（SIGTERM → releaseLock → markStopped → evidence） |
 | `/mcp-health <name>` | 对指定 MCP 运行健康检查（进程存活 + healthUrl probe） |
+| `/capability-status` | 直接渲染当前 capability registry / resolver / runtime 状态，不再只是提示词模板 |
+
+## Artifact / Evidence 闭环
+
+日期：2026-05-08
+
+dll-agent 现在区分“业务源码修改”和“任务产物”。浏览器审计、E2E、UX audit 等任务生成的脚本、报告、截图、trace、log 会进入 artifact evidence，而不是被简单当成业务源码变更或自然语言声明。
+
+| 产物 | 分类 | gate 行为 |
+|------|------|-----------|
+| `audit-full-browser.mjs` / `browser-test.mjs` | `generated_script` | 记录为任务审计脚本，不等同业务源码修改 |
+| `files/*audit-report*.md` | `audit_report` | 解析 Total/PASS/FAIL/WARN；存在 FAIL 时不能 verified complete |
+| `test-screenshots/*.png` | `screenshot` | 与 audit report 组合后算 real tool evidence |
+| `.playwright-mcp/*.log` | `command_log` | 可作为浏览器/MCP 执行证据引用 |
+
+重要规则：
+
+- report + screenshots 证明“确实执行过浏览器审计”。
+- report 中 `FAIL > 0` 证明“审计未完全通过”，只能 PARTIAL/BLOCKED，不能 PASS。
+- 报告同时写 “No blocking issues found” 和 `FAIL > 0` 时，Completion Readiness Gate 会阻断 verified completion。
+- 生成报告中的 password/token/API key/JWT 等敏感值会在 artifact 扫描时自动脱敏；密码表格列会写成 `REDACTED`。
+- 如果旧 session 仍保留 “completion claim without verification evidence” 的历史 gate block，`session-reconciler.ts` 会在发现 artifact/result evidence 后清理或重分类该 block。
+- `artifact-result-ledger.ts` 会把报告、截图、脚本补写为 `results.jsonl` 的 ResultPacket，避免 Result Ledger 断档。
+- Artifact Ledger 是底层代码能力，不是 prompt-only 约束。
 
 ## 文件路径
 
@@ -132,6 +156,7 @@ dll-agent 的全局默认 tools / skills / MCP 注册与按需加载系统。
 | Session effective | `~/.dll-agent/sessions/<id>/effective-tools.json` | JSON (redacted) |
 | MCP 状态文件 | `~/.dll-agent/mcp/<name>.json` | JSON |
 | MCP 锁文件 | `~/.dll-agent/mcp/<name>.lock` | JSON |
+| Quota 刷新 PID | `~/.dll-agent/quota/refresh.pid` | 单例后台刷新进程 |
 
 ## Project Overlay Schema
 
@@ -190,9 +215,10 @@ dll-agent 的全局默认 tools / skills / MCP 注册与按需加载系统。
 | 全局默认工具清单 | ✅ 底层代码实现 | `tool-catalog.ts` + `~/.dll-agent/global/tools.jsonc` |
 | 项目级叠加清单 | ✅ 底层代码实现 | `tool-overlay.ts` merge logic |
 | 运行中重新加载 | ✅ 底层代码实现 | `/tools-reload` 命令 + `buildEffectiveManifest()` |
-| MCP 按需启动 | ⚠️ 部分实现 | mcp-manager 锁/healthcheck 逻辑已就绪；与 opencode MCP Effect layer 的全链路桥接尚未完成 |
-| MCP 健康检查 | ⚠️ 部分实现 | 进程存活检查已实现；HTTP healthUrl probe 尚未实现 |
+| MCP 按需启动 | ✅ 最小闭环实现 | capability-orchestrator 在 session loop 中基于任务目标规划 MCP，并在 `resolveTools()` 前通过 `MCP.Service.add()` 接入 OpenCode MCP tools；mcp-manager 仍负责状态收敛/cleanup |
+| MCP 健康检查 | ✅ 底层代码实现 | 进程存活检查、stale PID 状态收敛和本地 HTTP healthUrl probe 已实现；远程 healthUrl 默认跳过，避免无授权外部网络访问 |
 | MCP 互斥锁 | ✅ 底层代码实现 | `acquireLock()` / `releaseLock()` in mcp-manager.ts |
+| MCP 生命周期清理 | ✅ 底层代码实现 | `reconcileMcpStatus()` / `cleanupManagedMcp()`；只停止 dll-agent 管理过的过期 PID，不按字符串误杀未知进程 |
 | Prompt 最小注入 | ✅ 底层代码实现 | `tool-prompt.ts` index/detail 分离 + 字符上限 |
 | Evidence 记录 | ✅ 底层代码实现 | 所有 load/merge/start/stop 事件写入 evidence |
 | Doctor 检查 | ✅ 底层代码实现 | `toolDoctorChecks()` 8 项检查 |
@@ -202,9 +228,41 @@ dll-agent 的全局默认 tools / skills / MCP 注册与按需加载系统。
 | 安全脱敏 | ✅ 继承现有 | `evidence.ts:redact()` 统一脱敏 |
 | 文档 | ✅ 本文档 | `packages/docs/dll-agent-tools.md` |
 
+## Capability Runtime 接入状态
+
+日期：2026-05-08
+
+`capability-orchestrator.ts` 已把 tools/skills/MCP/software 的声明式 registry 接入 `session/prompt.ts` 主循环：
+
+- 运行时从 builtin + global + discovered + project registry 合并有效能力。
+- 根据最近用户目标、涉及文件、失败类型推断 required capability tags。
+- 通过 resolver 输出 use / skill_activate / mcp_connect / ask_permission / blocked。
+- `capability-action-runner.ts` 只执行低风险、项目 cwd、argv 形式的 auto_install；brew/sudo/global npm/git/gh/rm/curl/wget 等继续阻断。
+- auto-install 成功后会执行 allowlisted verify commands，并写入 Result Ledger；验证失败则记录为 `PARTIAL`，不会当成 verified completion。
+- 在 `resolveTools()` 前调用 OpenCode `MCP.Service.add()`，因此自动接入的 MCP 会被 `mcp.tools()` 暴露给模型。
+- capability tags 会作为 skill intents 传给 `skills.ts`，新 skill/MCP/tool 只要声明 `capabilities + triggers` 就能被规划，不需要改任务分类器。
+- final gate 已接入 capability gap/block：需要的能力未满足时不能写 verified completion。
+
+仍需区分：
+
+| 能力 | 状态 |
+|------|------|
+| Registry / planner / resolver | ✅ 底层代码实现 |
+| Session runtime orchestration | ✅ 已接入 `prompt.ts` |
+| MCP 进入 OpenCode tools | ✅ 通过 `MCP.Service.add()` 接入 |
+| 低风险自动安装执行器 | ✅ 已实现，限制在项目内 argv allowlist |
+| MCP HTTP healthUrl probe | ✅ 已实现本地 URL probe；远程 URL 默认跳过，避免 doctor/healthcheck 触发外部网络 |
+| Slash 命令直接调用纯函数 | ⚠️ 仍主要是 commander 模板驱动 |
+| `/capability-status` 直接状态输出 | ✅ 已实现，Command layer 调用 `renderCapabilityStatus()` |
+| TUI sidebar capability 摘要 | ✅ 已实现，sidebar 插件调用 `buildCapabilitySidebarStatus()`；无任务时显示 registry/on-demand 摘要，有任务 todo 时显示 task selected / mcp auto / task permission |
+| Artifact evidence → final gate | ✅ 已实现，`artifact-ledger.ts` + `evidence-normalizer.ts` + `completion-readiness.ts` 接入 `gates.ts`；浏览器审计有产物但有 FAIL 时阻断 verified completion |
+| Report redaction / validation | ✅ 已实现，`report-validator.ts` 对 audit report 自动脱敏并检测 FAIL/无阻断矛盾、指标不一致、未覆盖项 |
+| Session gate reconcile | ✅ 已实现，`session-reconciler.ts` 把旧 no-evidence block 迁移为当前 evidence/readiness 状态 |
+| Artifact Result Ledger backfill | ✅ 已实现，`artifact-result-ledger.ts` 将报告/截图/脚本转为 ResultPacket |
+| TUI task artifact state | ✅ 已实现，`task-state.ts` + capability sidebar 显示 artifact/result/blocker 推导出的 task 状态 |
+
 ## 下一步
 
-1. 桥接 mcp-manager 与 `src/mcp/index.ts` 的 Effect layer（自动 markRunning/markStopped/degrade）
-2. 实现 MCP healthUrl HTTP probe
-3. 在 session prompt 中集成 `tool-prompt.ts` 的 index/detail 输出
-4. 实现基于 context 的 on-demand MCP 自动启动
+1. 将 MCP lifecycle 状态与 OpenCode MCP status 做双向 reconcile
+2. 为 remote MCP healthUrl 增加显式用户授权后的 probe
+3. 将 capability sidebar 的运行中状态与 OpenCode 原生 MCP/LSP state 做更细粒度关联

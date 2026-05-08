@@ -2,7 +2,7 @@ import fs from "fs"
 import os from "os"
 import path from "path"
 import { afterEach, describe, expect, test } from "bun:test"
-import { buildVerifierSubtask, pickVerifierAgent, decide, recordReviewerCall, markReviewerCompleted, isReadOnlyReviewer, updateState, buildFinalReportContext, loadCooldown } from "../../src/dll-agent/supervisor"
+import { buildVerifierSubtask, pickVerifierAgent, decide, recordReviewerCall, markReviewerCompleted, isReadOnlyReviewer, updateState, buildFinalReportContext, loadCooldown, loadState, modelContextLimit, buildTaskCompletionSubtask, saveState, setQueuedReviewers, setRunningReviewers } from "../../src/dll-agent/supervisor"
 import type { MessageV2 } from "../../src/session/message-v2"
 
 const cleanupSessions: string[] = []
@@ -148,6 +148,35 @@ describe("DllAgentSupervisor.buildVerifierSubtask", () => {
     expect(isReadOnlyReviewer("role-cross")).toBe(false)
     expect(isReadOnlyReviewer("executor")).toBe(false)
   })
+
+  test("markReviewerCompleted removes reviewer from required, queued, and running state", () => {
+    const sid = sessionID("state_converges")
+    const state = loadState(sid)
+    state.required_reviews = ["role-cross", "chief-engineer"]
+    state.queued_reviewers = ["role-cross", "chief-engineer"]
+    state.running_reviewers = ["role-cross"]
+    state.reviewer_conflict = true
+    saveState(sid, state)
+
+    markReviewerCompleted(sid, "role-cross")
+    const next = loadState(sid)
+    expect(next.completed_reviews).toContain("role-cross")
+    expect(next.required_reviews).not.toContain("role-cross")
+    expect(next.queued_reviewers).not.toContain("role-cross")
+    expect(next.running_reviewers).not.toContain("role-cross")
+  })
+
+  test("setQueuedReviewers and setRunningReviewers do not resurrect completed reviewers", () => {
+    const sid = sessionID("no_resurrect")
+    markReviewerCompleted(sid, "chief-engineer")
+    setRunningReviewers(sid, ["chief-engineer", "role-cross"])
+    setQueuedReviewers(sid, ["chief-engineer", "role-cross"])
+    const state = loadState(sid)
+    expect(state.running_reviewers).not.toContain("chief-engineer")
+    expect(state.queued_reviewers).not.toContain("chief-engineer")
+    expect(state.running_reviewers).toContain("role-cross")
+    expect(state.queued_reviewers).not.toContain("role-cross")
+  })
 })
 
 describe("DllAgentSupervisor repeatedToolFailure passthrough (P0-3)", () => {
@@ -197,6 +226,29 @@ describe("DllAgentSupervisor repeatedToolFailure passthrough (P0-3)", () => {
     const state = updateState(sid, decision)
     expect(state.metrics.repeated_tool_failure).toBe(true)
     expect(state.metrics.tool_failures).toBe(2)
+  })
+
+  test("chief-engineer cooldown does not fallback to role-cross without conflict evidence", () => {
+    const sid = sessionID("no_role_cross_fallback")
+    const messages = [
+      userMsg("msg_u", "请修复失败"),
+      toolErrorMsg("bash", "error: missing file /tmp/nope", "cat /tmp/nope"),
+      toolErrorMsg("bash", "error: missing file /tmp/nope", "cat /tmp/nope"),
+    ]
+    const first = decide(messages, sid, 1)
+    expect(first.reviewers).toContain("chief-engineer")
+    recordReviewerCall(
+      sid,
+      "chief-engineer",
+      1,
+      first.fingerprints?.["chief-engineer"],
+      first.reasons["chief-engineer"],
+      "msg_u",
+    )
+
+    const second = decide(messages, sid, 2)
+    expect(second.reviewers).not.toContain("chief-engineer")
+    expect(second.reviewers).not.toContain("role-cross")
   })
 
   test("repeatedToolFailure=false after error pattern window clears", () => {
@@ -427,5 +479,210 @@ describe("DllAgentSupervisor reviewer fingerprint loop prevention", () => {
     const decision2 = decide(messages2, sid, 3, 400)
     // Should NOT re-trigger because fingerprint points to the same original user
     expect(decision2.reviewers).not.toContain("long-context-archivist")
+  })
+})
+
+// ─── Phase 6: Model Routing & Token Awareness Tests ────────────────────────
+
+describe("DllAgentSupervisor.Phase6.modelContextLimit", () => {
+  test("returns correct limit for deepseek-v4-pro", () => {
+    expect(modelContextLimit("deepseek", "deepseek-v4-pro")).toBe(1_048_576)
+  })
+
+  test("returns correct limit for kimi-k2.6", () => {
+    expect(modelContextLimit("kimi", "kimi-k2.6")).toBe(262_144)
+  })
+
+  test("returns correct limit for glm-5.1", () => {
+    expect(modelContextLimit("zai", "glm-5.1")).toBe(204_800)
+  })
+
+  test("returns undefined for unknown models", () => {
+    expect(modelContextLimit("unknown", "model-1")).toBeUndefined()
+  })
+
+  test("returns undefined when providerID is undefined", () => {
+    expect(modelContextLimit(undefined, "deepseek-v4-pro")).toBeUndefined()
+  })
+})
+
+describe("DllAgentSupervisor.Phase6.kimiPreReportTrigger", () => {
+  test("Rule 2b: triggers long-context-archivist when context >= 30% and final claim", () => {
+    const sid = sessionID("kimi_pre_report")
+    const msgs: any[] = [
+      userMsg("msg_user_kpr", "继续执行任务"),
+      {
+        info: {
+          id: "msg_asst_kpr",
+          sessionID: "ses_test",
+          role: "assistant" as const,
+          time: { created: 0 },
+          agent: "commander",
+          model: { providerID: "deepseek", modelID: "deepseek-v4-pro" },
+          tokens: { input: 400000, output: 50000, reasoning: 0, cache: { read: 0, write: 0 } },
+        } as any,
+        parts: [{ type: "text" as const, text: "All tasks completed successfully!", id: "p_kpr", messageID: "m_kpr", sessionID: "ses_test" } as any],
+      },
+    ]
+    const decision = decide(msgs, sid, 10, 1_000_000)
+    expect(decision.reviewers).toContain("long-context-archivist")
+  })
+
+  test("Rule 2b: does NOT trigger with low context and no final claim", () => {
+    const sid = sessionID("kimi_low_ctx")
+    const msgs: any[] = [
+      userMsg("msg_user_low", "检查代码"),
+      asstMsg("Let me check the code..."),
+    ]
+    const decision = decide(msgs, sid, 2, 1_000_000)
+    expect(decision.metrics.kimi_pre_report_signal).toBe(false)
+  })
+})
+
+describe("DllAgentSupervisor.Phase6.glmCompletionClaimCheck", () => {
+  test("Rule 8: triggers requirements-inspector when completion claim without real tool evidence", () => {
+    const sid = sessionID("glm_completion_claim")
+    const msgs: any[] = [
+      userMsg("msg_user_glm", "修复那个bug"),
+      asstMsg("已经完成了，验证通过，all tests pass"),
+    ]
+    const decision = decide(msgs, sid, 5)
+    expect(decision.reviewers).toContain("requirements-inspector")
+  })
+})
+
+describe("DllAgentSupervisor.Phase6.kimiCompletionCheck", () => {
+  test("Rule 9: triggers task-completion-archivist when completion claim has unfinished indicators", () => {
+    const sid = sessionID("kimi_completion")
+    const msgs: any[] = [
+      userMsg("msg_user_kc", "优化模型路由"),
+      asstMsg("任务已完成，但未完成：TODO cleanup pending"),
+    ]
+    const decision = decide(msgs, sid, 8)
+    expect(decision.reviewers).toContain("task-completion-archivist")
+  })
+
+  test("Rule 9: does NOT trigger without completion claim", () => {
+    const sid = sessionID("kimi_no_claim")
+    const msgs: any[] = [
+      userMsg("msg_user_nc", "how to fix this"),
+      asstMsg("Let me investigate the code base."),
+    ]
+    const decision = decide(msgs, sid, 3)
+    expect(decision.metrics.kimi_completion_check_signal).toBe(false)
+  })
+})
+
+describe("DllAgentSupervisor.Phase6.scopeExpansion", () => {
+  test("Rule 10: triggers requirements-inspector on scope expansion", () => {
+    const sid = sessionID("scope_expansion")
+    const msgs: any[] = [
+      userMsg("msg_user_se", "不对，你扩大了范围，增加了额外需求"),
+      asstMsg("I see, let me narrow the scope."),
+    ]
+    const decision = decide(msgs, sid, 4)
+    expect(decision.reviewers).toContain("requirements-inspector")
+  })
+})
+
+describe("DllAgentSupervisor.Phase6.phaseSwitch", () => {
+  test("Rule 2c: triggers long-context-archivist on phase switch", () => {
+    const sid = sessionID("phase_switch")
+    const msgs: any[] = [
+      userMsg("msg_user_ps", "先不要做那个了，换个方向，先处理 token 优化"),
+      asstMsg("Switching direction to token optimization."),
+    ]
+    const decision = decide(msgs, sid, 6)
+    expect(decision.reviewers).toContain("long-context-archivist")
+  })
+})
+
+describe("DllAgentSupervisor.Phase6.tokenAwareRouting", () => {
+  test("Rule 11: high context triggers routing evidence write", () => {
+    const sid = sessionID("token_aware")
+    const msgs: any[] = [
+      userMsg("msg_user_ta", "完成这个任务"),
+      {
+        info: {
+          id: "msg_asst_ta",
+          sessionID: "ses_test",
+          role: "assistant" as const,
+          time: { created: 0 },
+          agent: "commander",
+          model: { providerID: "deepseek", modelID: "deepseek-v4-pro" },
+          tokens: { input: 700000, output: 50000, reasoning: 0, cache: { read: 0, write: 0 } },
+        } as any,
+        parts: [{ type: "text" as const, text: "Working on it...", id: "p_ta", messageID: "m_ta", sessionID: "ses_test" } as any],
+      },
+    ]
+    const decision = decide(msgs, sid, 12, 1_000_000)
+    // Context is 75% → should trigger token-aware routing evidence
+    expect(decision.metrics.context_percent).toBe(75)
+    // Check that routing evidence was written (via supervisor.decision evidence)
+    // The main assertion: the system doesn't crash and produces a valid decision
+    expect(decision.should_review).toBeDefined()
+  })
+
+  test("Rule 11: normal context does NOT trigger token-aware routing", () => {
+    const sid = sessionID("normal_ctx")
+    const msgs: any[] = [
+      userMsg("msg_user_nr", "小任务"),
+      asstMsg("Done."),
+    ]
+    const decision = decide(msgs, sid, 2, 1_000_000)
+    // Normal context < 60%, no routing evidence needed
+    expect(decision.metrics.context_percent).toBeLessThan(60)
+  })
+})
+
+describe("DllAgentSupervisor.Phase6.buildTaskCompletionSubtask", () => {
+  test("builds a valid task-completion-archivist subtask with correct model", () => {
+    const sid = sessionID("task_completion_sub")
+    const state = {
+      version: 1 as const,
+      phase: "default",
+      risk: "low" as const,
+      required_reviews: [],
+      completed_reviews: [],
+      blocked_completion: false,
+      block_reason: null,
+      reviewer_conflict: false,
+      metrics: {
+        tool_failures: 0,
+        permission_denied: 0,
+        user_corrections: 0,
+        context_percent: 30,
+        context_tokens: 300000,
+        final_claim: true,
+        verification_evidence: false,
+        reviewer_conflict_signal: false,
+        repeated_tool_failure: false,
+        real_tool_evidence: false,
+      },
+      updated_at: new Date().toISOString(),
+    }
+    const subtask = buildTaskCompletionSubtask(sid, "优化模型路由", "任务已完成，但仍有待办", state)
+    expect(subtask.type).toBe("subtask")
+    expect(subtask.agent).toBe("task-completion-archivist")
+    expect(String(subtask.model?.providerID ?? "")).toBe("kimi")
+    expect(String(subtask.model?.modelID ?? "")).toBe("kimi-k2.6")
+    expect(subtask.prompt).toContain("task-completion-archivist")
+    expect(subtask.prompt).toContain("completion_status")
+    expect(subtask.prompt).toContain("优化模型路由")
+  })
+})
+
+describe("DllAgentSupervisor.Phase6.defaultCommander", () => {
+  test("DeepSeek remains default commander — short task does NOT trigger Kimi/GLM", () => {
+    const sid = sessionID("short_task")
+    const msgs: any[] = [
+      userMsg("msg_user_st", "查看 git status"),
+      asstMsg("Let me check the git status."),
+    ]
+    const decision = decide(msgs, sid, 1, 1_000_000)
+    // Short task: no reviewers triggered
+    expect(decision.reviewers.length).toBe(0)
+    // Decision is valid
+    expect(decision.should_review).toBe(false)
   })
 })

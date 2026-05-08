@@ -14,6 +14,9 @@ import {
   type SupervisorState,
 } from "./interfaces"
 import type { MessageV2 } from "@/session/message-v2"
+import { loadResults } from "./result-ledger"
+import { buildEvidenceSnapshot } from "./evidence-normalizer"
+import { evaluateCompletionReadiness } from "./completion-readiness"
 
 /** 同一 block reason 在同一 session 中最多允许自动重试次数 */
 export const GATE_MAX_RETRIES = 2
@@ -52,7 +55,31 @@ export function checkEvidenceGate(input: EvidenceGateInput, messages?: MessageV2
 
   // 优先使用"真工具证据"（实际跑过 typecheck/test/doctor 且工具输出 pass）；
   // 退化到字符串匹配作为兜底。这样模型在自然语言里写 "测试通过" 不再算证据。
-  const realEvidence = messages ? verifiedToolEvidence(messages) : false
+  const toolEvidence = messages ? verifiedToolEvidence(messages) : false
+  const evidenceSnapshot = buildEvidenceSnapshot({
+    sessionID: input.sessionID,
+    projectDir: input.projectDir,
+    toolEvidence,
+  })
+  const readiness = evaluateCompletionReadiness({ snapshot: evidenceSnapshot })
+  if (!readiness.can_claim_verified && evidenceSnapshot.has_real_tool_evidence && (evidenceSnapshot.fail_count > 0 || evidenceSnapshot.blockers.length > 0)) {
+    return {
+      passed: false,
+      needs_evidence: false,
+      needs_review: true,
+      block_reason: `evidence exists but completion is not verified: ${readiness.reasons.slice(0, 3).join("; ")}`,
+      synthetic_hint: `<dll-agent-final-gate>
+Completion claim is blocked because real evidence contains unresolved failures or contradictions.
+Status: ${readiness.status}
+Reasons:
+${readiness.reasons.map((reason, index) => `${index + 1}. ${reason}`).join("\n")}
+Required next actions:
+${readiness.required_next_actions.map((action, index) => `${index + 1}. ${action}`).join("\n")}
+</dll-agent-final-gate>`,
+    }
+  }
+
+  const realEvidence = evidenceSnapshot.has_real_tool_evidence
   // 高风险只接受真工具证据；其它风险允许字符串匹配作为兜底。
   const hasEvidence =
     realEvidence ||
@@ -256,6 +283,10 @@ export function finalGate(params: {
   supervisorState: SupervisorState
   reconciliationConflicts: string[]
   costExceeded: boolean
+  /** Phase 7: session ID for Result Ledger query */
+  sessionID?: string
+  /** Project directory for Artifact Ledger query */
+  projectDir?: string
 }): { allowed: boolean; reasons: string[] } {
   const reasons: string[] = []
 
@@ -281,6 +312,46 @@ export function finalGate(params: {
 
   if (params.costExceeded) {
     reasons.push("session cost cap exceeded")
+  }
+
+  // Phase 7: Check Result Ledger for blocking unfinished subtasks
+  if (params.sessionID) {
+    try {
+      const results = loadResults(params.sessionID)
+      const blockers = results.filter((r) =>
+        r.completion_status === "BLOCKED" || (r.completion_status === "PARTIAL" && r.unresolved_items.length > 0)
+      )
+      if (blockers.length > 0) {
+        reasons.push(
+          `result ledger has ${blockers.length} blocking/partial subtask(s): ` +
+          blockers.map((b) => `${b.executing_role}: ${b.subtask_goal.slice(0, 80)}`).join("; "),
+        )
+      }
+      // Check for unverified results
+      const unverified = results.filter((r) => r.completion_status === "UNVERIFIED")
+      if (unverified.length > 0) {
+        reasons.push(
+          `result ledger has ${unverified.length} unverified subtask(s) — verification needed before final PASS`,
+        )
+      }
+    } catch {
+      // Result ledger read is best-effort
+    }
+  }
+
+  if (params.sessionID || params.projectDir) {
+    const snapshot = buildEvidenceSnapshot({
+      sessionID: params.sessionID,
+      projectDir: params.projectDir,
+      toolEvidence: params.evidenceGate.passed,
+    })
+    const readiness = evaluateCompletionReadiness({
+      snapshot,
+      state: params.supervisorState,
+    })
+    if (!readiness.can_claim_verified) {
+      reasons.push(...readiness.reasons.map((reason) => `completion readiness: ${reason}`))
+    }
   }
 
   const allowed = reasons.length === 0

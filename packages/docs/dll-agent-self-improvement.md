@@ -33,7 +33,7 @@ Evidence 日志系统：自动脱敏、写入 evidence file。
 **代码模式**: ✅ flat exports (P0-1: 已移除 self-reexport, 改为 flat named exports)。
 
 ### skill-registry.ts
-内置技能声明（纯数据，无副作用）。定义 8 个技能及其完整约束。
+内置技能声明（纯数据，无副作用）。定义 9 个技能及其完整约束。
 **代码模式**: ✅ 已完成 flat exports + self-reexport。
 
 ### skills.ts
@@ -140,6 +140,22 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 | **可执行错误构建 (NEW)** | `actionable-error.ts` | 14 种错误自动分类；自动恢复建议；recovery budget 控制；failure fingerprint 去重 |
 | **Cross-Review Council (NEW)** | `cross-review.ts` | 多模型对抗审查；7 种触发条件；独立 reviewer + role-cross 仲裁；candidate solution ranking；33 tests |
 | **硬编码路径修复 (NEW)** | `skill-registry.ts` | 移除 /Users/dailulu 硬编码路径，改为 $HOME 和相对路径 |
+| **Cross-review council 接入 (NEW)** | `prompt.ts` | checkCrossReviewTrigger() 接入 supervisor 决策循环，触发条件满足时自动注入 council reviewers |
+| **Tool prompt 注入 (NEW)** | `prompt.ts` | buildPromptIndex() 注入 system prompt array，≤1200 chars |
+| **Actionable error 接入 (NEW)** | `prompt.ts` | buildActionableError() 在 gate block 时注入 recovery suggestion |
+| **Continuation Gate (NEW)** | `continuation-gate.ts` + `prompt.ts` | Kimi task-completion-archivist 检查 blocking unfinished items；continuation packet 生成；budget 控制；在 evidence gate 前运行 |
+| **Tool-prompt project overlay (NEW)** | `prompt.ts` | loadProjectOverlay() + buildEffectiveManifest() 替换 buildGlobalEffective()，项目级工具配置生效 |
+| **UX state TUI 接入 (NEW)** | `dll-agent-panel.tsx` | uxLine() memo 驱动 buildCompactSummary()，TUI 面板实时显示 task/supervisor/cost 状态 |
+| **Capability Runtime Orchestrator (NEW)** | `capability-orchestrator.ts` + `capability-action-runner.ts` + `prompt.ts` | 用户目标 → registry merge → capability plan → resolver → low-risk action runner / skill intents / MCP requests / gate context；在 `resolveTools()` 前通过 OpenCode `MCP.Service.add()` 接入可自动连接 MCP |
+| **Capability Status Direct Renderer (NEW)** | `capability-status.ts` + `command/index.ts` | `/capability-status` 直接读取真实 registry/resolver/runtime 状态，不再只是 commander prompt 模板 |
+| **Capability TUI Sidebar (NEW)** | `capability-status.ts` + `sidebar/capability.tsx` | TUI sidebar 直接消费 capability status compact summary；无任务时显示 registry/on-demand 摘要，有任务 todo 时显示 task selected / mcp auto / task permission；30s active / 60s idle 刷新，失败降级显示 unavailable |
+| **MCP healthUrl probe (NEW)** | `mcp-manager.ts` | 本地 `healthUrl` 通过 curl probe 检查；remote healthUrl 默认跳过以避免无授权外部网络访问 |
+| **Artifact Ledger + Evidence Normalizer (NEW)** | `artifact-ledger.ts` + `evidence-normalizer.ts` + `gates.ts` | 审计脚本、截图、报告等任务产物被分类为 artifact evidence；浏览器审计报告+截图可作为 real tool evidence，但报告中存在 FAIL/矛盾摘要时会阻断 verified completion |
+| **Completion Readiness Gate (NEW)** | `completion-readiness.ts` + `gates.ts` + `prompt.ts` | final claim 统一经过 readiness 判定；FAIL、blocker、pending reviewer、supervisor block 均禁止写 VERIFIED_COMPLETE |
+| **Report Validator / Redactor (NEW)** | `report-validator.ts` + `artifact-ledger.ts` | 生成的 audit report 会自动脱敏 password/token/JWT/API key；检测 FAIL/“无阻断”矛盾、指标不一致、未覆盖项，阻止虚假 PASS |
+| **Session Gate Reconciler (NEW)** | `session-reconciler.ts` + `prompt.ts` | resumed/long session 中旧的 no-evidence gate block 会在发现 artifact/result evidence 后清理或重分类，避免历史状态导致无限卡住 |
+| **Artifact Result Backfill (NEW)** | `artifact-result-ledger.ts` + `evidence-normalizer.ts` | artifact report/screenshots/scripts 自动补写 Result Ledger，避免 live task 有报告但 `results.jsonl` 为空 |
+| **Task Artifact State TUI (NEW)** | `task-state.ts` + `capability-status.ts` + `sidebar/capability.tsx` | sidebar 显示由 artifact/result/supervisor 推导出的 task verified/partial/blocked 状态，抵消模型 Todo 过期问题 |
 
 ### ⚠️ 只是配置层实现（需要环境变量）
 
@@ -166,13 +182,12 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 
 | 特性 | 说明 |
 |---|---|
-| MCP runtime 全链路接入 | tool-catalog/tool-overlay 纯函数层已实现；与 opencode MCP Effect layer 的全链路桥接（自动 markRunning/markStopped/degrade）尚未接入 src/mcp/index.ts |
-| MCP healthcheck HTTP probe | mcp-manager.ts healthcheck() 目前仅检查进程存活；healthUrl 配置的 HTTP probe 尚未实现 |
-| on-demand MCP auto-start | 在 opencode session 中根据 context 自动判断是否需要启动 MCP 的集成尚未完成 |
+| MCP runtime 全链路接入 | capability-orchestrator 已在 session loop 中按需调用 `MCP.Service.add()`，使选中 MCP 进入 `mcp.tools()`；mcp-manager 仍只负责 dll-agent 侧状态收敛/managed cleanup，不替代 OpenCode MCP 生命周期 |
+| on-demand MCP auto-start | 已实现最小闭环：基于用户目标和 registry triggers 自动规划 MCP，并在无凭据/登录态/发布/破坏性风险时自动接入；涉及 secrets、登录态、远程发布或破坏性操作仍要求确认或阻断 |
 | TUI quota 显示组件 | 已实现 dll-agent-panel.tsx，但需验证 |
-| Permission classifier 接入 Permission.Request | permission-classifier.ts 纯函数层已实现（37 tests 通过）；与 opencode Permission.Request 评估管线的桥接尚未完成 |
+| Permission classifier 接入 Permission.Request | permission-classifier.ts + permission-bridge.ts 已实现，桥接到 src/permission/index.ts；permissionPreCheck() 已在 Permission 评估管线中调用 |
 | LSP strategy 接入 LSP launch pipeline | lsp-strategy.ts 纯函数层已实现（10 tests 通过）；与 opencode LSP launch.ts 的预热管线桥接尚未完成 |
-| Cross-review council 接入 prompt.ts session loop | cross-review.ts 纯函数层已实现（33 tests 通过）；与 prompt.ts 的 council 调度管线桥接尚未完成 |
+| Cross-review council 接入 prompt.ts session loop | cross-review-bridge.ts 已接入 prompt.ts supervisor 决策循环；checkCrossReviewTrigger() 在 skill 激活后调用 |
 
 ### ✅ 已修复 P0 (本轮 + 历史)
 
@@ -182,7 +197,7 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 | `triggers.ts` 自引用 false positive | ✅ 已修复 | 修复 read 工具输出误判为 error；增强 stripSelfInjections 过滤 reviewer output JSON |
 | `updateState` 中 `repeatedToolFailure: false` 硬编码 | ✅ 已修复 | 验证数据流正确传递；添加 6 个回归测试 |
 | Doctor session state false positive | ✅ 已修复 | cooldown fingerprint key `task-signal` → `sk-` 碰撞已通过 JSON-aware 扫描解决；session state 写入前统一 redact() |
-| Gate/reconciliation 循环 | ✅ 已修复 | `GATE_MAX_RETRIES=2` + `gate_block_retries` 追踪；同一 block reason 超限后不再注入 synthetic_hint |
+| Gate/reconciliation 循环 | ✅ 已修复 | `GATE_MAX_RETRIES=2` + `gate_block_retries` 追踪；两条 prompt gate 路径均接入 hard-stop summary，同一 block reason 超限后不再继续普通 hint 循环 |
 | **Gate synthetic_hint 未注入到消息流 (CRITICAL)** | ✅ 本轮修复 | `gatePendingHints` 队列将 gate block 的 synthetic_hint 作为 synthetic text part 注入到 conversation |
 | **第二 gate 路径缺少 synthetic_hint merge** | ✅ 本轮修复 | reconciliation gate 的 synthetic_hint 与 evidence gate hint 合并注入 |
 | **Role-cross 缺少 JSON 输出模板** | ✅ 本轮修复 | role-cross reviewer prompt 包含 `emptyReviewerOutput` JSON 模板 |
@@ -192,7 +207,15 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 | Skill activation 重复证据 | ✅ 已修复 | 同一 skill + 同一 fingerprint 不再重复写入 evidence |
 | Finalization 上下文压缩 | ✅ 已修复 | `buildFinalReportContext()` 只传目标/reviever/验证/block 摘要 |
 | Usage/Quota/Cost 显示与刷新 | ✅ 已修复 | 区分 local est. / provider billed / provider balance；Quota TTL=300s + stale 标记 + 刷新时间显示 |
+| Quota 60 秒后台刷新 | ✅ 已实现 | `dll-agent` 启动时通过单例 daemon 调用 `dll-agent-quota --loop --interval 60`；`refresh.pid` 防重复；默认最长运行 6 小时 |
+| Session/Evidence 自动清理 | ✅ 已实现 | 启动时执行保守清理：保留当前 session，删除 30 天以上或超过 90 个上限的旧 session，并裁剪单 session evidence 文件数 |
+| MCP 生命周期状态收敛 | ✅ 已实现 | 启动时清理 dll-agent 管理过的 dead PID 状态；`mcp-manager.ts` 支持 stale PID reconciliation 和 managed stop/cleanup |
 | 自举升级闭环 | ✅ 已实现 | self-upgrade skill + MCP manager + 脚本工具箱 + 升级守卫 |
+| Capability-driven runtime | ✅ 本轮实现 | `capability-orchestrator.ts` 复用 schema/registry/planner/resolver/lifecycle；`capability-action-runner.ts` 执行低风险项目内 auto_install；`prompt.ts` 将 selected capabilities 转为 skill intents、MCP requests、system summary 和 capability gate block |
+| Auto-install verification + Result Ledger | ✅ 本轮实现 | `capability-action-runner.ts` 在安装成功后执行 allowlisted verify commands，并写入 `result-ledger.ts`；验证失败记为 `PARTIAL` |
+| Browser audit artifact reconciliation | ✅ 本轮实现 | report/screenshot/script 可补写 Result Ledger；旧 gate block 会被清理或改写为 evidence-backed readiness block |
+| Generated report secret redaction | ✅ 本轮实现 | 仅对生成报告 artifact 自动脱敏，不修改业务源码；doctor/gate 不接受含 secret 或未覆盖核心项的 verified claim |
+| Browser audit artifact evidence | ✅ 本轮实现 | `node audit-full-browser.mjs` / Playwright 审计输出、`files/*audit-report.md` 与 `test-screenshots/*.png` 被识别为真实执行证据；若报告含 FAIL 或“无阻断”与 FAIL 矛盾，final gate 只能给 PARTIAL/BLOCKED |
 
 ### ❌ 尚未实现
 
@@ -230,19 +253,30 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 5. ~~**P0-CRITICAL**：修复 gate synthetic_hint 未注入到消息流~~ ✅ 本轮修复
 6. ~~**P0**：修复 role-cross JSON 输出模板缺失~~ ✅ 本轮修复
 7. ~~**P0**：修复 hardcoded 用户路径~~ ✅ 本轮修复
-8. **P1**：permission-classifier 接入 opencode Permission.Request 管线（纯函数层已完成，需桥接）
+8. ~~**P1**：permission-classifier 接入 opencode Permission.Request 管线~~ ✅ 本轮完成（permission-bridge.ts 已接入 src/permission/index.ts:18）
 9. **P1**：lsp-strategy 接入 opencode LSP launch 管线（纯函数层已完成，需桥接）
-10. **P1**：cross-review council 接入 prompt.ts session loop（纯函数层已完成，需桥接）
-11. **P1**：添加 prompt.ts supervisor 集成测试
-12. **P2**：Evidence file rotation 和 session 目录清理
-13. **P2**：Supervisor Effect.sync() 包装，确保 Effect fiber 模型兼容
+10. ~~**P1**：cross-review council 接入 prompt.ts session loop~~ ✅ 本轮完成
+11. ~~**P1**：continuation gate 接入 final gate path~~ ✅ 本轮完成
+12. **P1**：添加 prompt.ts supervisor 集成测试
+13. ~~**P2**：Evidence file rotation 自动调度~~ ✅ 启动时已接入保守 session/evidence cleanup；当前 session 不清理
+14. **P2**：Supervisor Effect.sync() 包装，确保 Effect fiber 模型兼容
+14. ~~**P1**：tool-prompt 接入 system prompt~~ ✅ 本轮完成（buildPromptIndex() 已注入 system 数组）
+15. ~~**P1**：actionable-error 接入 gate block 路径~~ ✅ 本轮完成（buildActionableError() 注入 gate block hint）
+16. ~~**P1**：tool-prompt project overlay 加载~~ ✅ 本轮完成（loadProjectOverlay + buildEffectiveManifest 替换 buildGlobalEffective）
+17. ~~**P2**：ux-state TUI 接入~~ ✅ 本轮完成（buildCompactSummary 驱动 uxLine）
+18. ~~**P1**：Capability runtime 接入 session loop~~ ✅ 本轮完成（orchestrator + MCP.Service.add + skill intents + capability gate）
+19. ~~**P1**：Capability action runner 执行低风险项目内安装~~ ✅ 本轮完成（argv runner + allowlist + project cwd + timeout；高风险/全局安装阻断）
+20. ~~**P1**：MCP healthUrl HTTP probe~~ ✅ 本轮完成（local-only probe；remote skipped）
+21. ~~**P1**：/capability-status 直接 runtime renderer~~ ✅ 本轮完成（Command layer 直接调用 renderCapabilityStatus）
+22. ~~**P1**：auto-install verify command 写入 Result Ledger~~ ✅ 本轮完成（VERIFIED_COMPLETE / PARTIAL 区分）
+23. ~~**P2**：TUI sidebar 消费 capability-status~~ ✅ 本轮完成（`sidebar/capability.tsx` 调用 `buildCapabilitySidebarStatus()`，有限行数 + 自适应刷新；已修复全 registry permission 误报为当前阻塞的问题）
 
 ## 验证状态
 
 | 验证 | 命令 | 结果 |
 |---|---|---|
 | TypeScript typecheck | `bun run --cwd packages/opencode typecheck` | ✅ tsgo --noEmit: 0 errors |
-| Unit tests | `bun test test/dll-agent/` | ✅ 181 pass, 0 fail (9 files) |
+| Unit tests | `bun test test/dll-agent/` | ✅ 327 pass, 0 fail (18 files) |
 | Tool system tests | `bun test test/dll-agent/tools.test.ts` | ✅ 58 pass, 0 fail |
 | Wrapper syntax | `python3 -m py_compile dll-agent dll-agent-quota` | ✅ OK |
 | Doctor | `dll-agent doctor` | ✅ result: warn (only expected API-key-in-memory warning) |

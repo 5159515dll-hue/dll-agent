@@ -11,6 +11,23 @@ const money = new Intl.NumberFormat("en-US", {
   currency: "USD",
 })
 
+/** CNY formatter for non-OpenAI providers */
+const cny = new Intl.NumberFormat("zh-CN", {
+  style: "currency",
+  currency: "CNY",
+})
+
+/** Providers that bill in CNY (all except OpenAI) */
+const CNY_PROVIDERS = new Set(["deepseek", "kimi", "zai"])
+
+/** Format a cost value in the provider's billing currency. Costs are stored in USD internally. */
+function formatProviderCost(cost: number, providerID: string): string {
+  if (CNY_PROVIDERS.has(providerID)) {
+    return cny.format(cost * 7.2)
+  }
+  return money.format(cost)
+}
+
 function readQuotaFile() {
   const file = process.env.DLL_AGENT_QUOTA_FILE
   if (!file) return
@@ -68,7 +85,10 @@ function balanceLine(value: any) {
     if (item?.total_balance) return `provider balance: ${item.currency} ${item.total_balance}`
   }
   if (balances && typeof balances === "object") {
-    if (typeof balances.available_balance === "number") return `provider balance: ${money.format(balances.available_balance)}`
+    if (typeof balances.available_balance === "number") {
+      const currency = balances.currency ?? "CNY"
+      return `provider balance: ${currency} ${Number(balances.available_balance).toFixed(2)}`
+    }
   }
   return "quota: unknown"
 }
@@ -172,7 +192,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       </text>
       <text fg={theme().textMuted}>{state().tokens.toLocaleString()} tokens (all types incl. cache)</text>
       <text fg={theme().textMuted}>{state().percent ?? 0}% used</text>
-      <text fg={theme().textMuted}>local est. spend {money.format(modelSpend().totalCost)}</text>
+      <text fg={theme().textMuted}>session cost {money.format(modelSpend().totalCost)}</text>
       <box paddingTop={1}>
         <text fg={theme().text}>
           <b>Model usage (local est.)</b>
@@ -185,7 +205,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                   {item.providerID}/{item.name}
                 </text>
                 <text fg={theme().textMuted}>
-                  local est. {money.format(item.cost)} · {item.tokens.toLocaleString()} tokens · {item.calls} call
+                  local est. {formatProviderCost(item.cost, item.providerID)} · {item.tokens.toLocaleString()} tokens · {item.calls} call
                   {item.calls === 1 ? "" : "s"}
                 </text>
               </box>

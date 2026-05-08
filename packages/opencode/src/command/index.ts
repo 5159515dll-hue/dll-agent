@@ -10,6 +10,7 @@ import { withStatics } from "@/util/schema"
 import { Config } from "@/config/config"
 import { MCP } from "../mcp"
 import { Skill } from "../skill"
+import { renderCapabilityStatus } from "@/dll-agent/capability-status"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
 import PROMPT_REVIEW from "./template/review.txt"
 
@@ -155,6 +156,16 @@ export const layer = Layer.effect(
           },
           hints: [],
         }
+      }
+
+      commands["capability-status"] = {
+        name: "capability-status",
+        description: "show live dll-agent capability registry, resolver, and runtime status",
+        source: "command",
+        get template() {
+          return renderCapabilityStatus(ctx.worktree)
+        },
+        hints: [],
       }
 
       return {

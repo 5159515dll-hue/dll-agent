@@ -24,6 +24,9 @@ import {
   COOLDOWN_CONFIG,
 } from "./interfaces"
 import type { MessageV2 } from "@/session/message-v2"
+import { buildContinuationSubtaskPrompt } from "./continuation-gate"
+import { buildResultsSummary, buildResultPacket, writeResult as writeResultLedger, type ResultPacket } from "./result-ledger"
+import { checkDeduplication } from "./deduplication-gate"
 import os from "os"
 
 // ─── State management ──────────────────────────────────────────────────────
@@ -54,10 +57,22 @@ function atomicWrite(file: string, data: string) {
 
 export function saveState(sessionID: string, state: SupervisorState) {
   try {
+    normalizeReviewerState(state)
     atomicWrite(stateFile(sessionID), JSON.stringify(redact(state), null, 2))
   } catch {
     // Non-critical; supervisor state persistence is best-effort
   }
+}
+
+function normalizeReviewerState(state: SupervisorState) {
+  state.completed_reviews = [...new Set(state.completed_reviews ?? [])]
+  const completed = new Set(state.completed_reviews)
+  state.required_reviews = [...new Set((state.required_reviews ?? []).filter((r) => !completed.has(r)))]
+  state.queued_reviewers = [...new Set((state.queued_reviewers ?? []).filter((r) => !completed.has(r as ReviewerRole)))]
+    .map((r) => r as ReviewerRole)
+  state.running_reviewers = [...new Set((state.running_reviewers ?? []).filter((r) => !completed.has(r as ReviewerRole)))]
+    .map((r) => r as ReviewerRole)
+  if (completed.has("role-cross") && state.required_reviews.length === 0) state.reviewer_conflict = false
 }
 
 function freshState(): SupervisorState {
@@ -101,7 +116,12 @@ export function cooldownFile(sessionID: string) {
 export function setQueuedReviewers(sessionID: string, reviewers: string[]) {
   try {
     const state = loadState(sessionID)
-    state.queued_reviewers = [...reviewers]
+    const completed = new Set(state.completed_reviews ?? [])
+    const running = new Set(state.running_reviewers ?? [])
+    state.queued_reviewers = [...new Set(reviewers)]
+      .filter((reviewer) => !completed.has(reviewer as ReviewerRole))
+      .filter((reviewer) => !running.has(reviewer as ReviewerRole))
+      .map((reviewer) => reviewer as ReviewerRole)
     state.updated_at = new Date().toISOString()
     saveState(sessionID, state)
   } catch {
@@ -112,7 +132,12 @@ export function setQueuedReviewers(sessionID: string, reviewers: string[]) {
 export function setRunningReviewers(sessionID: string, reviewers: string[]) {
   try {
     const state = loadState(sessionID)
-    state.running_reviewers = [...reviewers]
+    const completed = new Set(state.completed_reviews ?? [])
+    state.running_reviewers = [...new Set(reviewers)]
+      .filter((reviewer) => !completed.has(reviewer as ReviewerRole))
+      .map((reviewer) => reviewer as ReviewerRole)
+    const running = new Set(state.running_reviewers)
+    state.queued_reviewers = (state.queued_reviewers ?? []).filter((reviewer) => !running.has(reviewer))
     state.updated_at = new Date().toISOString()
     saveState(sessionID, state)
   } catch {
@@ -359,12 +384,24 @@ function buildReviewerContext(
   reason: string,
   metrics: SupervisorMetricsSnapshot,
   messages: MessageV2.WithParts[],
+  sessionID?: string,
 ) {
   const user = latestRealUser(messages)
   const userGoal = user ? truncate(messageText(user).trim(), 1_500) : "(no recent user text)"
   const paths = extractRelatedPaths(messages)
   const failures = recentToolFailureSummary(messages)
   const diff = gitDiffSummary(paths)
+
+  // Phase 7: Include result ledger summary so reviewers know what's been done
+  let resultSummary = ""
+  if (sessionID) {
+    try {
+      resultSummary = buildResultsSummary(sessionID)
+    } catch {
+      // Non-critical — skip result summary if ledger unavailable
+    }
+  }
+
   const contextLines = [
     `Reviewer: ${reviewer}`,
     `Trigger reason: ${reason}`,
@@ -388,21 +425,51 @@ function buildReviewerContext(
     `Recent tool failure snippets:`,
     failures.length ? failures.join("\n") : "- none",
   ]
-  return truncate(contextLines.join("\n"), 6_000)
+
+  if (resultSummary && resultSummary !== "No prior results in ledger.") {
+    contextLines.push(``)
+    contextLines.push(resultSummary)
+  }
+
+  return truncate(contextLines.join("\n"), 8_000)
 }
 
 export function reviewerRuntimeMs(reviewer: string) {
   if (reviewer === "requirements-inspector") return COOLDOWN_CONFIG.reviewer_runtime_ms
   if (reviewer === "long-context-archivist") return COOLDOWN_CONFIG.reviewer_runtime_ms
+  if (reviewer === "task-completion-archivist") return COOLDOWN_CONFIG.reviewer_runtime_ms
   if (reviewer === "final-auditor") return 240_000
   return 300_000
 }
 
 export function isReadOnlyReviewer(reviewer: string) {
-  return reviewer === "requirements-inspector" || reviewer === "long-context-archivist" || reviewer === "final-auditor"
+  return reviewer === "requirements-inspector" || reviewer === "long-context-archivist" || reviewer === "task-completion-archivist" || reviewer === "final-auditor"
 }
 
 // ─── 风险判定 ─────────────────────────────────────────────────────────────
+
+// Phase 6: Model context limit lookup for token-aware routing
+const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  "deepseek/deepseek-v4-pro": 1_048_576,
+  "deepseek/deepseek-v4": 1_048_576,
+  "openai/gpt-5.5-pro": 1_050_000,
+  "openai/gpt-5": 1_050_000,
+  "kimi/kimi-k2.6": 262_144,
+  "kimi/kimi-k2": 262_144,
+  "zai/glm-5.1": 204_800,
+  "zai/glm-5": 204_800,
+}
+
+export function modelContextLimit(providerID?: string, modelID?: string): number | undefined {
+  if (!providerID || !modelID) return undefined
+  const key = `${providerID}/${modelID}`.toLowerCase()
+  if (MODEL_CONTEXT_LIMITS[key]) return MODEL_CONTEXT_LIMITS[key]
+  // Fallback: try partial match (e.g. "deepseek/deepseek-v4-pro-beta")
+  for (const [k, v] of Object.entries(MODEL_CONTEXT_LIMITS)) {
+    if (key.includes(k.split("/")[1]?.replace(/-/g, "") ?? "")) return v
+  }
+  return undefined
+}
 
 export function assessRisk(metrics: Metrics): RiskLevel {
   let score = 0
@@ -451,6 +518,24 @@ export function decide(
 
   const addReviewer = (reviewer: ReviewerRole, reason: string) => {
     if (reviewers.includes(reviewer)) return
+    const state = loadState(sessionID)
+    if (state.completed_reviews?.includes(reviewer)) {
+      writeEvidence("cooldown.skipped", {
+        reason: "reviewer_already_completed_this_phase",
+        reviewer,
+        phase: state.phase,
+      }, sessionID)
+      return
+    }
+    if (state.queued_reviewers?.includes(reviewer) || state.running_reviewers?.includes(reviewer)) {
+      writeEvidence("cooldown.skipped", {
+        reason: "reviewer_already_queued_or_running",
+        reviewer,
+        queued: state.queued_reviewers ?? [],
+        running: state.running_reviewers ?? [],
+      }, sessionID)
+      return
+    }
     const fingerprint = makeTriggerFingerprint(messages, reviewer, reason)
     if (isCooldown(sessionID, reviewer, currentStep, fingerprint)) return
     reviewers.push(reviewer)
@@ -474,6 +559,20 @@ export function decide(
     addReviewer("long-context-archivist", reason)
   }
 
+  // 规则 2b (Phase 6): Kimi pre-report context compression
+  // When context is >=30% and final claim detected, proactively compress context
+  // via Kimi before the final report. Reduces DeepSeek token consumption on the report turn.
+  if (metrics.kimiPreReportSignal && !reviewers.includes("long-context-archivist")) {
+    const reason = `pre-report context compression: context at ${metrics.contextPercent}% with final claim`
+    addReviewer("long-context-archivist", reason)
+  }
+
+  // 规则 2c (Phase 6): Phase switch → long-context-archivist for handoff packet
+  if (metrics.phaseSwitchSignal) {
+    const reason = "phase switch or task direction change detected"
+    addReviewer("long-context-archivist", reason)
+  }
+
   // 规则 3：重复工具失败 → chief-engineer 或 role-cross
   if (metrics.repeatedToolFailure || metrics.toolFailures >= 3) {
     const reason = metrics.repeatedToolFailure
@@ -485,7 +584,11 @@ export function decide(
       reasons["chief-engineer"] = reason
       fingerprints["chief-engineer"] = chiefFingerprint
     } else {
-      addReviewer("role-cross", reason + " (chief-engineer in cooldown)")
+      writeEvidence("cooldown.skipped", {
+        reason: "chief_engineer_in_cooldown_no_role_cross_fallback",
+        reviewer: "role-cross",
+        original_reason: reason,
+      }, sessionID)
     }
   }
 
@@ -503,6 +606,42 @@ export function decide(
   if (metrics.finalClaim && !metrics.verificationEvidence) {
     // 这里不直接调 final-auditor，由 gates 层处理。
     // 只登记到 state 中。
+  }
+
+  // 规则 8 (Phase 6): GLM completion-claim-check
+  // Trigger requirements-inspector when a completion claim is made
+  // without real tool evidence OR when the claim contradicts unfinished indicators
+  if (metrics.glmCompletionClaimSignal && !reviewers.includes("requirements-inspector")) {
+    const reason = metrics.realToolEvidence
+      ? "completion claim with suspected contradiction (correction pattern in claim text)"
+      : "completion claim without real tool evidence — requirements check needed"
+    addReviewer("requirements-inspector", reason)
+  }
+
+  // 规则 9 (Phase 6): Kimi task-completion-archivist — completion claim with unfinished items
+  // Trigger Kimi to generate a continuation packet before allowing final stop
+  if (metrics.kimiCompletionCheckSignal) {
+    const reason = "completion claim with unfinished indicators detected"
+    addReviewer("task-completion-archivist", reason)
+  }
+
+  // 规则 10 (Phase 6): Scope expansion → requirements-inspector
+  if (metrics.scopeExpandedSignal && !reviewers.includes("requirements-inspector")) {
+    const reason = "scope expansion or feature creep detected"
+    addReviewer("requirements-inspector", reason)
+  }
+
+  // 规则 11 (Phase 6): Token-aware routing — when context is very high,
+  // prioritize Kimi for context compression over DeepSeek for further tasks.
+  // This is advisory; the actual routing happens in decide() return.
+  if (contextLimit && (metrics.contextPercent >= 60 || metrics.contextTokens > contextLimit * 0.6)) {
+    writeEvidence("routing.token_aware", {
+      reason: "high context — Kimi prioritization recommended",
+      context_percent: metrics.contextPercent,
+      context_tokens: metrics.contextTokens,
+      context_limit: contextLimit,
+      step: currentStep,
+    }, sessionID)
   }
 
   // 规则 7（auto-verifier）：completion blocked + 缺真实 tool evidence → 自动注入 verifier subtask
@@ -559,6 +698,11 @@ export function decide(
       reviewer_conflict_signal: metrics.reviewerConflictSignal,
       repeated_tool_failure: metrics.repeatedToolFailure,
       real_tool_evidence: metrics.realToolEvidence,
+      kimi_completion_check_signal: metrics.kimiCompletionCheckSignal,
+      glm_completion_claim_signal: metrics.glmCompletionClaimSignal,
+      kimi_pre_report_signal: metrics.kimiPreReportSignal,
+      scope_expanded_signal: metrics.scopeExpandedSignal,
+      phase_switch_signal: metrics.phaseSwitchSignal,
     },
   }
 }
@@ -584,6 +728,11 @@ export function updateState(
     verificationEvidence: decision.metrics.verification_evidence,
     realToolEvidence: decision.metrics.real_tool_evidence,
     reviewerConflictSignal: decision.metrics.reviewer_conflict_signal,
+    kimiCompletionCheckSignal: decision.metrics.kimi_completion_check_signal ?? false,
+    glmCompletionClaimSignal: decision.metrics.glm_completion_claim_signal ?? false,
+    kimiPreReportSignal: decision.metrics.kimi_pre_report_signal ?? false,
+    scopeExpandedSignal: decision.metrics.scope_expanded_signal ?? false,
+    phaseSwitchSignal: decision.metrics.phase_switch_signal ?? false,
   }
   const risk = assessRisk(riskMetrics)
 
@@ -611,6 +760,18 @@ export function updateState(
     state.reviewer_conflict = true
   }
 
+  // Continuation budget tracking
+  if (decision.metrics.final_claim && !decision.metrics.verification_evidence) {
+    state.continuation_count ??= 0
+    state.continuation_count++
+    state.repair_counts ??= {}
+    // Persist updated budget
+    writeEvidence("continuation.budget_tracked", {
+      continuation_count: state.continuation_count,
+      step: decision.metrics.context_tokens,
+    })
+  }
+
   saveState(sessionID, state)
   return state
 }
@@ -625,6 +786,9 @@ export function markReviewerCompleted(
     state.completed_reviews.push(reviewer)
   }
   state.required_reviews = state.required_reviews.filter((r) => r !== reviewer)
+  state.queued_reviewers = (state.queued_reviewers ?? []).filter((r) => r !== reviewer)
+  state.running_reviewers = (state.running_reviewers ?? []).filter((r) => r !== reviewer)
+  if (reviewer === "role-cross" && state.required_reviews.length === 0) state.reviewer_conflict = false
 
   if (output?.block_completion) {
     state.blocked_completion = true
@@ -655,6 +819,35 @@ export function markReviewerCompleted(
     block_completion: output?.block_completion ?? false,
     findings_count: output?.findings.length ?? 0,
   }, sessionID)
+
+  // Phase 7: Record structured reviewer output to Result Ledger
+  if (output) {
+    try {
+      const resultPacket = buildResultPacket({
+        sessionID,
+        executing_role: reviewer as ResultPacket["executing_role"],
+        model: reviewer === "requirements-inspector" ? "zai/glm-5.1"
+          : reviewer === "long-context-archivist" || reviewer === "task-completion-archivist" ? "kimi/kimi-k2.6"
+          : reviewer === "chief-engineer" ? "deepseek/deepseek-v4-pro"
+          : reviewer === "final-auditor" ? "openai/gpt-5.5-pro"
+          : "unknown",
+        user_goal: state.metrics?.final_claim ? "completion claim" : "ongoing task",
+        subtask_goal: `Review by ${reviewer}: ${output.trigger_reason}`,
+        claimed_result: `Review verdict: ${output.verdict} | Score: ${output.score} | Evidence confidence: ${output.evidence_confidence}`,
+        completion_status: output.block_completion ? "BLOCKED" : "VERIFIED_COMPLETE",
+        evidence_refs: [`reviewer:${reviewer}`, `score:${output.score}`],
+        unresolved_items: output.findings
+          .filter((f) => f.severity === "block")
+          .map((f) => f.summary),
+        verification_results: [
+          { name: "reviewer_score", status: output.score >= 70 ? "passed" : "failed" },
+        ],
+      })
+      writeResultLedger(sessionID, resultPacket)
+    } catch {
+      // Result ledger write is best-effort; must not block completion tracking
+    }
+  }
 }
 
 export function clearBlockIfResolved(sessionID: string) {
@@ -680,6 +873,38 @@ export function generateSubtasks(
 
   for (const reviewer of decision.reviewers) {
     const reason = decision.reasons[reviewer]
+
+    // Phase 7: Deduplication gate — check if a reusable result already exists
+    // for this reviewer's task. If a VERIFIED_COMPLETE result exists, skip
+    // re-dispatching and inject a synthetic hint instead.
+    try {
+      const dedup = checkDeduplication(sessionID, reason, {
+        requiredFilePaths: extractRelatedPaths(messages),
+        maxAgeMinutes: 120,
+      })
+      if (dedup.isRedundant && dedup.recommendedAction === "reuse_existing") {
+        writeEvidence("result.dedup_blocked", {
+          reviewer,
+          reason,
+          existing_packet_id: dedup.existingResults[0]?.packet_id,
+          covered_scope: dedup.sufficiency?.coveredScope,
+        }, sessionID)
+        // Skip this subtask — a reusable result already exists
+        continue
+      }
+      if (dedup.isRedundant && dedup.recommendedAction === "verify_existing") {
+        writeEvidence("result.dedup_blocked", {
+          reviewer,
+          reason,
+          existing_packet_id: dedup.existingResults[0]?.packet_id,
+          action: "verify_existing",
+        }, sessionID)
+        continue
+      }
+    } catch {
+      // Dedup check must not block subtask dispatch
+    }
+
     const subtask = buildSubtask(reviewer, reason, decision.metrics, sessionID, messages)
     subtasks.push(subtask)
     writeEvidence("supervisor.reviewer_called", {
@@ -702,11 +927,12 @@ function buildSubtask(
   const modelMap: Record<ReviewerRole, { providerID: ProviderID; modelID: ModelID }> = {
     "requirements-inspector": { providerID: ProviderID.make("zai"), modelID: ModelID.make("glm-5.1") },
     "long-context-archivist": { providerID: ProviderID.make("kimi"), modelID: ModelID.make("kimi-k2.6") },
+    "task-completion-archivist": { providerID: ProviderID.make("kimi"), modelID: ModelID.make("kimi-k2.6") },
     "chief-engineer": { providerID: ProviderID.make("deepseek"), modelID: ModelID.make("deepseek-v4-pro") },
     "final-auditor": { providerID: ProviderID.make("openai"), modelID: ModelID.make("gpt-5.5-pro") },
     "role-cross": { providerID: ProviderID.make("zai"), modelID: ModelID.make("glm-5.1") },
   }
-  const compactContext = buildReviewerContext(reviewer, reason, metrics, messages)
+  const compactContext = buildReviewerContext(reviewer, reason, metrics, messages, sessionID)
 
   const promptTemplates: Record<ReviewerRole, string> = {
     "requirements-inspector": [
@@ -801,6 +1027,44 @@ function buildSubtask(
       JSON.stringify(emptyReviewerOutput("role-cross", reason), null, 2),
       `\`\`\``,
     ].join("\n"),
+    "task-completion-archivist": [
+      `[dll-agent supervisor auto-trigger]`,
+      `<compact-review-context>`,
+      compactContext,
+      `</compact-review-context>`,
+      ``,
+      `Act as the task-completion-archivist (Kimi K2.6). Check whether the task is truly complete:`,
+      `1. Is the user goal fully achieved?`,
+      `2. Are there blocking unfinished items in the completion report?`,
+      `3. Classify ALL unfinished items as: blocking_unfinished | non_blocking_followup | requires_user_input`,
+      `4. If blocking items exist, generate a continuation packet with a next_execution_plan.`,
+      `5. Never mark as VERIFIED_COMPLETE if blocking unfinished items exist.`,
+      ``,
+      `ROLE BOUNDARY: use the compact context first. Only read listed relevant files when needed.`,
+      `The runtime enforces this reviewer as read-only; bash/edit/web/task tools are denied.`,
+      `Output a CONTINUATION PACKET in the following JSON format:`,
+      `\`\`\`json`,
+      JSON.stringify({
+        version: 1,
+        reviewer: "task-completion-archivist",
+        trigger_reason: reason,
+        verdict: "pass",
+        completion_status: "UNVERIFIED_COMPLETE",
+        blocking_unfinished: [],
+        non_blocking_followup: [],
+        requires_user_input: [],
+        already_completed: [],
+        next_execution_plan: [],
+        allow_final_report: false,
+        findings: [],
+        score: 100,
+        block_completion: false,
+        next_actions: [],
+        evidence_confidence: 100,
+        ts: new Date().toISOString(),
+      }, null, 2),
+      `\`\`\``,
+    ].join("\n"),
   }
 
   return {
@@ -862,6 +1126,44 @@ export function buildVerifierSubtask(
     agent,
     description: "Auto verifier: typecheck + tests + doctor",
     command: "dll-agent-supervisor",
+    prompt,
+  }
+}
+
+/**
+ * Phase 6: Build a task-completion-archivist subtask with the dedicated
+ * continuation prompt template from continuation-gate.ts.
+ *
+ * Previously, the continuation gate reused buildVerifierSubtask() and overrode
+ * agent/description/command — but the prompt was still a verification prompt,
+ * not a completion-check prompt. This function uses the correct template.
+ */
+export function buildTaskCompletionSubtask(
+  sessionID: string,
+  userGoal: string,
+  completionClaim: string,
+  state: SupervisorState,
+): MessageV2.SubtaskPart {
+  const prompt = buildContinuationSubtaskPrompt({
+    userGoal,
+    completionClaim,
+    state,
+  })
+
+  writeEvidence("supervisor.task_completion_archivist_injected", {
+    reason: "continuation gate triggered",
+    userGoal: userGoal.slice(0, 100),
+  }, sessionID)
+
+  return {
+    type: "subtask" as const,
+    id: PartID.ascending(),
+    messageID: MessageID.ascending(),
+    sessionID: SessionID.make(sessionID),
+    agent: "task-completion-archivist",
+    description: "Kimi task-completion-archivist: check unfinished items",
+    command: "dll-agent-supervisor",
+    model: { providerID: ProviderID.make("kimi"), modelID: ModelID.make("kimi-k2.6") },
     prompt,
   }
 }

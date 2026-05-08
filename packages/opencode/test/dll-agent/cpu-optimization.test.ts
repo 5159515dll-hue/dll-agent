@@ -249,4 +249,44 @@ describe("adaptive refresh rates", () => {
     expect(source).toContain("15_000")
     expect(source).toContain("60_000")
   })
+
+  test("capability sidebar uses bounded adaptive refresh", async () => {
+    const sourcePath = path.join(import.meta.dir, "../../src/cli/cmd/tui/feature-plugins/sidebar/capability.tsx")
+    const source = fs.readFileSync(sourcePath, "utf8")
+    expect(source).toContain("buildCapabilitySidebarStatus(process.cwd(), 72, {")
+    expect(source).toContain("sessionID: props.session_id")
+    expect(source).toContain("idleAwareInterval")
+    expect(source).toContain("30_000")
+    expect(source).toContain("60_000")
+  })
+
+  test("capability sidebar plugin is registered internally", async () => {
+    const sourcePath = path.join(import.meta.dir, "../../src/cli/cmd/tui/plugin/internal.ts")
+    const source = fs.readFileSync(sourcePath, "utf8")
+    expect(source).toContain("SidebarCapability")
+    expect(source).toContain("../feature-plugins/sidebar/capability")
+  })
+
+  test("capability sidebar receives session title as task context", async () => {
+    const sidebarPath = path.join(import.meta.dir, "../../src/cli/cmd/tui/routes/session/sidebar.tsx")
+    const pluginTypePath = path.join(import.meta.dir, "../../../plugin/src/tui.ts")
+    const capabilityPath = path.join(import.meta.dir, "../../src/cli/cmd/tui/feature-plugins/sidebar/capability.tsx")
+    const sidebar = fs.readFileSync(sidebarPath, "utf8")
+    const pluginTypes = fs.readFileSync(pluginTypePath, "utf8")
+    const capability = fs.readFileSync(capabilityPath, "utf8")
+
+    expect(sidebar).toContain('name="sidebar_content"')
+    expect(sidebar).toContain("title={session()!.title}")
+    expect(pluginTypes).toContain("sidebar_content: {")
+    expect(pluginTypes).toContain("title?: string")
+    expect(capability).toContain("[props.title, todo]")
+  })
+
+  test("both prompt gate paths use retry exhaustion hard-stop summary", async () => {
+    const sourcePath = path.join(import.meta.dir, "../../src/session/prompt.ts")
+    const source = fs.readFileSync(sourcePath, "utf8")
+    expect(source).toContain("buildGateBlockSummary")
+    expect(source.match(/gate\.retry_exhausted/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+    expect(source).toContain('path: "second-break"')
+  })
 })

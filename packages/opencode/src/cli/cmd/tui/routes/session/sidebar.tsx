@@ -81,7 +81,7 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 </Show>
               </box>
             </TuiPluginRuntime.Slot>
-            <TuiPluginRuntime.Slot name="sidebar_content" session_id={props.sessionID} />
+            <TuiPluginRuntime.Slot name="sidebar_content" session_id={props.sessionID} title={session()!.title} />
           </box>
         </scrollbox>
 

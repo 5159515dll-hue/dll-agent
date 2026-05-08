@@ -14,6 +14,16 @@ export type Metrics = {
   /** 真实从工具输出（bash/test runner 等）解析出的验证证据 */
   realToolEvidence: boolean
   reviewerConflictSignal: boolean
+  /** Phase 6: Kimi completion check signal — trigger task-completion-archivist before final report */
+  kimiCompletionCheckSignal: boolean
+  /** Phase 6: GLM completion claim check signal — trigger requirements-inspector for completion claims */
+  glmCompletionClaimSignal: boolean
+  /** Phase 6: Kimi pre-report signal — trigger long-context-archivist before final report for context compression */
+  kimiPreReportSignal: boolean
+  /** Phase 6: Scope expansion signal — detected when commander significantly expands task scope */
+  scopeExpandedSignal: boolean
+  /** Phase 6: Phase switch signal — detected when user changes task direction */
+  phaseSwitchSignal: boolean
 }
 
 function textOf(parts: MessageV2.Part[]) {
@@ -86,10 +96,23 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     /(不对|不是这个|跑偏|方向(变|错|偏)|不符合|你误解|理解错|搞错|做错|改错|需求(变更|改变|改了)|目标(变更|改变|改了)|不要按原来|推倒重来|重新来|wrong|off[- ]?track|misunderstood|incorrect|mistaken|that'?s wrong|not what i (asked|wanted|meant)|start over|backtrack|revert)/i
   const longContextPattern = /(长上下文|长日志|日志很多|baseline|文档|docx|ppt|报告|全部日志|context|memory|历史|总结|压缩|long context|long log|big document|summarize|condense|consolidate)/i
   const finalClaimPattern =
-    /(完成了|已经完成|已修复|修复完成|验证通过|最终结论|最终 verdict|可以交付|done|fixed|implemented|verified|all tests pass|successfully|task[- ]?complete|ready to merge|ship it|all green|完工)/i
+    /(完成了|已完成|已经完成|已修复|修复完成|验证通过|最终结论|最终 verdict|可以交付|done|fixed|implemented|verified|all tests pass|successfully|task[- ]?complete|ready to merge|ship it|all green|完工)/i
   const evidencePattern =
     /(运行了|执行了|验证|测试|typecheck|doctor|smoke|pytest|npm test|bun run|日志|log\/|docs\/|路径|命令|observed|output|checkpoint|metrics|tsgo|exit code|stdout|stderr|exited with)/i
   const conflictPattern = /(冲突|相互矛盾|reviewer conflict|意见不一致|无法判断|证据不足|insufficient evidence|disagree|contradict)/i
+
+  // Phase 6: New trigger signal patterns
+  // Unfinished indicators for Kimi completion check
+  const unfinishedPattern =
+    /(未完成|待完成|下一步|后续|TODO|roadmap|不是.*本轮|仍有.*未|尚未.*完成|PARTIAL|BLOCKED|推迟|不在.*范围)/i
+  // GLM completion claim check: completion claim without real evidence or with medium+ risk
+  // (computed from combined conditions in metrics() return)
+  // Scope expansion detection: compare file edit scope vs initial task scope
+  const scopeExpansionPattern =
+    /(扩大.*范围|增加.*需求|额外.*功能|scope.*(creep|expand)|feature.*creep|gold.?plating|超出.*(计划|预期|范围))/i
+  // Phase switch detection: user explicitly changes task direction
+  const phaseSwitchPattern =
+    /(先.*不要|先.*别|暂停|换个.*方向|先做|先修|先处理|改做|改为|转而|切换.*任务|switch.*task|change.*direction|scrap.*that|new.*plan|重新.*计划)/i
 
   const SCANNABLE_TOOLS = new Set(["bash", "edit", "write", "task"])
   const toolErrors: string[] = []
@@ -146,6 +169,20 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     verificationEvidence: evidencePattern.test(allText),
     realToolEvidence: verifiedToolEvidence(messages),
     reviewerConflictSignal: conflictPattern.test(allText),
+
+    // Phase 6: New trigger signals
+    // Kimi completion check: final claim + any unfinished indicator
+    kimiCompletionCheckSignal: finalClaimPattern.test(lastAssistantText) && unfinishedPattern.test(lastAssistantText),
+    // GLM completion claim check: final claim + (no real tool evidence OR medium+ risk implied)
+    glmCompletionClaimSignal:
+      finalClaimPattern.test(lastAssistantText) &&
+      (!verifiedToolEvidence(messages) || correctionPattern.test(lastAssistantText)),
+    // Kimi pre-report: context >=30% AND final claim (proactive compression before report)
+    kimiPreReportSignal: contextPercent >= 30 && finalClaimPattern.test(lastAssistantText),
+    // Scope expansion: detected only via explicit scope expansion patterns (not generic corrections)
+    scopeExpandedSignal: scopeExpansionPattern.test(allText),
+    // Phase switch: user changes direction explicitly
+    phaseSwitchSignal: phaseSwitchPattern.test(messageText(lastUser)),
   }
 }
 
@@ -161,6 +198,10 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
  */
 const VERIFICATION_COMMAND_PATTERN =
   /(typecheck|tsgo|tsc|bun test|pytest|npm test|npm run test|go test|cargo test|jest|vitest|mocha|doctor|python3 -m py_compile|git diff --check|dll-agent doctor)/i
+const AUDIT_EVIDENCE_COMMAND_PATTERN =
+  /(playwright|browser.*audit|audit-full-browser|click-through|点击审计|浏览器.*审计|e2e)/i
+const AUDIT_ARTIFACT_OUTPUT_PATTERN =
+  /(Report saved to:|full-crm-browser-flow-audit-report|screenshots? captured|test-screenshots|Browser Click-Through Audit|📸 Screenshots)/i
 const POSITIVE_OUTPUT_PATTERN =
   /(0 errors?|all tests? pass|exit(ed)? (with )?(code )?0|exited with code 0|^ok$|✓|PASS\b|^pass\b|Build succeeded|completed successfully|no error|0 problems|result:\s*(ok|warn)|passed|success)/im
 const NEGATIVE_OUTPUT_PATTERN =
@@ -177,13 +218,13 @@ export function verifiedToolEvidence(messages: MessageV2.WithParts[]): boolean {
       const command = typeof input?.command === "string" ? input.command : ""
       const description = typeof input?.description === "string" ? input.description : ""
       const haystack = `${tool} ${command} ${description}`
-      if (!VERIFICATION_COMMAND_PATTERN.test(haystack)) continue
       const output = typeof part.state.output === "string" ? part.state.output : ""
+      if (AUDIT_EVIDENCE_COMMAND_PATTERN.test(haystack) && AUDIT_ARTIFACT_OUTPUT_PATTERN.test(output)) return true
+      if (!VERIFICATION_COMMAND_PATTERN.test(haystack)) continue
       if (NEGATIVE_OUTPUT_PATTERN.test(output)) continue
       if (POSITIVE_OUTPUT_PATTERN.test(output) || output.trim().length === 0) return true
     }
   }
   return false
 }
-
 

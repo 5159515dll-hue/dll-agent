@@ -1,7 +1,32 @@
-import { describe, expect, test } from "bun:test"
+import fs from "fs"
+import os from "os"
+import path from "path"
+import { afterEach, describe, expect, test } from "bun:test"
 import { checkEvidenceGate, checkReconciliationGate, recordGateBlock, isGateRetryExhausted, GATE_MAX_RETRIES, buildGateBlockSummary } from "../../src/dll-agent/gates"
 import type { EvidenceGateInput } from "../../src/dll-agent/interfaces"
 import type { MessageV2 } from "../../src/session/message-v2"
+
+const cleanup: string[] = []
+
+afterEach(() => {
+  for (const dir of cleanup.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
+})
+
+function auditProjectWithFails() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dll-agent-gate-artifacts-"))
+  cleanup.push(dir)
+  fs.mkdirSync(path.join(dir, "files"), { recursive: true })
+  fs.mkdirSync(path.join(dir, "test-screenshots"), { recursive: true })
+  fs.writeFileSync(path.join(dir, "test-screenshots", "home.png"), "png")
+  fs.writeFileSync(path.join(dir, "files", "full-crm-browser-flow-audit-report.md"), `
+> No blocking issues found during this audit session.
+| Total Tests | 67 |
+| ✅ PASS | 53 |
+| ❌ FAIL | 5 |
+| ⚠️ WARN | 9 |
+`)
+  return dir
+}
 
 function base(over: Partial<EvidenceGateInput> = {}): EvidenceGateInput {
   return {
@@ -86,6 +111,23 @@ describe("DllAgentGates.checkEvidenceGate", () => {
       [],
     )
     expect(r.passed).toBe(false)
+  })
+
+  test("artifact evidence with FAIL count blocks verified completion", () => {
+    const projectDir = auditProjectWithFails()
+    const r = checkEvidenceGate(
+      base({
+        isCompletionClaim: true,
+        risk: "high",
+        hasVerificationEvidence: true,
+        assistantText: "审计完成，没有阻断问题。",
+        projectDir,
+      }),
+      [bashTool("node audit-full-browser.mjs", "Report saved to: files/full-crm-browser-flow-audit-report.md\nScreenshots captured: 55")],
+    )
+    expect(r.passed).toBe(false)
+    expect(r.block_reason).toContain("not verified")
+    expect(r.synthetic_hint).toContain("FAIL")
   })
 
   test("explicit unverified marker passes", () => {
