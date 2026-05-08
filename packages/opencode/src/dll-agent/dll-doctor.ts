@@ -22,6 +22,7 @@ import { CAPABILITY_ORCHESTRATOR_VERSION } from "./capability-orchestrator"
 import { scanArtifactLedger } from "./artifact-ledger"
 import { buildEvidenceSnapshot } from "./evidence-normalizer"
 import { evaluateCompletionReadiness } from "./completion-readiness"
+import { doctorCheck as roleModelDoctorCheck } from "./role-model-registry"
 import type { RiskLevel } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
 import { execSync } from "child_process"
@@ -851,6 +852,45 @@ function checkCapabilityHealth(projectRoot?: string): DoctorCheck[] {
   return checks
 }
 
+// ─── Role Model Health Check ─────────────────────────────────────────────────
+
+function checkRoleModelHealth(projectRoot: string): DoctorCheck[] {
+  const checks: DoctorCheck[] = []
+  try {
+    const issues = roleModelDoctorCheck(undefined, projectRoot)
+    if (issues.length === 0) {
+      checks.push({
+        name: "role-model-health",
+        severity: "PASS",
+        message: "All role models validated — no provider key issues or config conflicts",
+        nextAction: null,
+        evidence: "doctorCheck() returned no issues",
+      })
+    } else {
+      for (const issue of issues) {
+        checks.push({
+          name: `role-model:${issue.role}`,
+          severity: issue.severity,
+          message: issue.message,
+          nextAction: issue.severity === "FAIL"
+            ? `Fix role model config for '${issue.role}'`
+            : `Review role '${issue.role}' model assignment`,
+          evidence: `role=${issue.role}, severity=${issue.severity}`,
+        })
+      }
+    }
+  } catch (error) {
+    checks.push({
+      name: "role-model-health",
+      severity: "WARN",
+      message: `Could not run role model health check: ${String(error)}`,
+      nextAction: "Run role-model-registry doctor manually",
+      evidence: String(error),
+    })
+  }
+  return checks
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
@@ -865,6 +905,9 @@ export function runDoctor(projectRoot?: string): DoctorReport {
 
   // LSP checks
   allChecks.push(...checkLspStrategy(root))
+
+  // Role model health checks
+  allChecks.push(...checkRoleModelHealth(root))
 
   // Evidence health
   allChecks.push(...checkEvidenceHealth())

@@ -1,4 +1,11 @@
 import { redact as evidenceRedact, write as evidenceWrite } from "./evidence"
+import {
+  resolveRoleModel,
+  listRoleModels,
+  getDefaultModel,
+  type DllRole,
+  type EffectiveRoleModel,
+} from "./role-model-registry"
 
 export const qualityLevels = ["max", "auto", "balanced", "economy"] as const
 export const verifyLevels = ["strict", "normal", "light"] as const
@@ -31,45 +38,79 @@ export function verify(): Verify {
   return "strict"
 }
 
-export function roleRoster() {
+const ROLE_MISSIONS: Record<DllRole, string> = {
+  commander: "Default goal execution, routing, deep reasoning, stop-condition control, and evidence gate.",
+  "chief-engineer": "Deep reasoning, engineering execution, hard debugging, patch design, and tool-use recovery.",
+  "requirements-inspector": "Chinese requirement interpretation, instruction adherence, contradiction detection, and phase drift checks.",
+  "long-context-archivist": "Long logs, documents, reports, PPT/Word consistency, memory, baseline, and history reconciliation.",
+  "task-completion-archivist": "Task completion continuation check and structured packet generation.",
+  "final-auditor": "On-demand strategic overview and final audit only when stuck, off-track, conflicted, or making high-risk completion claims.",
+  "role-cross": "Temporary role crossing for recovery or reviewer conflict.",
+  "agentic-solver": "Future: autonomous multi-step agentic problem solving.",
+  "multimodal-reader": "Future: multi-modal (image/PDF/audio) content analysis.",
+  "voice-output": "Future: TTS/voice clone output.",
+  executor: "Verification and test execution: typecheck, test, doctor.",
+}
+
+/**
+ * Returns the role roster with models resolved from the Role Model Registry.
+ * When projectDir or sessionID are not available, uses built-in defaults
+ * (with global config overrides applied).
+ */
+export function roleRoster(projectDir?: string) {
+  const resolve = (role: DllRole) => resolveRoleModel(role, undefined, projectDir)
+  const c = resolve("commander")
+  const ce = resolve("chief-engineer")
+  const ri = resolve("requirements-inspector")
+  const lca = resolve("long-context-archivist")
+  const fa = resolve("final-auditor")
   return {
-    commander: {
-      model: "deepseek/deepseek-v4-pro",
-      mission: "Default goal execution, routing, deep reasoning, stop-condition control, and evidence gate.",
-    },
-    chiefEngineer: {
-      model: "deepseek/deepseek-v4-pro",
-      mission: "Deep reasoning, engineering execution, hard debugging, patch design, and tool-use recovery.",
-    },
-    requirementsInspector: {
-      model: "zai/glm-5.1",
-      mission: "Chinese requirement interpretation, instruction adherence, contradiction detection, and phase drift checks.",
-    },
-    longContextArchivist: {
-      model: "kimi/kimi-k2.6",
-      mission: "Long logs, documents, reports, PPT/Word consistency, memory, baseline, and history reconciliation.",
-    },
-    finalAuditor: {
-      model: "openai/gpt-5.5-pro",
-      mission: "On-demand strategic overview and final audit only when stuck, off-track, conflicted, or making high-risk completion claims.",
-    },
+    commander: { model: c.primary, mission: ROLE_MISSIONS.commander },
+    chiefEngineer: { model: ce.primary, mission: ROLE_MISSIONS["chief-engineer"] },
+    requirementsInspector: { model: ri.primary, mission: ROLE_MISSIONS["requirements-inspector"] },
+    longContextArchivist: { model: lca.primary, mission: ROLE_MISSIONS["long-context-archivist"] },
+    finalAuditor: { model: fa.primary, mission: ROLE_MISSIONS["final-auditor"] },
   }
 }
 
 export function modeSummary() {
+  const cmdr = resolveRoleModel("commander")
   return {
     quality: quality(),
     verify: verify(),
     defaultAgent: "commander",
-    defaultModel: "deepseek/deepseek-v4-pro",
-    commands: ["roles", "dll-status", "quality", "verify", "model-capability", "chief-engineer", "requirements-check", "context-check", "final-audit", "cross-review", "team-review", "tools", "tools-reload", "tools-status", "mcp-status", "mcp-start", "mcp-stop", "mcp-health", "capabilities", "capability-status", "capability-discover", "capability-plan", "capability-refresh", "capability-doctor"],
+    defaultModel: cmdr.primary,
+    commands: [
+      "roles", "dll-status", "quality", "verify", "model-capability",
+      "chief-engineer", "requirements-check", "context-check", "final-audit",
+      "cross-review", "team-review",
+      "role-models", "role-model-set", "role-model-reset", "role-model-test",
+      "role-model-fallback-add", "role-model-fallback-remove",
+      "tools", "tools-reload", "tools-status",
+      "mcp-status", "mcp-start", "mcp-stop", "mcp-health",
+      "capabilities", "capability-status", "capability-discover",
+      "capability-plan", "capability-refresh", "capability-doctor",
+    ],
     subagents: ["chief-engineer", "requirements-inspector", "long-context-archivist", "final-auditor", "role-cross"],
   }
 }
 
+/**
+ * Returns role command definitions.
+ * Model fields are intentionally omitted — the runtime resolves the model
+ * from the agent's configured model (via agent.ts → Role Model Registry).
+ * This ensures that session-level model overrides take effect for slash commands.
+ */
 export function roleCommands() {
   const q = quality()
   const v = verify()
+  const cmdr = resolveRoleModel("commander")
+  const ce = resolveRoleModel("chief-engineer")
+  const ri = resolveRoleModel("requirements-inspector")
+  const lca = resolveRoleModel("long-context-archivist")
+  const fa = resolveRoleModel("final-auditor")
+  const rc = resolveRoleModel("role-cross")
+
   return {
     "roles": {
       description: "Show the dll-agent role team and when each role must be used.",
@@ -83,10 +124,10 @@ export function roleCommands() {
       template: [
         `Quality mode: ${q}.`,
         `Verification mode: ${v}.`,
-        "Default commander/executor: deepseek/deepseek-v4-pro, context 1,048,576, thinking=max.",
-        "Inspectors: zai/glm-5.1 and kimi/kimi-k2.6.",
-        "OpenAI strategic/final auditor: openai/gpt-5.5-pro, on-demand only for stuck/off-track/conflict/high-risk finalization.",
-        "Available commands: /quality, /verify, /model-capability, /roles, /team-review, /chief-engineer, /cross-review.",
+        `Default commander/executor: ${cmdr.primary}, context 1,048,576, thinking=max.`,
+        `Inspectors: ${ri.primary} and ${lca.primary}.`,
+        `OpenAI strategic/final auditor: ${fa.primary}, on-demand only for stuck/off-track/conflict/high-risk finalization.`,
+        "Available commands: /quality, /verify, /model-capability, /roles, /team-review, /chief-engineer, /cross-review, /role-models.",
       ].join("\n"),
     },
     "quality": {
@@ -104,13 +145,18 @@ export function roleCommands() {
     "model-capability": {
       description: "Show pinned strongest model capabilities and role mapping.",
       agent: "commander",
-      template:
-        "Show pinned dll-agent model capabilities:\n- default commander/executor: deepseek/deepseek-v4-pro, context 1,048,576, thinking=max, reasoning=max.\n- requirements-inspector: zai/glm-5.1, context 204,800, thinking enabled.\n- long-context-archivist: kimi/kimi-k2.6, context 262,144, thinking enabled.\n- strategic/final auditor: openai/gpt-5.5-pro, context 1,050,000, output 128,000, reasoning=xhigh, on-demand only.\nDo not claim live API verification unless doctor/API smoke was actually run.",
+      template: [
+        "Show pinned dll-agent model capabilities:",
+        `- default commander/executor: ${cmdr.primary} (source: ${cmdr.source})`,
+        `- requirements-inspector: ${ri.primary} (source: ${ri.source})`,
+        `- long-context-archivist: ${lca.primary} (source: ${lca.source})`,
+        `- strategic/final auditor: ${fa.primary}, on-demand only (source: ${fa.source})`,
+        "Do not claim live API verification unless doctor/API smoke was actually run.",
+      ].join("\n"),
     },
     "chief-engineer": {
       description: "Delegate execution/debugging to DeepSeek chief engineer.",
       agent: "chief-engineer",
-      model: "deepseek/deepseek-v4-pro",
       subtask: true,
       template:
         "Act as the chief engineer. Use deep reasoning, code inspection, tools, and verification to move the user goal forward. If a fix is made, provide exact files, commands, observed outputs, and remaining risk.\n\n$ARGUMENTS",
@@ -118,7 +164,6 @@ export function roleCommands() {
     "requirements-check": {
       description: "Run GLM Chinese requirement and logic inspection.",
       agent: "requirements-inspector",
-      model: "zai/glm-5.1",
       subtask: true,
       template:
         "Act as the requirements inspector. Check the user's Chinese intent, constraints, contradictions, phase drift, and whether the current work is still aligned with the real goal. Cite evidence.\n\n$ARGUMENTS",
@@ -126,7 +171,6 @@ export function roleCommands() {
     "context-check": {
       description: "Run Kimi long-context, document, log, and baseline inspection.",
       agent: "long-context-archivist",
-      model: "kimi/kimi-k2.6",
       subtask: true,
       template:
         "Act as the long-context archivist. Check logs, documents, baselines, phase history, evidence, and memory drift. Only use evidence-backed conclusions.\n\n$ARGUMENTS",
@@ -134,7 +178,6 @@ export function roleCommands() {
     "final-audit": {
       description: "Run on-demand GPT-5.5 Pro strategic/final evidence audit.",
       agent: "final-auditor",
-      model: "openai/gpt-5.5-pro",
       subtask: true,
       template:
         "Act as the on-demand strategic/final auditor. Check whether the user goal is complete, whether evidence is sufficient, whether tests/doctor/smoke checks really ran, whether strategic direction is still sound, and whether any claim is overconfident.\n\n$ARGUMENTS",
@@ -142,7 +185,6 @@ export function roleCommands() {
     "cross-review": {
       description: "Temporary role crossing for stuck tasks or reviewer conflict.",
       agent: "role-cross",
-      model: "deepseek/deepseek-v4-pro",
       subtask: true,
       template:
         "Run a temporary role-crossing review. Inspect the problem from a different role's perspective, find blind spots, identify missing evidence, and propose actionable recovery steps. This role crossing ends after this review round.\n\n$ARGUMENTS",
@@ -152,6 +194,115 @@ export function roleCommands() {
       agent: "commander",
       template:
         "Run a dll-agent team review for the current objective. Use the task tool only for roles that are actually needed; do not call OpenAI by default. Call these subagents as needed: requirements-inspector for intent/rules, long-context-archivist for logs/baseline/context, chief-engineer for executable recovery, final-auditor only for stuck/off-track/conflict/high-risk completion claims. Reconcile conflicts and continue toward the user goal.\n\n$ARGUMENTS",
+    },
+    // ─── Role Model Management Commands ────────────────────────────────────
+    "role-models": {
+      description: "Show all role model assignments, sources, and provider availability.",
+      agent: "commander",
+      template: [
+        "Show the current role model assignments for all dll-agent roles.",
+        "Use the role-model-registry.ts module to list all roles with:",
+        "- role name",
+        "- primary model (provider/model format)",
+        "- fallback chain",
+        "- source: built-in / global / project / session",
+        "- enabled status",
+        "- on-demand only flag",
+        "- provider availability (API key detected?)",
+        "Organize by active roles first, then future/disabled roles.",
+        "This is a read-only status command.",
+      ].join("\n"),
+    },
+    "role-model-set": {
+      description: "Set a role's model. Usage: /role-model-set <role> <provider/model> [--scope session|project|global]",
+      agent: "commander",
+      template: [
+        "Set the model for a specific dll-agent role.",
+        "Parameters: $ARGUMENTS",
+        "Format: /role-model-set <role> <provider/model> [--scope session|project|global]",
+        "",
+        "Instructions:",
+        "1. Parse arguments: first arg is role name, second is provider/model, optional --scope flag",
+        "2. Default scope if not specified: session",
+        "3. Validate the role name exists (use role-model-registry.ts isDllRole)",
+        "4. Validate model format (use role-model-registry.ts validateRoleModel)",
+        "5. If setting voice/TTS model to a coding role (commander/chief-engineer/agentic-solver), warn but allow",
+        "6. If setting final-auditor, warn that it remains on-demand only regardless of model",
+        "7. Check provider availability (API key in env)",
+        "8. Call setRoleModelOverride() from role-model-registry.ts",
+        "9. Report: previous model → new model, scope, and provider availability",
+        "10. If provider key is missing, note: 'saved but provider unavailable; will fallback at runtime'",
+        "Do NOT make the change unless the role and model format are valid.",
+      ].join("\n"),
+    },
+    "role-model-reset": {
+      description: "Reset a role's model to the next-tier default. Usage: /role-model-reset <role> [--scope session|project|global|all]",
+      agent: "commander",
+      template: [
+        "Reset a role's model override.",
+        "Parameters: $ARGUMENTS",
+        "Format: /role-model-reset <role> [--scope session|project|global|all]",
+        "",
+        "Instructions:",
+        "1. Parse arguments: first arg is role name, optional --scope flag",
+        "2. Default scope if not specified: session",
+        "3. If --scope all: reset session, then project, then global overrides for this role",
+        "4. Call resetRoleModelOverride() from role-model-registry.ts",
+        "5. Report: previous model → restored model, source of restored model",
+        "Do NOT reset if no override exists — just report 'no override to reset'.",
+      ].join("\n"),
+    },
+    "role-model-test": {
+      description: "Lightweight smoke test for a role's current model. Usage: /role-model-test <role>",
+      agent: "commander",
+      template: [
+        "Run a lightweight smoke test for a role's current model.",
+        "Parameters: $ARGUMENTS",
+        "Format: /role-model-test <role>",
+        "",
+        "Instructions:",
+        "1. Validate the role exists",
+        "2. Resolve the effective model via resolveRoleModel()",
+        "3. Check provider availability (API key in env)",
+        "4. If provider available: try a minimal API call (single token, e.g., 'say hello' with max_tokens=1)",
+        "5. Report: model, provider status, latency (approx), any errors",
+        "6. Do NOT output the API key",
+        "7. If provider unavailable: report which env var is missing and suggest how to configure it",
+        "8. This is a lightweight smoke test — do not consume significant tokens",
+      ].join("\n"),
+    },
+    "role-model-fallback-add": {
+      description: "Add a fallback model for a role. Usage: /role-model-fallback-add <role> <provider/model> [--scope session|project|global]",
+      agent: "commander",
+      template: [
+        "Add a fallback model to a role's fallback chain.",
+        "Parameters: $ARGUMENTS",
+        "Format: /role-model-fallback-add <role> <provider/model> [--scope session|project|global]",
+        "",
+        "Instructions:",
+        "1. Validate role name and model format",
+        "2. Read current config for the specified scope",
+        "3. Add the model to the fallback array (avoid duplicates)",
+        "4. Write the updated config",
+        "5. Report: role, added fallback, current fallback chain",
+        "This is a best-effort operation; if the config format doesn't match, report the issue.",
+      ].join("\n"),
+    },
+    "role-model-fallback-remove": {
+      description: "Remove a fallback model from a role. Usage: /role-model-fallback-remove <role> <provider/model> [--scope session|project|global]",
+      agent: "commander",
+      template: [
+        "Remove a fallback model from a role's fallback chain.",
+        "Parameters: $ARGUMENTS",
+        "Format: /role-model-fallback-remove <role> <provider/model> [--scope session|project|global]",
+        "",
+        "Instructions:",
+        "1. Validate role name and model format",
+        "2. Read current config for the specified scope",
+        "3. Remove the model from the fallback array",
+        "4. Write the updated config",
+        "5. Report: role, removed fallback, current fallback chain",
+      ].join("\n"),
     },
     "tools": {
       description: "Show current effective tools manifest: global + project merge, status per tool.",
@@ -382,9 +533,11 @@ export function systemPrompt() {
     "The UI may show one active agent, but dll-agent is a role team. The DeepSeek commander should do normal work directly and call real subagents through the task tool when the task is complex, high-risk, stuck, weakly evidenced, or challenged by the user.",
     "Do not call OpenAI for ordinary status, ordinary planning, routine coding, or first-pass answers.",
     "Available subagents: chief-engineer, requirements-inspector, long-context-archivist, final-auditor, role-cross.",
-    "Available role commands: /dll-status, /quality, /verify, /model-capability, /roles, /chief-engineer, /requirements-check, /context-check, /final-audit, /cross-review, /team-review, /capabilities, /capability-status, /capability-discover, /capability-plan, /capability-refresh, /capability-doctor.",
+    "Available role commands: /dll-status, /quality, /verify, /model-capability, /roles, /chief-engineer, /requirements-check, /context-check, /final-audit, /cross-review, /team-review, /role-models, /role-model-set, /role-model-reset, /role-model-test, /capabilities, /capability-status, /capability-discover, /capability-plan, /capability-refresh, /capability-doctor.",
     "Prompting is layered: source-level invariants are short and global; role prompts are role-specific; task packets are phase-specific; evidence packets are retrieved precisely; cross-role packets are temporary and removed after recovery.",
     "Do not feed every instruction to every model. Keep each model focused on its role unless role crossing is explicitly needed for recovery.",
+    "",
+    "Role models can be changed at runtime via /role-model-set and /role-model-reset commands. Use /role-models to view current assignments.",
   ].join("\n")
 }
 

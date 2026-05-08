@@ -92,6 +92,17 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 - council 受 cooldown 和 cost guard 限制
 **代码模式**: ✅ flat exports。
 
+### role-model-registry.ts (NEW — Phase 8)
+统一 Role Model Registry：所有 dll-agent 角色的模型来源走同一个解析逻辑。
+- 三层覆盖：session override > project override > global override > built-in default
+- 支持 11 个角色（含 3 个 future role）
+- Fallback chain 解析：primary 不可用时自动使用 fallback
+- Provider 可用性检测（API key env var check）
+- Voice/TTS 模型 guard（禁止用于 coding role）
+- 配置冲突检测（global + project 同时定义同一角色）
+- 所有模型变更写入 evidence
+**代码模式**: ✅ flat exports。
+
 ## 实现状态
 
 ### ✅ 已由底层代码实现

@@ -14,6 +14,11 @@ import { recordGateBlock, isGateRetryExhausted } from "./gates"
 import { ProviderID, ModelID } from "@/provider/schema"
 import { SessionID, MessageID, PartID } from "@/session/schema"
 import {
+  resolveRoleModel,
+  resolveAvailableModel,
+  type DllRole,
+} from "./role-model-registry"
+import {
   type SupervisorState,
   type TriggerDecision,
   type ReviewerRole,
@@ -823,14 +828,12 @@ export function markReviewerCompleted(
   // Phase 7: Record structured reviewer output to Result Ledger
   if (output) {
     try {
+      const dllRole = reviewerToDllRole(reviewer)
+      const effective = resolveRoleModel(dllRole, sessionID)
       const resultPacket = buildResultPacket({
         sessionID,
         executing_role: reviewer as ResultPacket["executing_role"],
-        model: reviewer === "requirements-inspector" ? "zai/glm-5.1"
-          : reviewer === "long-context-archivist" || reviewer === "task-completion-archivist" ? "kimi/kimi-k2.6"
-          : reviewer === "chief-engineer" ? "deepseek/deepseek-v4-pro"
-          : reviewer === "final-auditor" ? "openai/gpt-5.5-pro"
-          : "unknown",
+        model: effective.primary,
         user_goal: state.metrics?.final_claim ? "completion claim" : "ongoing task",
         subtask_goal: `Review by ${reviewer}: ${output.trigger_reason}`,
         claimed_result: `Review verdict: ${output.verdict} | Score: ${output.score} | Evidence confidence: ${output.evidence_confidence}`,
@@ -917,6 +920,21 @@ export function generateSubtasks(
   return subtasks
 }
 
+/**
+ * Convert a ReviewerRole to the corresponding DllRole for registry lookup.
+ * Some supervisor reviewer roles map directly to DllRoles.
+ */
+function reviewerToDllRole(reviewer: ReviewerRole): DllRole {
+  // Most supervisor reviewer roles have 1:1 mapping to DllRoles
+  if (reviewer === "requirements-inspector") return "requirements-inspector"
+  if (reviewer === "long-context-archivist") return "long-context-archivist"
+  if (reviewer === "task-completion-archivist") return "task-completion-archivist"
+  if (reviewer === "chief-engineer") return "chief-engineer"
+  if (reviewer === "final-auditor") return "final-auditor"
+  if (reviewer === "role-cross") return "role-cross"
+  return "chief-engineer" // fallback
+}
+
 function buildSubtask(
   reviewer: ReviewerRole,
   reason: string,
@@ -924,13 +942,27 @@ function buildSubtask(
   sessionID: string,
   messages: MessageV2.WithParts[],
 ): MessageV2.SubtaskPart {
-  const modelMap: Record<ReviewerRole, { providerID: ProviderID; modelID: ModelID }> = {
-    "requirements-inspector": { providerID: ProviderID.make("zai"), modelID: ModelID.make("glm-5.1") },
-    "long-context-archivist": { providerID: ProviderID.make("kimi"), modelID: ModelID.make("kimi-k2.6") },
-    "task-completion-archivist": { providerID: ProviderID.make("kimi"), modelID: ModelID.make("kimi-k2.6") },
-    "chief-engineer": { providerID: ProviderID.make("deepseek"), modelID: ModelID.make("deepseek-v4-pro") },
-    "final-auditor": { providerID: ProviderID.make("openai"), modelID: ModelID.make("gpt-5.5-pro") },
-    "role-cross": { providerID: ProviderID.make("zai"), modelID: ModelID.make("glm-5.1") },
+  // Resolve effective model from Role Model Registry
+  // Uses session overrides if this session has role_model_overrides in supervisor state
+  const dllRole = reviewerToDllRole(reviewer)
+  const effective = resolveRoleModel(dllRole, sessionID, process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR)
+  const model = {
+    providerID: ProviderID.make(effective.parsed.providerID),
+    modelID: ModelID.make(effective.parsed.modelID),
+  }
+  // If primary model provider is unavailable, try fallback chain
+  if (!effective.providerAvailable && effective.fallback.length > 0) {
+    const resolved = resolveAvailableModel(dllRole, sessionID, process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR)
+    if (resolved.usedFallback) {
+      const fbParsed = resolved.model.indexOf("/") === -1
+        ? { providerID: resolved.model, modelID: "" }
+        : {
+            providerID: resolved.model.slice(0, resolved.model.indexOf("/")),
+            modelID: resolved.model.slice(resolved.model.indexOf("/") + 1),
+          }
+      model.providerID = ProviderID.make(fbParsed.providerID)
+      model.modelID = ModelID.make(fbParsed.modelID)
+    }
   }
   const compactContext = buildReviewerContext(reviewer, reason, metrics, messages, sessionID)
 
@@ -941,7 +973,7 @@ function buildSubtask(
       compactContext,
       `</compact-review-context>`,
       ``,
-      `Act as the requirements inspector (GLM 5.1). Check:`,
+      `Act as the requirements inspector (${effective.primary}). Check:`,
       `1. Is the current work still aligned with the user's original Chinese intent?`,
       `2. Are there any contradictions, phase drift, or rule violations?`,
       `3. Are all important claims backed by evidence?`,
@@ -963,7 +995,7 @@ function buildSubtask(
       compactContext,
       `</compact-review-context>`,
       ``,
-      `Act as the long-context archivist (Kimi K2.6). Check:`,
+      `Act as the long-context archivist (${effective.primary}). Check:`,
       `1. Are there logs, documents, baselines, or phase history that have been lost or misread?`,
       `2. Is the conversation context coherent across the full session?`,
       `3. Are there missing pieces of evidence from earlier phases?`,
@@ -983,7 +1015,7 @@ function buildSubtask(
       compactContext,
       `</compact-review-context>`,
       ``,
-      `Act as the chief engineer (DeepSeek V4 Pro). Diagnose the tool failures:`,
+      `Act as the chief engineer (${effective.primary}). Diagnose the tool failures:`,
       `1. What is the root cause of the failures?`,
       `2. Can the failures be fixed with a different approach, tool, or permission?`,
       `3. Is the current task approach fundamentally broken?`,
@@ -997,7 +1029,7 @@ function buildSubtask(
       compactContext,
       `</compact-review-context>`,
       ``,
-      `Act as the on-demand strategic/final auditor (GPT-5.5 Pro). Check:`,
+      `Act as the on-demand strategic/final auditor (${effective.primary}). Check:`,
       `1. Is the user goal truly complete?`,
       `2. Is there sufficient evidence for the completion claim?`,
       `3. Are there outstanding engineering risks or unverified claims?`,
@@ -1017,7 +1049,7 @@ function buildSubtask(
       compactContext,
       `</compact-review-context>`,
       ``,
-      `Run a temporary role-crossing review. Inspect the problem from a different role's perspective:`,
+      `Run a temporary role-crossing review (${effective.primary}). Inspect the problem from a different role's perspective:`,
       `1. Find blind spots that the current role may have missed.`,
       `2. Identify missing evidence.`,
       `3. Propose actionable recovery steps.`,
@@ -1033,7 +1065,7 @@ function buildSubtask(
       compactContext,
       `</compact-review-context>`,
       ``,
-      `Act as the task-completion-archivist (Kimi K2.6). Check whether the task is truly complete:`,
+      `Act as the task-completion-archivist (${effective.primary}). Check whether the task is truly complete:`,
       `1. Is the user goal fully achieved?`,
       `2. Are there blocking unfinished items in the completion report?`,
       `3. Classify ALL unfinished items as: blocking_unfinished | non_blocking_followup | requires_user_input`,
@@ -1075,7 +1107,7 @@ function buildSubtask(
     agent: reviewer,
     description: `Auto reviewer: ${reviewer} triggered by ${reason}`,
     command: "dll-agent-supervisor",
-    model: modelMap[reviewer],
+    model: model,
     prompt: promptTemplates[reviewer],
   }
 }
@@ -1155,6 +1187,8 @@ export function buildTaskCompletionSubtask(
     userGoal: userGoal.slice(0, 100),
   }, sessionID)
 
+  const effective = resolveRoleModel("task-completion-archivist", sessionID, process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR)
+
   return {
     type: "subtask" as const,
     id: PartID.ascending(),
@@ -1163,7 +1197,7 @@ export function buildTaskCompletionSubtask(
     agent: "task-completion-archivist",
     description: "Kimi task-completion-archivist: check unfinished items",
     command: "dll-agent-supervisor",
-    model: { providerID: ProviderID.make("kimi"), modelID: ModelID.make("kimi-k2.6") },
+    model: { providerID: ProviderID.make(effective.parsed.providerID), modelID: ModelID.make(effective.parsed.modelID) },
     prompt,
   }
 }

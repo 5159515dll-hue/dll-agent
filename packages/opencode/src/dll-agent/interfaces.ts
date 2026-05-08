@@ -127,6 +127,8 @@ export interface SupervisorState {
   continuation_count?: number
   repair_counts?: Record<string, number>
   last_continuation_packet_id?: string
+  /** Session-level role model overrides: role name → { primary, fallback, enabled } */
+  role_model_overrides?: Record<string, { primary: string; fallback?: string[]; enabled?: boolean }>
   /** 最后更新时间 */
   updated_at: string
 }
@@ -408,3 +410,8 @@ export type EvidenceRecordType =
   | "result.dedup_blocked"
   | "result.dedup_allowed"
   | "result.stale_detected"
+  // Role Model Registry evidence types
+  | "role-model.set"
+  | "role-model.reset"
+  | "role-model.fallback_used"
+  | "role-model.fallback_exhausted"
