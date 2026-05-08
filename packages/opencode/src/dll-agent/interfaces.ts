@@ -23,6 +23,7 @@ export type ReviewerRole =
   | "chief-engineer"
   | "final-auditor"
   | "role-cross"
+  | "multimodal-context-interpreter"
 
 // ─── Reviewer 输出（机器可读）────────────────────────────────────────────────
 
@@ -154,6 +155,8 @@ export interface SupervisorMetricsSnapshot {
   scope_expanded_signal?: boolean
   /** Phase 6: Phase switch signal */
   phase_switch_signal?: boolean
+  /** Phase 8: Multimodal input signal */
+  multimodal_signal?: boolean
 }
 
 // ─── Trigger 决策 ───────────────────────────────────────────────────────────
@@ -415,3 +418,8 @@ export type EvidenceRecordType =
   | "role-model.reset"
   | "role-model.fallback_used"
   | "role-model.fallback_exhausted"
+  // Multimodal Context evidence types
+  | "multimodal.context.produced"
+  | "multimodal.context.reused"
+  | "multimodal.context.invalidated"
+  | "multimodal.context.low_confidence"

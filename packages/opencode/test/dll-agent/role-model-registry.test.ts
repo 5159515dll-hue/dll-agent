@@ -557,8 +557,8 @@ describe("JSONC config support", () => {
 // Test 15: ALL_ROLES and ACTIVE_ROLES
 // =============================================================================
 describe("role lists", () => {
-  test("ALL_ROLES includes all 11 roles", () => {
-    expect(registry.ALL_ROLES.length).toBe(11)
+  test("ALL_ROLES includes all 12 roles", () => {
+    expect(registry.ALL_ROLES.length).toBe(12)
     expect(registry.ALL_ROLES).toContain("commander")
     expect(registry.ALL_ROLES).toContain("agentic-solver")
   })

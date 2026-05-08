@@ -448,7 +448,7 @@ export function reviewerRuntimeMs(reviewer: string) {
 }
 
 export function isReadOnlyReviewer(reviewer: string) {
-  return reviewer === "requirements-inspector" || reviewer === "long-context-archivist" || reviewer === "task-completion-archivist" || reviewer === "final-auditor"
+  return reviewer === "requirements-inspector" || reviewer === "long-context-archivist" || reviewer === "task-completion-archivist" || reviewer === "final-auditor" || reviewer === "multimodal-context-interpreter"
 }
 
 // ─── 风险判定 ─────────────────────────────────────────────────────────────
@@ -649,6 +649,14 @@ export function decide(
     }, sessionID)
   }
 
+  // 规则 12 (Phase 8): Multimodal input signal → multimodal-context-interpreter
+  // Trigger the multimodal role when non-text inputs (images, video, audio, etc.)
+  // are detected but only on-demand — not for every task.
+  if (metrics.multimodalSignal) {
+    const reason = "multimodal input detected (screenshot, image, video, audio, PPT figure, chart, etc.)"
+    addReviewer("multimodal-context-interpreter" as ReviewerRole, reason)
+  }
+
   // 规则 7（auto-verifier）：completion blocked + 缺真实 tool evidence → 自动注入 verifier subtask
   // 这使得模型不需要"记得"运行验证 — supervisor 在代码层强制注入验证任务。
   const needsVerifier =
@@ -708,6 +716,7 @@ export function decide(
       kimi_pre_report_signal: metrics.kimiPreReportSignal,
       scope_expanded_signal: metrics.scopeExpandedSignal,
       phase_switch_signal: metrics.phaseSwitchSignal,
+      multimodal_signal: metrics.multimodalSignal,
     },
   }
 }
@@ -738,6 +747,7 @@ export function updateState(
     kimiPreReportSignal: decision.metrics.kimi_pre_report_signal ?? false,
     scopeExpandedSignal: decision.metrics.scope_expanded_signal ?? false,
     phaseSwitchSignal: decision.metrics.phase_switch_signal ?? false,
+    multimodalSignal: decision.metrics.multimodal_signal ?? false,
   }
   const risk = assessRisk(riskMetrics)
 
@@ -932,6 +942,7 @@ function reviewerToDllRole(reviewer: ReviewerRole): DllRole {
   if (reviewer === "chief-engineer") return "chief-engineer"
   if (reviewer === "final-auditor") return "final-auditor"
   if (reviewer === "role-cross") return "role-cross"
+  if (reviewer === "multimodal-context-interpreter") return "multimodal-context-interpreter"
   return "chief-engineer" // fallback
 }
 
@@ -1094,6 +1105,50 @@ function buildSubtask(
         next_actions: [],
         evidence_confidence: 100,
         ts: new Date().toISOString(),
+      }, null, 2),
+      `\`\`\``,
+    ].join("\n"),
+    "multimodal-context-interpreter": [
+      `[dll-agent supervisor auto-trigger]`,
+      `<compact-review-context>`,
+      compactContext,
+      `</compact-review-context>`,
+      ``,
+      `Act as the multimodal context interpreter (${effective.primary}). Your role is to analyze non-text inputs:`,
+      `1. Identify all non-text inputs (screenshots, images, webpage visuals, PPT figures, flowcharts, charts, video, audio)`,
+      `2. Extract observations: text content, visual layout, structure, errors, warnings, important details`,
+      `3. Assign confidence (low/medium/high) to each observation`,
+      `4. Set context_sufficient=false if the input is too ambiguous`,
+      `5. NEVER claim high confidence if uncertainties remain`,
+      ``,
+      `ROLE BOUNDARY: read-only analysis. Do not modify files, run code, or make engineering decisions.`,
+      `The runtime enforces this reviewer as read-only; bash/edit/task tools are denied.`,
+      `Output a structured multimodal_context_packet using the schema from multimodal-context.ts.`,
+      ``,
+      `IMPORTANT: Output in this JSON format:`,
+      `\`\`\`json`,
+      JSON.stringify({
+        packet_type: "multimodal_context_packet",
+        packet_id: "mmctx_placeholder",
+        source_hash: "auto-generated",
+        role: "multimodal-context-interpreter",
+        model: effective.primary,
+        input_type: "screenshot",
+        user_goal: reason,
+        source_ref: "",
+        task_relevance: "",
+        observations: [],
+        detected_text: null,
+        visual_structure: null,
+        errors_or_warnings: [],
+        important_details: [],
+        uncertainties: [],
+        overall_confidence: "medium",
+        context_sufficient: true,
+        recommended_next_role: null,
+        evidence_refs: [],
+        redaction_status: "none",
+        created_at: new Date().toISOString(),
       }, null, 2),
       `\`\`\``,
     ].join("\n"),

@@ -24,6 +24,8 @@ export type Metrics = {
   scopeExpandedSignal: boolean
   /** Phase 6: Phase switch signal — detected when user changes task direction */
   phaseSwitchSignal: boolean
+  /** Phase 8: Multimodal signal — detected when non-text input (images, video, audio, etc.) is present */
+  multimodalSignal: boolean
 }
 
 function textOf(parts: MessageV2.Part[]) {
@@ -114,6 +116,10 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
   const phaseSwitchPattern =
     /(先.*不要|先.*别|暂停|换个.*方向|先做|先修|先处理|改做|改为|转而|切换.*任务|switch.*task|change.*direction|scrap.*that|new.*plan|重新.*计划)/i
 
+  // Phase 8: Multimodal input patterns
+  const multimodalPattern =
+    /(截图|screenshot|图片|image|photo|网页.*(?:视觉|截图|布局)|webpage.*visual|PPT.*(?:图示|figure|截图)|slides?.*figure|流程图|flowchart|图表|chart|graph|视频|video|音频|audio|录音|UI.*(?:截图|视觉|screenshot)|界面.*(?:截图|视觉)|\.(?:png|jpg|jpeg|gif|webp|bmp|mp4|mov|avi|webm|mp3|wav|ogg)\b)/i
+
   const SCANNABLE_TOOLS = new Set(["bash", "edit", "write", "task"])
   const toolErrors: string[] = []
   let permissionDenied = 0
@@ -183,6 +189,8 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     scopeExpandedSignal: scopeExpansionPattern.test(allText),
     // Phase switch: user changes direction explicitly
     phaseSwitchSignal: phaseSwitchPattern.test(messageText(lastUser)),
+    // Phase 8: Multimodal input signal
+    multimodalSignal: multimodalPattern.test(allText),
   }
 }
 

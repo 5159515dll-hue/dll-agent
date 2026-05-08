@@ -26,6 +26,7 @@ export type DllRole =
   | "role-cross"
   | "agentic-solver"
   | "multimodal-reader"
+  | "multimodal-context-interpreter"
   | "voice-output"
   | "executor"
 
@@ -122,6 +123,16 @@ const BUILT_IN_DEFAULTS: Record<DllRole, Omit<RoleModelConfig, "scope">> = {
     primary: "openai/gpt-5.5-pro",
     fallback: [],
     enabled: false, // Future role
+  },
+  "multimodal-context-interpreter": {
+    // Dedicated multimodal role for screenshots, images, webpage visuals,
+    // PPT figures, flowcharts, charts, video, audio — non-text inputs only.
+    // Uses MiMo Token Plan (mimo-v2.5-pro) via OpenAI-compatible API.
+    // MiMo is a temporary entitlement; replace via /role-model-set when needed.
+    primary: "mimo/mimo-v2.5-pro",
+    fallback: [],
+    enabled: true,
+    onDemandOnly: true,
   },
   "voice-output": {
     primary: "openai/gpt-5.5-pro",

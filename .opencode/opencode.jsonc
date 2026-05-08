@@ -1,6 +1,63 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "provider": {},
+  "provider": {
+    "mimo": {
+      "name": "MiMo Token Plan",
+      "npm": "@ai-sdk/openai-compatible",
+      "api": "https://token-plan-cn.xiaomimimo.com/v1",
+      "env": ["MIMO_API_KEY"],
+      "models": {
+        "mimo-v2.5-pro": {
+          "name": "MiMo v2.5 Pro",
+          "family": "mimo",
+          "attachment": true,
+          "reasoning": true,
+          "temperature": true,
+          "tool_call": true,
+          "limit": {
+            "context": 262144,
+            "output": 65536,
+          },
+        },
+        "mimo-v2.5": {
+          "name": "MiMo v2.5",
+          "family": "mimo",
+          "attachment": true,
+          "reasoning": true,
+          "temperature": true,
+          "tool_call": true,
+          "limit": {
+            "context": 262144,
+            "output": 65536,
+          },
+        },
+        "mimo-v2-pro": {
+          "name": "MiMo v2 Pro",
+          "family": "mimo",
+          "attachment": true,
+          "reasoning": true,
+          "temperature": true,
+          "tool_call": true,
+          "limit": {
+            "context": 262144,
+            "output": 65536,
+          },
+        },
+        "mimo-v2-omni": {
+          "name": "MiMo v2 Omni",
+          "family": "mimo",
+          "attachment": true,
+          "reasoning": true,
+          "temperature": true,
+          "tool_call": true,
+          "limit": {
+            "context": 262144,
+            "output": 65536,
+          },
+        },
+      },
+    },
+  },
   "permission": {
     "edit": {
       "packages/opencode/migration/*": "deny",

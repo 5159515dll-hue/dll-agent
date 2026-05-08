@@ -392,6 +392,32 @@ export const layer = Layer.effect(
             ),
             options: {},
           }
+          // dll-agent multimodal context interpreter: converts non-text inputs
+          // (screenshots, images, webpage visuals, PPT figures, flowcharts, charts,
+          // video, audio, UI, document visuals) into structured multimodal_context_packet.
+          // Read-only: cannot modify files or run commands. On-demand only.
+          agents["multimodal-context-interpreter"] = {
+            name: "multimodal-context-interpreter",
+            description: "dll-agent multimodal context interpreter. Converts non-text inputs into structured context packets.",
+            mode: "subagent",
+            native: true,
+            model: roleModel("multimodal-context-interpreter"),
+            steps: 4,
+            prompt:
+              "You are the dll-agent multimodal context interpreter. Your role is to analyze non-text inputs (screenshots, images, webpage visuals, PPT figures, flowcharts, charts, video, audio) and produce structured multimodal_context_packet outputs. You are read-only: do not modify files, run bash commands, or edit code. Your output feeds into the commander and reviewers for downstream decisions. Always include confidence levels and uncertainties — never claim absolute certainty from visual analysis.",
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                read: "allow",
+                webfetch: "allow",
+                websearch: "allow",
+              }),
+              user,
+              dllAllowAll,
+              inspectorLockdown, // read-only: denies bash/edit/write/patch/task
+            ),
+            options: {},
+          }
           // dll-agent verifier/executor subagent: runs typecheck/test/doctor and pastes raw stdout.
           agents.executor = {
             name: "executor",
