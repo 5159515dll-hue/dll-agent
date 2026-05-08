@@ -38,6 +38,7 @@ import { DialogThemeList } from "@tui/component/dialog-theme-list"
 import { DialogHelp } from "./ui/dialog-help"
 import { CommandProvider, useCommandDialog } from "@tui/component/dialog-command"
 import { DialogAgent } from "@tui/component/dialog-agent"
+import { DialogRoleModelSet } from "@tui/component/dialog-role-model-set"
 import { DialogSessionList } from "@tui/component/dialog-session-list"
 import { DialogConsoleOrg } from "@tui/component/dialog-console-org"
 import { KeybindProvider, useKeybind } from "@tui/context/keybind"
@@ -516,6 +517,17 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
       },
       onSelect: () => {
         dialog.replace(() => <DialogMcp />)
+      },
+    },
+    {
+      title: "Set role model",
+      value: "role-model.set",
+      category: "dll-agent",
+      slash: {
+        name: "role-model-set",
+      },
+      onSelect: () => {
+        dialog.replace(() => <DialogRoleModelSet />)
       },
     },
     {

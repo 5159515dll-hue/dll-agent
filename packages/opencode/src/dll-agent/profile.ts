@@ -213,28 +213,8 @@ export function roleCommands() {
         "This is a read-only status command.",
       ].join("\n"),
     },
-    "role-model-set": {
-      description: "为指定角色设置当前使用模型。用法：/role-model-set <role> <provider/model> [--scope session|project|global]。默认 scope 为 session。",
-      agent: "commander",
-      template: [
-        "Set the model for a specific dll-agent role.",
-        "Parameters: $ARGUMENTS",
-        "Format: /role-model-set <role> <provider/model> [--scope session|project|global]",
-        "",
-        "Instructions:",
-        "1. Parse arguments: first arg is role name, second is provider/model, optional --scope flag",
-        "2. Default scope if not specified: session",
-        "3. Validate the role name exists (use role-model-registry.ts isDllRole)",
-        "4. Validate model format (use role-model-registry.ts validateRoleModel)",
-        "5. If setting voice/TTS model to a coding role (commander/chief-engineer/agentic-solver), warn but allow",
-        "6. If setting final-auditor, warn that it remains on-demand only regardless of model",
-        "7. Check provider availability (API key in env)",
-        "8. Call setRoleModelOverride() from role-model-registry.ts",
-        "9. Report: previous model → new model, scope, and provider availability",
-        "10. If provider key is missing, note: 'saved but provider unavailable; will fallback at runtime'",
-        "Do NOT make the change unless the role and model format are valid.",
-      ].join("\n"),
-    },
+    // role-model-set 已升级为 TUI 交互式对话框（见 dialog-role-model-set.tsx），
+    // 不再注册为模板命令，避免自动补全中出现重复条目。
     "role-model-reset": {
       description: "重置角色模型覆盖，回退到下一层默认配置。用法：/role-model-reset <role> [--scope session|project|global|all]",
       agent: "commander",
