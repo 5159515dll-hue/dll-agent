@@ -113,13 +113,13 @@ export function roleCommands() {
 
   return {
     "roles": {
-      description: "Show the dll-agent role team and when each role must be used.",
+      description: "显示 dll-agent 角色队伍及各角色的使用场景与时机。",
       agent: "commander",
       template:
         "Show the current dll-agent role team. Explain that the visible active agent is only the coordinator, and real role work is done through the task tool and slash commands. List exact subagent names: chief-engineer, requirements-inspector, long-context-archivist, final-auditor, role-cross. Do not call this complete work; this is only a status/explanation command.",
     },
     "dll-status": {
-      description: "Show dll-agent mode, model capabilities, and role dispatch state.",
+      description: "显示 dll-agent 当前运行模式、模型能力与角色调度状态。",
       agent: "commander",
       template: [
         `Quality mode: ${q}.`,
@@ -131,19 +131,19 @@ export function roleCommands() {
       ].join("\n"),
     },
     "quality": {
-      description: "Show or request quality mode: max, auto, balanced, economy.",
+      description: "查看或设置质量模式：max / auto / balanced / economy。默认推荐 max。",
       agent: "commander",
       template:
         `Current quality mode is ${q}. User requested quality mode: $ARGUMENTS\nSupported modes: max, auto, balanced, economy. Default/recommended is max: strongest, most expensive, no silent downgrade. For enforced relaunch, use: dll-agent --quality <mode>.`,
     },
     "verify": {
-      description: "Show or request verification mode: strict, normal, light.",
+      description: "查看或设置验证模式：strict / normal / light。默认推荐 strict。",
       agent: "commander",
       template:
         `Current verification mode is ${v}. User requested verification mode: $ARGUMENTS\nSupported modes: strict, normal, light. Default/recommended is strict: every important claim needs evidence. For enforced relaunch, use: dll-agent --verify <mode>.`,
     },
     "model-capability": {
-      description: "Show pinned strongest model capabilities and role mapping.",
+      description: "显示各角色当前配置的模型、来源与可用性状态。",
       agent: "commander",
       template: [
         "Show pinned dll-agent model capabilities:",
@@ -155,49 +155,49 @@ export function roleCommands() {
       ].join("\n"),
     },
     "chief-engineer": {
-      description: "Delegate execution/debugging to DeepSeek chief engineer.",
+      description: "委托工程审查模型进行深度推理、代码诊断、修复与验证。",
       agent: "chief-engineer",
       subtask: true,
       template:
         "Act as the chief engineer. Use deep reasoning, code inspection, tools, and verification to move the user goal forward. If a fix is made, provide exact files, commands, observed outputs, and remaining risk.\n\n$ARGUMENTS",
     },
     "requirements-check": {
-      description: "Run GLM Chinese requirement and logic inspection.",
+      description: "由需求一致性审查模型检查中文需求意图、逻辑矛盾与阶段偏离。",
       agent: "requirements-inspector",
       subtask: true,
       template:
         "Act as the requirements inspector. Check the user's Chinese intent, constraints, contradictions, phase drift, and whether the current work is still aligned with the real goal. Cite evidence.\n\n$ARGUMENTS",
     },
     "context-check": {
-      description: "Run Kimi long-context, document, log, and baseline inspection.",
+      description: "由长上下文归档模型整理长日志、文档、基线、历史阶段与证据一致性。",
       agent: "long-context-archivist",
       subtask: true,
       template:
         "Act as the long-context archivist. Check logs, documents, baselines, phase history, evidence, and memory drift. Only use evidence-backed conclusions.\n\n$ARGUMENTS",
     },
     "final-audit": {
-      description: "Run on-demand GPT-5.5 Pro strategic/final evidence audit.",
+      description: "触发最终审计模型对完成声明、验证证据与剩余风险进行审查。默认按需调用。",
       agent: "final-auditor",
       subtask: true,
       template:
         "Act as the on-demand strategic/final auditor. Check whether the user goal is complete, whether evidence is sufficient, whether tests/doctor/smoke checks really ran, whether strategic direction is still sound, and whether any claim is overconfident.\n\n$ARGUMENTS",
     },
     "cross-review": {
-      description: "Temporary role crossing for stuck tasks or reviewer conflict.",
+      description: "临时角色交叉审查，用于卡点恢复或审查冲突时切换视角。",
       agent: "role-cross",
       subtask: true,
       template:
         "Run a temporary role-crossing review. Inspect the problem from a different role's perspective, find blind spots, identify missing evidence, and propose actionable recovery steps. This role crossing ends after this review round.\n\n$ARGUMENTS",
     },
     "team-review": {
-      description: "Commander-driven multi-role review plan.",
+      description: "主执行模型驱动的多角色协同审查，根据任务需要自动调度审查角色。",
       agent: "commander",
       template:
         "Run a dll-agent team review for the current objective. Use the task tool only for roles that are actually needed; do not call OpenAI by default. Call these subagents as needed: requirements-inspector for intent/rules, long-context-archivist for logs/baseline/context, chief-engineer for executable recovery, final-auditor only for stuck/off-track/conflict/high-risk completion claims. Reconcile conflicts and continue toward the user goal.\n\n$ARGUMENTS",
     },
     // ─── Role Model Management Commands ────────────────────────────────────
     "role-models": {
-      description: "Show all role model assignments, sources, and provider availability.",
+      description: "显示所有角色当前配置的模型、来源（内置/全局/项目/会话）及 provider 可用性。",
       agent: "commander",
       template: [
         "Show the current role model assignments for all dll-agent roles.",
@@ -214,7 +214,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "role-model-set": {
-      description: "Set a role's model. Usage: /role-model-set <role> <provider/model> [--scope session|project|global]",
+      description: "为指定角色设置当前使用模型。用法：/role-model-set <role> <provider/model> [--scope session|project|global]。默认 scope 为 session。",
       agent: "commander",
       template: [
         "Set the model for a specific dll-agent role.",
@@ -236,7 +236,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "role-model-reset": {
-      description: "Reset a role's model to the next-tier default. Usage: /role-model-reset <role> [--scope session|project|global|all]",
+      description: "重置角色模型覆盖，回退到下一层默认配置。用法：/role-model-reset <role> [--scope session|project|global|all]",
       agent: "commander",
       template: [
         "Reset a role's model override.",
@@ -253,7 +253,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "role-model-test": {
-      description: "Lightweight smoke test for a role's current model. Usage: /role-model-test <role>",
+      description: "对指定角色的当前模型进行轻量冒烟测试，不消耗大量 token。用法：/role-model-test <role>",
       agent: "commander",
       template: [
         "Run a lightweight smoke test for a role's current model.",
@@ -272,7 +272,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "role-model-fallback-add": {
-      description: "Add a fallback model for a role. Usage: /role-model-fallback-add <role> <provider/model> [--scope session|project|global]",
+      description: "为指定角色添加备选模型。用法：/role-model-fallback-add <role> <provider/model> [--scope session|project|global]",
       agent: "commander",
       template: [
         "Add a fallback model to a role's fallback chain.",
@@ -289,7 +289,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "role-model-fallback-remove": {
-      description: "Remove a fallback model from a role. Usage: /role-model-fallback-remove <role> <provider/model> [--scope session|project|global]",
+      description: "移除指定角色的备选模型。用法：/role-model-fallback-remove <role> <provider/model> [--scope session|project|global]",
       agent: "commander",
       template: [
         "Remove a fallback model from a role's fallback chain.",
@@ -305,7 +305,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "tools": {
-      description: "Show current effective tools manifest: global + project merge, status per tool.",
+      description: "显示当前生效的工具清单：全局默认 + 项目覆盖合并结果，以及每个工具的状态。",
       agent: "commander",
       template: [
         "Show the current dll-agent effective tools manifest.",
@@ -320,7 +320,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "tools-reload": {
-      description: "Reload global + project tools manifests and update session effective manifest.",
+      description: "重新读取全局和项目工具清单并更新会话生效清单，不启动重型 MCP。",
       agent: "commander",
       template: [
         "Reload the dll-agent tool manifests.",
@@ -334,7 +334,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "tools-status": {
-      description: "Show detailed status of all tools: registered, available, running, failed, blocked.",
+      description: "显示所有工具的详细状态：已注册、可用、运行中、失败、被阻止等。",
       agent: "commander",
       template: [
         "Show detailed tool status for all registered tools.",
@@ -344,7 +344,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "mcp-status": {
-      description: "Show MCP server status: name, status, pid, port, health, last check.",
+      description: "显示所有 MCP 服务状态：名称、运行状态、进程 ID、端口、健康状态、最近检查时间。",
       agent: "commander",
       template: [
         "Show detailed MCP server status for all MCP entries in the effective manifest.",
@@ -362,7 +362,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "mcp-start": {
-      description: "Start a specific MCP server by name (on-demand).",
+      description: "按需启动指定 MCP 服务，启动前检查端口、互斥锁和健康状态。",
       agent: "commander",
       template: [
         "Start the specified MCP server by name.",
@@ -382,7 +382,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "mcp-stop": {
-      description: "Stop a specific MCP server by name.",
+      description: "停止指定 MCP 服务并释放互斥锁。",
       agent: "commander",
       template: [
         "Stop the specified MCP server.",
@@ -396,7 +396,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "mcp-health": {
-      description: "Run healthcheck on a specific MCP server.",
+      description: "对指定 MCP 服务运行健康检查。",
       agent: "commander",
       template: [
         "Check health of the specified MCP server.",
@@ -410,7 +410,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "capabilities": {
-      description: "Show full capability registry: builtin + global + discovered + project merge.",
+      description: "显示完整能力注册表：内置 + 全局 + 发现 + 项目多层合并结果。",
       agent: "commander",
       template: [
         "Show the current dll-agent capability registry (capability-driven system).",
@@ -428,7 +428,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "capability-status": {
-      description: "Show per-capability status: available, running, missing_dependency, degraded, blocked.",
+      description: "显示每个能力的详细状态：可用、运行中、缺少依赖、降级、被阻止等。",
       agent: "commander",
       template: [
         "Show detailed capability status for all registered capabilities.",
@@ -443,7 +443,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "capability-discover": {
-      description: "Run automatic capability discovery and update the discovered registry.",
+      description: "运行自动能力发现，扫描本地环境中的新能力并更新发现注册表。",
       agent: "commander",
       template: [
         "Run capability discovery to find new capabilities in the local environment.",
@@ -462,7 +462,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "capability-plan": {
-      description: "Plan capabilities needed for a given task goal.",
+      description: "根据任务目标规划所需能力，显示匹配方案、替代选项与能力缺口。用法：/capability-plan <任务描述>",
       agent: "commander",
       template: [
         "Use the capability planner to determine what capabilities are needed for the task.",
@@ -478,7 +478,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "capability-refresh": {
-      description: "Refresh capability statuses: re-check availability, re-verify, promote from discovered.",
+      description: "刷新能力状态：重新检查可用性、验证安装，并将高可信发现能力提升到全局注册表。",
       agent: "commander",
       template: [
         "Refresh capability statuses in the registry.",
@@ -496,7 +496,7 @@ export function roleCommands() {
       ].join("\n"),
     },
     "capability-doctor": {
-      description: "Run capability-specific health checks on the registry and runtime.",
+      description: "对能力注册表与运行时进行专项健康检查：文件完整性、缓存时效、状态异常与残留。",
       agent: "commander",
       template: [
         "Run capability-specific health checks.",
@@ -537,7 +537,7 @@ export function systemPrompt() {
     "Prompting is layered: source-level invariants are short and global; role prompts are role-specific; task packets are phase-specific; evidence packets are retrieved precisely; cross-role packets are temporary and removed after recovery.",
     "Do not feed every instruction to every model. Keep each model focused on its role unless role crossing is explicitly needed for recovery.",
     "",
-    "Role models can be changed at runtime via /role-model-set and /role-model-reset commands. Use /role-models to view current assignments.",
+    "可通过 /role-model-set 和 /role-model-reset 命令在运行时切换角色模型。使用 /role-models 查看当前配置。",
   ].join("\n")
 }
 

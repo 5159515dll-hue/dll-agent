@@ -38,12 +38,12 @@ session override > project override > global override > built-in default
 ## Slash Commands
 
 ### `/role-models`
-Show all roles with their current effective models, source, provider availability, and on-demand status.
+显示所有角色当前配置的模型、来源（内置/全局/项目/会话）、provider 可用性及按需调用状态。
 
 ### `/role-model-set <role> <provider/model> [--scope session|project|global]`
-Set a role's model. Default scope is `session`.
+为指定角色设置当前使用模型。默认 scope 为 `session`。
 
-Examples:
+示例：
 ```
 /role-model-set requirements-inspector mimo/mimo-v2.5-pro
 /role-model-set long-context-archivist kimi/kimi-k2.6 --scope global
@@ -51,16 +51,16 @@ Examples:
 ```
 
 ### `/role-model-reset <role> [--scope session|project|global|all]`
-Reset a role's model override. Default scope is `session`.
+重置角色模型覆盖，回退到下一层默认配置。默认 scope 为 `session`。
 
 ### `/role-model-test <role>`
-Run a lightweight smoke test for a role's current model.
+对指定角色的当前模型进行轻量冒烟测试。
 
 ### `/role-model-fallback-add <role> <provider/model> [--scope session|project|global]`
-Add a fallback model to a role's fallback chain.
+为指定角色添加备选模型。
 
 ### `/role-model-fallback-remove <role> <provider/model> [--scope session|project|global]`
-Remove a fallback model from a role.
+移除指定角色的备选模型。
 
 ## Configuration Files
 

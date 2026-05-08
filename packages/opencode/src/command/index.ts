@@ -160,7 +160,7 @@ export const layer = Layer.effect(
 
       commands["capability-status"] = {
         name: "capability-status",
-        description: "show live dll-agent capability registry, resolver, and runtime status",
+        description: "显示当前 dll-agent 能力注册表、解析器与运行时状态（直接渲染，非提示词模板）",
         source: "command",
         get template() {
           return renderCapabilityStatus(ctx.worktree)
