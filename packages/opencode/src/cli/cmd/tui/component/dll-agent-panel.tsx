@@ -19,8 +19,8 @@ function commandLine(compact: boolean) {
 }
 
 function teamLine(compact: boolean) {
-  if (compact) return "team: deepseek | inspect | openai audit"
-  return "team: commander=deepseek-v4-pro | inspect=glm/kimi | openai=on-demand audit"
+  if (compact) return "team: deepseek | inspect | openai audit | mimo multimodal"
+  return "team: commander=deepseek-v4-pro | inspect=glm/kimi | audit=openai | multimodal=mimo"
 }
 
 function modeLine() {
@@ -37,7 +37,7 @@ const cny = new Intl.NumberFormat("zh-CN", {
   currency: "CNY",
 })
 
-const CNY_PROVIDERS = new Set(["deepseek", "kimi", "zai"])
+const CNY_PROVIDERS = new Set(["deepseek", "kimi", "zai", "mimo"])
 
 function formatProviderCost(cost: number, providerID: string): string {
   if (CNY_PROVIDERS.has(providerID)) {
@@ -221,13 +221,16 @@ export function DllAgentHomeStatus() {
           OpenAI strategic/final auditor: openai/gpt-5.5-pro, on-demand only for stuck/off-track/conflict/high-risk finalization.
         </text>
         <text fg={theme.textMuted}>
+          Multimodal context interpreter: mimo/mimo-v2.5-pro, on-demand only for non-text inputs (screenshots, images, video, audio).
+        </text>
+        <text fg={theme.textMuted}>
           Mention commands: /quality, /verify, /model-capability, /roles, /team-review, /chief-engineer, /cross-review.
         </text>
         <box height={1} />
         <text fg={theme.text}>
           <b>Quota</b>
         </text>
-        <For each={["deepseek", "kimi", "openai", "zai"]}>
+        <For each={["deepseek", "kimi", "openai", "zai", "mimo"]}>
           {(name) => <text fg={theme.textMuted}>{name}: {quotaLine(quota()?.providers?.[name])}</text>}
         </For>
         <text fg={theme.textMuted}>updated: {quotaAgeLine(quota())}</text>

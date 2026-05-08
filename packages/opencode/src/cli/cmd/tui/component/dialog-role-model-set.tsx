@@ -19,6 +19,7 @@ function roleLabel(role: DllRole): string {
     "task-completion-archivist": "任务收尾检查模型",
     "final-auditor": "最终审计模型",
     "role-cross": "角色冲突仲裁模型",
+    "multimodal-context-interpreter": "多模态上下文解释模型",
     executor: "验证执行器",
   }
   return labels[role] ?? role
@@ -34,8 +35,8 @@ function sourceLabel(source: string): string {
   return labels[source] ?? source
 }
 
-/** Step 1: Pick a role from the role list */
-function DialogRoleModelRolePicker(props: { onSelectRole: (role: DllRole) => void }) {
+/** Step 1: Pick a role */
+function RolePicker() {
   const dialog = useDialog()
 
   const options = createMemo(() =>
@@ -45,10 +46,7 @@ function DialogRoleModelRolePicker(props: { onSelectRole: (role: DllRole) => voi
         value: role,
         title: roleLabel(role),
         description: `${effective.primary}${effective.providerAvailable ? "" : " (provider 不可用)"}`,
-        footer:
-          effective.source !== "built-in"
-            ? `${effective.primary} (${sourceLabel(effective.source)})`
-            : `${effective.primary}`,
+        footer: `${effective.primary}${effective.source !== "built-in" ? ` (${sourceLabel(effective.source)})` : ""}`,
       }
     }),
   )
@@ -59,22 +57,19 @@ function DialogRoleModelRolePicker(props: { onSelectRole: (role: DllRole) => voi
       placeholder="搜索角色..."
       options={options()}
       onSelect={(option) => {
-        dialog.clear()
-        props.onSelectRole(option.value as DllRole)
+        const role = option.value as DllRole
+        dialog.replace(() => <ModelPicker role={role} />)
       }}
     />
   )
 }
 
-/** Step 2: Pick a model for the selected role */
-function DialogRoleModelModelPicker(props: { role: DllRole }) {
+/** Step 2: Pick a model — shows ALL available models like /models */
+function ModelPicker(props: { role: DllRole }) {
   const sync = useSync()
   const dialog = useDialog()
 
-  const current = createMemo(() => {
-    const e = resolveRoleModel(props.role)
-    return e.primary
-  })
+  const current = createMemo(() => resolveRoleModel(props.role).primary)
 
   const options = createMemo(() => {
     const results: { value: string; title: string; description: string; category: string }[] = []
@@ -102,42 +97,41 @@ function DialogRoleModelModelPicker(props: { role: DllRole }) {
         const model = option.value as string
         if (!validateRoleModel(model).valid) return
         const change = setRoleModelOverride(props.role, model, "global")
-        if (change) {
-          // Show confirmation — replace with summary dialog
-          dialog.replace(() => (
-            <DialogRoleModelResult
-              role={props.role}
-              previousModel={change.previousPrimary}
-              newModel={change.newPrimary}
-              scope="global"
-            />
-          ))
-        } else {
-          dialog.clear()
-        }
+        dialog.replace(() => (
+          <Confirmation
+            role={props.role}
+            previousModel={change?.previousPrimary ?? current()}
+            newModel={model}
+            success={!!change}
+          />
+        ))
       }}
     />
   )
 }
 
-/** Step 3: Confirmation summary */
-function DialogRoleModelResult(props: {
+/** Step 3: Confirmation */
+function Confirmation(props: {
   role: DllRole
   previousModel: string
   newModel: string
-  scope: string
+  success: boolean
 }) {
   const dialog = useDialog()
 
   return (
     <DialogSelect
-      title="角色模型已切换"
+      title={props.success ? "角色模型已切换" : "切换失败"}
       options={[
         {
           value: "ok",
-          title: `✅ ${roleLabel(props.role)} 模型已更新`,
-          description: `${props.previousModel} → ${props.newModel}`,
-          footer: `作用域：${sourceLabel(props.scope)}（全局生效，所有 dll-agent 会话均使用此配置）`,
+          title: props.success
+            ? `✅ ${roleLabel(props.role)} 模型已更新`
+            : `❌ ${roleLabel(props.role)} 模型切换失败`,
+          description: props.success
+            ? `${props.previousModel} → ${props.newModel}`
+            : `未能写入配置：${props.newModel}`,
+          footer: props.success ? "作用域：全局配置（所有 dll-agent 会话均使用此配置）" : undefined,
         },
         {
           value: "done",
@@ -151,25 +145,5 @@ function DialogRoleModelResult(props: {
 }
 
 export function DialogRoleModelSet() {
-  const [step, setStep] = createSignal<"role" | "model">("role")
-  const [selectedRole, setSelectedRole] = createSignal<DllRole | null>(null)
-
-  if (step() === "role") {
-    return (
-      <DialogRoleModelRolePicker
-        onSelectRole={(role) => {
-          setSelectedRole(role)
-          setStep("model")
-        }}
-      />
-    )
-  }
-
-  const role = selectedRole()
-  if (!role) {
-    setStep("role")
-    return null
-  }
-
-  return <DialogRoleModelModelPicker role={role} />
+  return <RolePicker />
 }
