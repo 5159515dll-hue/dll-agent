@@ -13,6 +13,7 @@ import {
 } from "../../src/dll-agent/goal-contract"
 import { checkContinuationGate } from "../../src/dll-agent/continuation-gate"
 import { finalGate } from "../../src/dll-agent/gates"
+import { buildResultPacket, writeResult } from "../../src/dll-agent/result-ledger"
 import { buildTaskStateSnapshot } from "../../src/dll-agent/task-state"
 
 let root = ""
@@ -33,6 +34,10 @@ afterEach(() => {
   if (originalEvidenceFile === undefined) delete process.env.DLL_AGENT_EVIDENCE_FILE
   else process.env.DLL_AGENT_EVIDENCE_FILE = originalEvidenceFile
   fs.rmSync(root, { recursive: true, force: true })
+  fs.rmSync(path.join(os.homedir(), ".dll-agent", "sessions", "session-final-ledger-pass"), {
+    recursive: true,
+    force: true,
+  })
 })
 
 function freshState() {
@@ -263,6 +268,59 @@ describe("goal-contract", () => {
 
     expect(result.allowed).toBe(false)
     expect(result.reasons.join("\n")).toContain("goal contract CONTINUATION_REQUIRED")
+  })
+
+  test("final gate blocks PASS when Goal Contract lacks a verified result packet", () => {
+    ensureGoalContract({ sessionID: "session-final-ledger", userGoal: "Wire result ledger into final gate" })
+
+    const result = finalGate({
+      evidenceGate: {
+        passed: true,
+        needs_evidence: false,
+        needs_review: false,
+        block_reason: null,
+        synthetic_hint: null,
+      },
+      supervisorState: freshState(),
+      reconciliationConflicts: [],
+      costExceeded: false,
+      sessionID: "session-final-ledger",
+    })
+
+    expect(result.allowed).toBe(false)
+    expect(result.reasons.join("\n")).toContain("result ledger missing verified result")
+  })
+
+  test("final gate accepts Goal Contract only when matching verified result exists", () => {
+    ensureGoalContract({ sessionID: "session-final-ledger-pass", userGoal: "Wire result ledger into final gate" })
+    writeResult("session-final-ledger-pass", buildResultPacket({
+      sessionID: "session-final-ledger-pass",
+      executing_role: "commander",
+      model: "deepseek/deepseek-v4-pro",
+      user_goal: "Wire result ledger into final gate",
+      subtask_goal: "Wire result ledger into final gate",
+      claimed_result: "Result ledger final gate wiring is verified",
+      completion_status: "VERIFIED_COMPLETE",
+      commands_run: [{ command: "bun test", result: "passed", exitCode: 0, evidenceRef: "cmd:test" }],
+      verification_results: [{ name: "bun test", status: "passed", evidenceRef: "cmd:test" }],
+      evidence_refs: ["cmd:test"],
+    }))
+
+    const result = finalGate({
+      evidenceGate: {
+        passed: true,
+        needs_evidence: false,
+        needs_review: false,
+        block_reason: null,
+        synthetic_hint: null,
+      },
+      supervisorState: freshState(),
+      reconciliationConflicts: [],
+      costExceeded: false,
+      sessionID: "session-final-ledger-pass",
+    })
+
+    expect(result.allowed).toBe(true)
   })
 
   test("continuation gate reads Goal Contract even when final report text has no unfinished markers", () => {

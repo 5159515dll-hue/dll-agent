@@ -17,8 +17,8 @@
  * Builds on: result-ledger.ts, result-sufficiency-gate.ts
  * Consumed by: supervisor.ts, prompt.ts
  */
-import { queryResults, loadResults, buildResultsSummary, type ResultPacket } from "./result-ledger"
-import { checkResultSufficiency, isResultStale, type SufficiencyCheck } from "./result-sufficiency-gate"
+import { buildResultsSummary, type ResultPacket } from "./result-ledger"
+import { checkResultSufficiency, type SufficiencyCheck } from "./result-sufficiency-gate"
 import { write as writeEvidence } from "./evidence"
 
 // ─── Deduplication Check ───────────────────────────────────────────────────
@@ -50,6 +50,16 @@ export interface DedupCheck {
   evidenceRefs: string[]
 }
 
+export interface DedupDispatchDecision {
+  shouldDispatch: boolean
+  mustJustifyRedo: boolean
+  action: DedupCheck["recommendedAction"]
+  reason: string
+  syntheticHint: string | null
+  existingPacketId?: string
+  evidenceRefs: string[]
+}
+
 /**
  * Check whether a proposed task has already been completed in a reusable form.
  *
@@ -68,6 +78,7 @@ export function checkDeduplication(
   options?: {
     requiredFilePaths?: string[]
     maxAgeMinutes?: number
+    projectDir?: string
     forceRedo?: boolean
     redoJustification?: string
   },
@@ -96,6 +107,7 @@ export function checkDeduplication(
   const sufficiency = checkResultSufficiency(sessionID, taskGoal, {
     requiredFilePaths: options?.requiredFilePaths,
     maxAgeMinutes: maxAge,
+    projectDir: options?.projectDir,
   })
 
   if (sufficiency.verdict === "none") {
@@ -196,6 +208,13 @@ Review the failure diagnosis before re-executing. Do not repeat the same approac
     case "stale":
     case "invalidated":
     case "insufficient": {
+      if (sufficiency.verdict === "stale") {
+        writeEvidence("result.stale_detected", {
+          reason: "result_sufficiency_stale",
+          best_packet_id: sufficiency.bestResult?.packet_id,
+          stale_reasons: sufficiency.staleReasons ?? [],
+        }, sessionID)
+      }
       return {
         isRedundant: false,
         existingResults: sufficiency.matchingResults,
@@ -220,6 +239,60 @@ Review the failure diagnosis before re-executing. Do not repeat the same approac
         evidenceRefs: [],
       }
   }
+}
+
+/**
+ * Convert the sufficiency/dedup verdict into a dispatch-layer decision.
+ * A verified reusable result becomes a hard dispatch skip; weaker results
+ * constrain the next action but still allow work to continue from existing state.
+ */
+export function buildDedupDispatchDecision(
+  sessionID: string,
+  taskGoal: string,
+  role: string,
+  options?: {
+    requiredFilePaths?: string[]
+    maxAgeMinutes?: number
+    projectDir?: string
+    forceRedo?: boolean
+    redoJustification?: string
+  },
+): DedupDispatchDecision {
+  const check = checkDeduplication(sessionID, taskGoal, options)
+  const existingPacketId = check.existingResults[0]?.packet_id
+  if (check.recommendedAction === "reuse_existing") {
+    writeEvidence("result.dedup_blocked", {
+      role,
+      task_goal: taskGoal.slice(0, 300),
+      action: "hard_block_reuse",
+      existing_packet_id: existingPacketId,
+      reason: check.reason,
+    }, sessionID)
+    return {
+      shouldDispatch: false,
+      mustJustifyRedo: true,
+      action: check.recommendedAction,
+      reason: check.reason,
+      syntheticHint: check.syntheticHint,
+      existingPacketId,
+      evidenceRefs: check.evidenceRefs,
+    }
+  }
+  return {
+    shouldDispatch: true,
+    mustJustifyRedo: check.existingResults.length > 0,
+    action: check.recommendedAction,
+    reason: check.reason,
+    syntheticHint: check.syntheticHint,
+    existingPacketId,
+    evidenceRefs: check.evidenceRefs,
+  }
+}
+
+export function isDedupReuseAcknowledged(text: string, existingPacketId?: string) {
+  const normalized = text.toLowerCase()
+  if (existingPacketId && normalized.includes(existingPacketId.toLowerCase())) return true
+  return /(reuse|reused|existing result|result ledger|dedup|复用|复用了|已有结果|结果账本|不重复执行|无需重做)/i.test(text)
 }
 
 /**

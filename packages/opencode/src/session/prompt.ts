@@ -57,7 +57,12 @@ import { GLOBAL_DEFAULT_TOOLS, DEFAULT_MANIFEST } from "@/dll-agent/tool-catalog
 import { buildPromptIndex } from "@/dll-agent/tool-prompt"
 import { buildActionableError, formatActionableError } from "@/dll-agent/actionable-error"
 import { checkContinuationGate, isContinuationBudgetExhausted, parseKimiContinuationOutput, consumeContinuationPacket, buildBudgetExhaustedReport } from "@/dll-agent/continuation-gate"
-import { checkDeduplication, buildDedupContextSummary } from "@/dll-agent/deduplication-gate"
+import {
+  checkDeduplication,
+  buildDedupContextSummary,
+  buildDedupDispatchDecision,
+  isDedupReuseAcknowledged,
+} from "@/dll-agent/deduplication-gate"
 import { orchestrateCapabilities, type CapabilityOrchestrationResult } from "@/dll-agent/capability-orchestrator"
 import { runCapabilityActions } from "@/dll-agent/capability-action-runner"
 import { reconcileSessionState } from "@/dll-agent/session-reconciler"
@@ -1906,12 +1911,36 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }).state
                 const metrics = computeTriggerMetrics(msgs)
                 const lastAssistantText = messageText(lastAssistantMsg)
+                const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
+                const currentTaskGoal = lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : ""
 
                 const costCheck = checkCostCap(sessionID, msgs)
+                let dedupHardBlock: { reason: string; hint: string | null; packetId?: string } | null = null
 
-                // Phase 7 — Deduplication Gate: inject prior result context so models
-                // can see what's already been completed and avoid redundant re-execution.
+                // Phase 4 — Deduplication Gate: block redundant result re-dispatch when a verified
+                // reusable ResultPacket already covers the current task.
                 try {
+                  const dedupDispatch = buildDedupDispatchDecision(sessionID, currentTaskGoal, "commander", {
+                    projectDir: ctx.directory,
+                    maxAgeMinutes: 120,
+                  })
+                  if (
+                    metrics.finalClaim &&
+                    !dedupDispatch.shouldDispatch &&
+                    !isDedupReuseAcknowledged(lastAssistantText, dedupDispatch.existingPacketId)
+                  ) {
+                    dedupHardBlock = {
+                      reason: dedupDispatch.reason,
+                      hint: dedupDispatch.syntheticHint,
+                      packetId: dedupDispatch.existingPacketId,
+                    }
+                    yield* slog.info("dedup hard-blocked redundant commander completion", {
+                      existing_packet_id: dedupDispatch.existingPacketId,
+                    })
+                  }
+                  if (dedupDispatch.syntheticHint) {
+                    gatePendingHints.push(dedupDispatch.syntheticHint)
+                  }
                   const dedupContext = buildDedupContextSummary(sessionID)
                   if (dedupContext) {
                     gatePendingHints.push(dedupContext)
@@ -1920,17 +1949,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     })
                   }
                 } catch {
-                  // Dedup context injection is advisory; must not block the loop
+                  // Dedup checks are best-effort; ledger errors must not break the loop.
                 }
 
                 // Phase 5 — Continuation Gate: 在 evidence gate 之前检查是否有 blocking unfinished
-                const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
                 const continuationResult = checkContinuationGate({
                   assistantText: lastAssistantText,
                   isCompletionClaim: metrics.finalClaim,
                   state,
                   sessionID,
-                  userGoal: lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : "",
+                  userGoal: currentTaskGoal,
                 })
                 if (!continuationResult.passed) {
                   const budgetCheck = isContinuationBudgetExhausted({
@@ -1960,7 +1988,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     })
                     const blockedReport = buildBudgetExhaustedReport({
                       sessionID,
-                      userGoal: lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : "",
+                      userGoal: currentTaskGoal,
                       reason: budgetCheck.reason ?? "continuation budget exhausted",
                       packet: continuationResult.continuation_packet,
                     })
@@ -1979,6 +2007,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   sessionID,
                   projectDir: ctx.directory,
                 }, msgs)
+
+                if (dedupHardBlock) {
+                  gateResult.passed = false
+                  const block = `dedup hard-block: existing verified result ${dedupHardBlock.packetId ?? "unknown"} must be reused or redo justified`
+                  gateResult.block_reason = gateResult.block_reason
+                    ? `${gateResult.block_reason}; ${block}`
+                    : block
+                  gateResult.synthetic_hint = [gateResult.synthetic_hint, dedupHardBlock.hint]
+                    .filter(Boolean)
+                    .join("\n")
+                  evidenceWrite("result.dedup_blocked", {
+                    role: "commander",
+                    reason: dedupHardBlock.reason,
+                    existing_packet_id: dedupHardBlock.packetId,
+                    action: "completion_blocked_until_reuse_acknowledged",
+                  }, sessionID)
+                }
 
                 if (metrics.finalClaim && capabilityRuntime) {
                   const capabilityBlocks = [

@@ -14,6 +14,9 @@ import {
   type ResultPacket,
   type ResultCompletionStatus,
 } from "./result-ledger"
+import fs from "fs"
+import path from "path"
+import crypto from "crypto"
 
 // ─── Sufficiency Verdict ───────────────────────────────────────────────────
 
@@ -45,6 +48,8 @@ export interface SufficiencyCheck {
   remainingGaps: string[]
   /** Evidence that supports the sufficiency decision */
   evidenceRefs: string[]
+  /** Why a candidate was treated as stale */
+  staleReasons?: string[]
 }
 
 // ─── Sufficiency Check ─────────────────────────────────────────────────────
@@ -65,13 +70,16 @@ export function checkResultSufficiency(
     requiredVerifications?: string[]
     /** Only consider results newer than this */
     maxAgeMinutes?: number
+    /** Project root used to resolve relative file paths for hash staleness checks */
+    projectDir?: string
   },
 ): SufficiencyCheck {
-  const results = queryResults(sessionID, {
+  const queried = queryResults(sessionID, {
     file_paths: options?.requiredFilePaths,
     // Include all results (not just reusable) — staleness/invalidation is checked below
     reusable_only: false,
   })
+  const results = options?.requiredFilePaths?.length ? queried : queried.filter((packet) => matchesTaskGoal(packet, taskGoal))
 
   if (results.length === 0) {
     return {
@@ -104,6 +112,21 @@ export function checkResultSufficiency(
   })
 
   const bestResult = sorted[0]
+
+  const staleReasons = resultStaleReasons(bestResult, options?.projectDir)
+  if (staleReasons.length > 0) {
+    return {
+      verdict: "stale",
+      matchingResults: sorted,
+      bestResult,
+      canReuse: false,
+      neededActions: ["Result files changed — re-verify or redo"],
+      coveredScope: bestResult.files_changed.map((f) => f.filePath),
+      remainingGaps: [taskGoal],
+      evidenceRefs: bestResult.evidence_refs,
+      staleReasons,
+    }
+  }
 
   // Check staleness: if max age exceeded
   if (options?.maxAgeMinutes) {
@@ -138,6 +161,18 @@ export function checkResultSufficiency(
 
   // VERIFIED_COMPLETE → sufficient
   if (bestResult.completion_status === "VERIFIED_COMPLETE") {
+    if (!hasReusableEvidence(bestResult)) {
+      return {
+        verdict: "sufficient_but_unverified",
+        matchingResults: sorted,
+        bestResult,
+        canReuse: true,
+        neededActions: ["Run verification before claiming completion"],
+        coveredScope: bestResult.files_changed.map((f) => f.filePath),
+        remainingGaps: ["Verified result packet is missing evidence refs or passed verification"],
+        evidenceRefs: bestResult.evidence_refs,
+      }
+    }
     return {
       verdict: "sufficient",
       matchingResults: sorted,
@@ -232,4 +267,52 @@ export function isResultStale(packet: ResultPacket, maxAgeMinutes: number = 60):
   if (packet.stale) return true
   if (packet.completion_status === "STALE" || packet.completion_status === "INVALIDATED") return true
   return false
+}
+
+function hasReusableEvidence(packet: ResultPacket) {
+  return packet.evidence_refs.length > 0 && packet.verification_results.some((v) => v.status === "passed")
+}
+
+function matchesTaskGoal(packet: ResultPacket, taskGoal: string) {
+  const goal = normalize(taskGoal)
+  if (!goal) return true
+  const haystack = normalize(`${packet.user_goal} ${packet.subtask_goal} ${packet.claimed_result}`)
+  if (haystack.includes(goal) || goal.includes(normalize(packet.subtask_goal))) return true
+  const tokens = goal.split(/\s+/).filter((token) => token.length >= 4)
+  if (tokens.length === 0) return haystack.includes(goal.slice(0, 12))
+  return tokens.some((token) => haystack.includes(token))
+}
+
+function normalize(text: string) {
+  return text.toLowerCase().replace(/\s+/g, " ").trim()
+}
+
+function resultStaleReasons(packet: ResultPacket, projectDir?: string) {
+  const reasons: string[] = []
+  for (const file of packet.files_changed) {
+    if (!file.hashAfter) continue
+    const currentHash = hashFile(resolvePath(file.filePath, projectDir))
+    if (!currentHash) {
+      reasons.push(`${file.filePath}: missing current file for hash check`)
+      continue
+    }
+    if (currentHash !== file.hashAfter) {
+      reasons.push(`${file.filePath}: hash changed`)
+    }
+  }
+  return reasons
+}
+
+function resolvePath(filePath: string, projectDir?: string) {
+  if (path.isAbsolute(filePath)) return filePath
+  return path.join(projectDir ?? process.cwd(), filePath)
+}
+
+function hashFile(filePath: string) {
+  try {
+    if (!fs.existsSync(filePath)) return null
+    return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex")
+  } catch {
+    return null
+  }
 }

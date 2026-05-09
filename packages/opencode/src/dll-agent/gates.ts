@@ -15,6 +15,7 @@ import {
 } from "./interfaces"
 import type { MessageV2 } from "@/session/message-v2"
 import { loadResults } from "./result-ledger"
+import { checkResultSufficiency } from "./result-sufficiency-gate"
 import { buildEvidenceSnapshot } from "./evidence-normalizer"
 import { evaluateCompletionReadiness } from "./completion-readiness"
 import { assessGoalCompletion, loadGoalContract } from "./goal-contract"
@@ -358,6 +359,15 @@ export function finalGate(params: {
   if (params.sessionID) {
     const contract = loadGoalContract(params.sessionID)
     if (contract) {
+      const resultSufficiency = checkResultSufficiency(params.sessionID, contract.user_goal, {
+        requiredVerifications: contract.required_verification,
+        projectDir: params.projectDir,
+      })
+      if (resultSufficiency.verdict !== "sufficient") {
+        reasons.push(
+          `result ledger missing verified result for goal contract: ${resultSufficiency.verdict} (${resultSufficiency.neededActions.join("; ")})`,
+        )
+      }
       const assessment = assessGoalCompletion({
         contract,
         verificationResults: params.evidenceGate.passed

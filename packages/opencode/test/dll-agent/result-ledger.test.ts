@@ -1,6 +1,7 @@
 import fs from "fs"
 import os from "os"
 import path from "path"
+import crypto from "crypto"
 import { afterEach, describe, expect, test } from "bun:test"
 import {
   writeResult,
@@ -13,7 +14,11 @@ import {
   type ResultPacket,
 } from "../../src/dll-agent/result-ledger"
 import { checkResultSufficiency, isResultStale } from "../../src/dll-agent/result-sufficiency-gate"
-import { checkDeduplication } from "../../src/dll-agent/deduplication-gate"
+import {
+  buildDedupDispatchDecision,
+  checkDeduplication,
+  isDedupReuseAcknowledged,
+} from "../../src/dll-agent/deduplication-gate"
 
 const cleanupSessions: string[] = []
 
@@ -116,6 +121,24 @@ describe("ResultLedger.queryResults", () => {
     expect(reusable.length).toBe(1)
     expect(reusable[0].subtask_goal).toBe("reusable")
   })
+
+  test("reusable_only excludes stale and invalidated packets even when reusable flag is stale", () => {
+    const sid = sessionID("query_reusable_stale")
+    writeResult(sid, makePacket({ subtask_goal: "fresh", reusable: true, stale: false }))
+    writeResult(sid, makePacket({
+      subtask_goal: "stale flag",
+      reusable: true,
+      stale: true,
+      completion_status: "VERIFIED_COMPLETE",
+    }))
+    writeResult(sid, makePacket({
+      subtask_goal: "invalidated",
+      reusable: true,
+      completion_status: "INVALIDATED",
+    }))
+    const reusable = queryResults(sid, { reusable_only: true })
+    expect(reusable.map((r) => r.subtask_goal)).toEqual(["fresh"])
+  })
 })
 
 describe("ResultLedger.invalidate", () => {
@@ -171,6 +194,19 @@ describe("ResultSufficiencyGate", () => {
     expect(result.canReuse).toBe(true)
   })
 
+  test("verdict=sufficient_but_unverified when VERIFIED_COMPLETE lacks evidence refs", () => {
+    const sid = sessionID("suf_missing_evidence")
+    writeResult(sid, makePacket({
+      subtask_goal: "fix missing evidence",
+      completion_status: "VERIFIED_COMPLETE",
+      evidence_refs: [],
+      verification_results: [{ name: "typecheck", status: "passed" }],
+    }))
+    const result = checkResultSufficiency(sid, "fix missing evidence")
+    expect(result.verdict).toBe("sufficient_but_unverified")
+    expect(result.canReuse).toBe(true)
+  })
+
   test("verdict=partial when PARTIAL result exists", () => {
     const sid = sessionID("suf_partial")
     writeResult(sid, makePacket({
@@ -219,6 +255,26 @@ describe("ResultSufficiencyGate", () => {
     expect(result.verdict).toBe("stale")
     expect(result.canReuse).toBe(false)
   })
+
+  test("verdict=stale when file hash changed", () => {
+    const sid = sessionID("suf_hash_changed")
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "dll-agent-result-hash-"))
+    try {
+      const file = path.join(project, "src.ts")
+      fs.writeFileSync(file, "before")
+      const hashBefore = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")
+      writeResult(sid, makePacket({
+        subtask_goal: "hash guarded task",
+        files_changed: [{ filePath: "src.ts", changeSummary: "write file", hashAfter: hashBefore }],
+      }))
+      fs.writeFileSync(file, "after")
+      const result = checkResultSufficiency(sid, "hash guarded task", { projectDir: project })
+      expect(result.verdict).toBe("stale")
+      expect(result.staleReasons?.join("\n")).toContain("hash changed")
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("ResultSufficiencyGate.isResultStale", () => {
@@ -260,6 +316,26 @@ describe("DeduplicationGate", () => {
     expect(result.isRedundant).toBe(true)
     expect(result.recommendedAction).toBe("reuse_existing")
     expect(result.syntheticHint).toContain("DO NOT re-execute this task")
+  })
+
+  test("dispatch decision hard-blocks verified duplicate work", () => {
+    const sid = sessionID("dedup_dispatch_reuse")
+    writeResult(sid, makePacket({
+      subtask_goal: "already dispatched",
+      completion_status: "VERIFIED_COMPLETE",
+      reusable: true,
+    }))
+    const result = buildDedupDispatchDecision(sid, "already dispatched", "commander")
+    expect(result.shouldDispatch).toBe(false)
+    expect(result.mustJustifyRedo).toBe(true)
+    expect(result.action).toBe("reuse_existing")
+  })
+
+  test("commander redo of completed work must acknowledge reuse or packet id", () => {
+    expect(isDedupReuseAcknowledged("I reused the existing result from the result ledger.")).toBe(true)
+    expect(isDedupReuseAcknowledged("复用已有结果，不重复执行。")).toBe(true)
+    expect(isDedupReuseAcknowledged("Done from res_abc123.", "res_abc123")).toBe(true)
+    expect(isDedupReuseAcknowledged("I did it again from scratch.")).toBe(false)
   })
 
   test("returns continue_from_existing when PARTIAL result exists", () => {
@@ -322,9 +398,9 @@ describe("DeduplicationGate evidence refs", () => {
     const sid = sessionID("dedup_no_ev")
     writeResult(sid, makePacket({
       subtask_goal: "no evidence",
-      completion_status: "UNVERIFIED",
+      completion_status: "VERIFIED_COMPLETE",
       evidence_refs: [],
-      verification_results: [],
+      verification_results: [{ name: "typecheck", status: "passed" }],
       reusable: true,
     }))
     const result = checkDeduplication(sid, "no evidence")
