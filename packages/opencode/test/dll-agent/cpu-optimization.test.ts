@@ -193,7 +193,7 @@ describe("quotaAgeLine no-file-read optimization", () => {
 
     // quotaAgeLine should take a parameter, not call readQuotaFile()
     expect(source).toContain("function quotaAgeLine(value: any)")
-    expect(source).toContain("quotaAgeLine(quota())")
+    expect(source).toContain("quotaAgeLine(input.quota)")
     // Should NOT have the old signature calling readQuotaFile inside
     const oldPattern = /function quotaAgeLine\(\)[\s\S]*?readQuotaFile\(\)/
     expect(oldPattern.test(source)).toBe(false)

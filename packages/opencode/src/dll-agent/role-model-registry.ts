@@ -323,7 +323,31 @@ export function setRoleModelOverride(
 
   if (!cfgPath) return null
 
-  return writeFileOverride(role, model, scope, cfgPath, previous)
+  const change = writeFileOverride(role, model, scope, cfgPath, previous)
+  if (change && sessionID) clearSessionOverride(role, sessionID)
+  return change
+}
+
+function clearSessionOverride(role: DllRole, sessionID: string) {
+  const statePath = sessionOverridePath(sessionID)
+  if (!statePath || !fs.existsSync(statePath)) return
+  try {
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"))
+    const overrides = (state.role_model_overrides as Record<string, unknown>) ?? {}
+    if (!(role in overrides)) return
+    delete overrides[role]
+    if (Object.keys(overrides).length === 0) {
+      delete state.role_model_overrides
+    } else {
+      state.role_model_overrides = overrides
+    }
+    state.updated_at = new Date().toISOString()
+    const tmp = `${statePath}.${process.pid}.${Date.now()}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(redact(state), null, 2))
+    fs.renameSync(tmp, statePath)
+  } catch {
+    return
+  }
 }
 
 function writeSessionOverride(

@@ -406,6 +406,34 @@ describe("setRoleModelOverride", () => {
     expect(result.source).toBe("project")
   })
 
+  test("global override clears same-role session override for immediate effective switch", () => {
+    writeSessionState({
+      commander: { primary: "mimo/mimo-v2.5-pro" },
+    })
+
+    const before = registry.resolveRoleModel("commander", "test-session", projectDir)
+    expect(before.primary).toBe("mimo/mimo-v2.5-pro")
+    expect(before.source).toBe("session")
+
+    const change = registry.setRoleModelOverride(
+      "commander",
+      "openai/gpt-5.5-pro",
+      "global",
+      "test-session",
+      projectDir,
+    )
+
+    expect(change).not.toBeNull()
+    expect(change!.scope).toBe("global")
+
+    const after = registry.resolveRoleModel("commander", "test-session", projectDir)
+    expect(after.primary).toBe("openai/gpt-5.5-pro")
+    expect(after.source).toBe("global")
+
+    const state = JSON.parse(fs.readFileSync(sessionStatePath, "utf8"))
+    expect(state.role_model_overrides?.commander).toBeUndefined()
+  })
+
   test("returns null for invalid scope", () => {
     const change = registry.setRoleModelOverride(
       "commander",

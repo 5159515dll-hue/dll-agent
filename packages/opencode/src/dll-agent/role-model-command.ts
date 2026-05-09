@@ -25,7 +25,7 @@ export function parseRoleModelSetArgs(args: string): ParsedRoleModelSetArgs {
   const role = tokens[0]
   const model = tokens[1]
   const scopeIndex = tokens.indexOf("--scope")
-  const scope = scopeIndex >= 0 ? tokens[scopeIndex + 1] : "session"
+  const scope = scopeIndex >= 0 ? tokens[scopeIndex + 1] : "global"
   return { role, model, scope }
 }
 
@@ -64,4 +64,3 @@ export function roleModelSetSuccessText(input: {
     `source=${input.source}`,
   ].join("\n")
 }
-

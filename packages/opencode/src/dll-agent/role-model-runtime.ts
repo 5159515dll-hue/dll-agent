@@ -5,6 +5,7 @@ import { write as evidenceWrite } from "./evidence"
 import {
   isDllRole,
   resolveRoleModel,
+  resetRoleModelOverride,
   setRoleModelOverride,
   validateRoleModel,
   type DllRole,
@@ -34,7 +35,8 @@ export const resolveEffectiveRoleModel = Effect.fn("DllAgentRoleModelRuntime.res
     const explicit = modelToString(input.explicitModel)
     const validation = validateRoleModel(explicit)
     if (validation.valid) {
-      setRoleModelOverride(input.role, explicit, "session", input.sessionID, input.projectDir)
+      setRoleModelOverride(input.role, explicit, "global", input.sessionID, input.projectDir)
+      resetRoleModelOverride(input.role, "session", input.sessionID, input.projectDir)
     }
   }
 
@@ -93,4 +95,3 @@ export const resolveEffectiveRoleModel = Effect.fn("DllAgentRoleModelRuntime.res
   )
   return fallback
 })
-

@@ -26,6 +26,7 @@ import { doctorCheck as roleModelDoctorCheck } from "./role-model-registry"
 import { doctorCheckRoleToolPolicy } from "./role-tool-policy"
 import { doctorCheckGoalContracts } from "./goal-contract"
 import { buildTaskObservabilityReport } from "./task-observability"
+import { evaluateRealWorldScenarioSuite } from "./scenario-evaluation"
 import type { RiskLevel } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
 import { execSync } from "child_process"
@@ -908,6 +909,30 @@ function checkObservabilityHealth(projectRoot: string): DoctorCheck[] {
   return checks
 }
 
+function checkScenarioEvaluationHealth(): DoctorCheck[] {
+  try {
+    const report = evaluateRealWorldScenarioSuite()
+    const severity: DoctorSeverity = report.fail > 0 || report.false_pass_risk > 0 ? "FAIL" : "PASS"
+    return [{
+      name: "real-world-scenario-evaluation",
+      severity,
+      message: severity === "PASS"
+        ? `Phase 10 regression scenarios pass (${report.pass}/${report.total}); false_pass_risk=${report.false_pass_risk}`
+        : `Phase 10 regression scenario gaps detected (${report.fail}/${report.total} failed, false_pass_risk=${report.false_pass_risk})`,
+      nextAction: severity === "PASS" ? null : "Run scenario-evaluation tests and inspect failed acceptance refs",
+      evidence: `human_intervention=${report.human_intervention_scenarios}, unnecessary_reviewer=${report.unnecessary_reviewer_scenarios}`,
+    }]
+  } catch (error) {
+    return [{
+      name: "real-world-scenario-evaluation",
+      severity: "FAIL",
+      message: "Phase 10 real-world scenario evaluator failed",
+      nextAction: "Inspect scenario-evaluation.ts",
+      evidence: String(error),
+    }]
+  }
+}
+
 // ─── Role Model Health Check ─────────────────────────────────────────────────
 
 function checkRoleModelHealth(projectRoot: string): DoctorCheck[] {
@@ -982,6 +1007,7 @@ export function runDoctor(projectRoot?: string): DoctorReport {
 
   // UX / observability checks
   allChecks.push(...checkObservabilityHealth(root))
+  allChecks.push(...checkScenarioEvaluationHealth())
 
   const passCount = allChecks.filter((c) => c.severity === "PASS").length
   const warnCount = allChecks.filter((c) => c.severity === "WARN").length

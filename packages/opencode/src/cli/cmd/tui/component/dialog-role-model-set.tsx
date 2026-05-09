@@ -6,6 +6,7 @@ import { DialogSelect } from "@tui/ui/dialog-select"
 import { useDialog } from "@tui/ui/dialog"
 import {
   ACTIVE_ROLES,
+  resetRoleModelOverride,
   resolveRoleModel,
   setRoleModelOverride,
   validateRoleModel,
@@ -80,7 +81,7 @@ function ModelPicker(props: { role: DllRole }) {
   const project = useProject()
   const sessionID = createMemo(() => (route.data.type === "session" ? route.data.sessionID : undefined))
   const projectDir = createMemo(() => project.instance.path().worktree || project.instance.directory())
-  const scope = createMemo(() => (sessionID() ? "session" : projectDir() ? "project" : "global"))
+  const scope = createMemo(() => "global" as const)
 
   const current = createMemo(() => resolveRoleModel(props.role, sessionID(), projectDir()).primary)
 
@@ -109,7 +110,8 @@ function ModelPicker(props: { role: DllRole }) {
       onSelect={(option) => {
         const model = option.value as string
         if (!validateRoleModel(model).valid) return
-        const change = setRoleModelOverride(props.role, model, scope() as "session" | "project" | "global", sessionID(), projectDir())
+        const change = setRoleModelOverride(props.role, model, scope(), sessionID(), projectDir())
+        if (change && sessionID()) resetRoleModelOverride(props.role, "session", sessionID(), projectDir())
         dialog.replace(() => (
           <Confirmation
             role={props.role}

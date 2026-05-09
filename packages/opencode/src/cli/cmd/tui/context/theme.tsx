@@ -44,6 +44,7 @@ import { Filesystem } from "@/util/filesystem"
 import { useTuiConfig } from "./tui-config"
 import { isRecord } from "@/util/record"
 import type { TuiThemeCurrent } from "@opencode-ai/plugin/tui"
+import { enabled as dllAgentEnabled } from "@/dll-agent/profile"
 
 type Theme = TuiThemeCurrent & {
   _hasSelectedListItemText: boolean
@@ -320,7 +321,8 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
         }
         draft.mode = mode
         draft.lock = lock
-        const active = config.theme ?? kv.get("theme", "opencode")
+        const defaultTheme = dllAgentEnabled() ? "system" : "opencode"
+        const active = config.theme ?? kv.get("theme", defaultTheme)
         draft.active = typeof active === "string" ? active : "opencode"
         draft.ready = false
       }),
@@ -576,7 +578,7 @@ function generateSystem(colors: TerminalColors, mode: "dark" | "light"): ThemeJs
 
       // Background colors - use transparent to respect terminal transparency
       background: transparent,
-      backgroundPanel: grays[2],
+      backgroundPanel: transparent,
       backgroundElement: grays[3],
       backgroundMenu: grays[3],
 

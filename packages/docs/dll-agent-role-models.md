@@ -7,7 +7,7 @@ The Role Model Registry is a unified system for managing which LLM model each dl
 ## Architecture
 
 ```
-explicit session override from TUI or /role-model-set
+explicit session override
 > session role override
 > project role override
 > global role override
@@ -48,7 +48,8 @@ Role Model Registry is the unified entry point for dll-agent role model selectio
 显示所有角色当前配置的模型、来源（内置/全局/项目/会话）、provider 诊断 hint 及按需调用状态。该命令本地渲染状态，不触发 LLM。
 
 ### `/role-model-set <role> <provider/model> [--scope session|project|global]`
-为指定角色设置当前使用模型。默认 scope 为 `session`。
+为指定角色设置当前使用模型。默认 scope 为 `global`，因为用户通常期望主执行模型切换后跨会话生效。
+如果显式写入 `global` 或 `project`，当前 session 中同角色的旧 session override 会被清除，避免 UI 显示“会话覆盖”并继续压住全局配置。
 该命令写入 Role Model Registry 的 override 链，并在写入前通过 Provider resolver 校验目标模型，不触发 LLM。
 
 示例：
@@ -133,8 +134,8 @@ The registry must not bypass `Provider.Service` or provider-specific request nor
 - `markReviewerCompleted()`: uses registry model for result ledger
 
 ### Session prompt (`prompt.ts`)
-- TUI model picker selections for commander are converted into commander session-scope overrides.
-- `/role-model-set` writes into the same override chain.
+- TUI model picker selections for commander are converted into commander global overrides by default.
+- `/role-model-set` writes into the same override chain; explicit `--scope session` remains available for temporary experiments.
 - Prompt execution uses the effective role model resolver; it does not manually stitch together separate `input.model`, agent model, and registry paths.
 - The resolved model is provider-validated before the user message is persisted.
 
@@ -147,7 +148,7 @@ The registry must not bypass `Provider.Service` or provider-specific request nor
 
 ## Safety Rules
 
-1. Switching commander model prompts a risk warning (session scope allowed)
+1. Switching commander model writes global scope by default; explicit session scope remains available
 2. `final-auditor` remains on-demand regardless of model change
 3. Voice/TTS models rejected for coding roles (commander, chief-engineer, agentic-solver)
 4. Missing provider keys: config saved but model marked `unavailable`, fallback used at runtime
