@@ -215,8 +215,12 @@ export function roleCommands() {
         "This is a read-only status command.",
       ].join("\n"),
     },
-    // role-model-set 已升级为 TUI 交互式对话框（见 dialog-role-model-set.tsx），
-    // 不再注册为模板命令，避免自动补全中出现重复条目。
+    "role-model-set": {
+      description: "设置角色模型覆盖。用法：/role-model-set <role> <provider/model> [--scope session|project|global]",
+      agent: "commander",
+      template:
+        "Local dll-agent command handled by SessionPrompt without an LLM call. Arguments: $ARGUMENTS",
+    },
     "role-model-reset": {
       description: "重置角色模型覆盖，回退到下一层默认配置。用法：/role-model-reset <role> [--scope session|project|global|all]",
       agent: "commander",
@@ -578,5 +582,4 @@ export function writeEvidence(type: string, payload: unknown) {
   if (!enabled()) return
   evidenceWrite(type, payload)
 }
-
 

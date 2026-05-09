@@ -9,7 +9,7 @@ export type Entry = {
 }
 
 const secretPatterns = [
-  /sk-[A-Za-z0-9_-]{12,}/g,
+  /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}/g,
   /github_pat_[A-Za-z0-9_]+/g,
   /ghp_[A-Za-z0-9_]+/g,
   /Bearer\s+[A-Za-z0-9._-]+/gi,
@@ -110,5 +110,4 @@ export function write(type: string, payload: unknown, sessionID?: string) {
     // Evidence logging is diagnostic and must not break the session.
   }
 }
-
 

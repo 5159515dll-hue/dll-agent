@@ -1,5 +1,7 @@
-import { createMemo, createSignal } from "solid-js"
+import { createMemo } from "solid-js"
 import { useSync } from "@tui/context/sync"
+import { useProject } from "@tui/context/project"
+import { useRoute } from "@tui/context/route"
 import { DialogSelect } from "@tui/ui/dialog-select"
 import { useDialog } from "@tui/ui/dialog"
 import {
@@ -38,10 +40,16 @@ function sourceLabel(source: string): string {
 /** Step 1: Pick a role */
 function RolePicker() {
   const dialog = useDialog()
+  const route = useRoute()
+  const project = useProject()
 
   const options = createMemo(() =>
     ACTIVE_ROLES.map((role) => {
-      const effective = resolveRoleModel(role)
+      const effective = resolveRoleModel(
+        role,
+        route.data.type === "session" ? route.data.sessionID : undefined,
+        project.instance.path().worktree || project.instance.directory(),
+      )
       return {
         value: role,
         title: roleLabel(role),
@@ -68,8 +76,13 @@ function RolePicker() {
 function ModelPicker(props: { role: DllRole }) {
   const sync = useSync()
   const dialog = useDialog()
+  const route = useRoute()
+  const project = useProject()
+  const sessionID = createMemo(() => (route.data.type === "session" ? route.data.sessionID : undefined))
+  const projectDir = createMemo(() => project.instance.path().worktree || project.instance.directory())
+  const scope = createMemo(() => (sessionID() ? "session" : projectDir() ? "project" : "global"))
 
-  const current = createMemo(() => resolveRoleModel(props.role).primary)
+  const current = createMemo(() => resolveRoleModel(props.role, sessionID(), projectDir()).primary)
 
   const options = createMemo(() => {
     const results: { value: string; title: string; description: string; category: string }[] = []
@@ -96,13 +109,14 @@ function ModelPicker(props: { role: DllRole }) {
       onSelect={(option) => {
         const model = option.value as string
         if (!validateRoleModel(model).valid) return
-        const change = setRoleModelOverride(props.role, model, "global")
+        const change = setRoleModelOverride(props.role, model, scope() as "session" | "project" | "global", sessionID(), projectDir())
         dialog.replace(() => (
           <Confirmation
             role={props.role}
             previousModel={change?.previousPrimary ?? current()}
             newModel={model}
             success={!!change}
+            scope={scope()}
           />
         ))
       }}
@@ -116,6 +130,7 @@ function Confirmation(props: {
   previousModel: string
   newModel: string
   success: boolean
+  scope: string
 }) {
   const dialog = useDialog()
 
@@ -131,7 +146,7 @@ function Confirmation(props: {
           description: props.success
             ? `${props.previousModel} → ${props.newModel}`
             : `未能写入配置：${props.newModel}`,
-          footer: props.success ? "作用域：全局配置（所有 dll-agent 会话均使用此配置）" : undefined,
+          footer: props.success ? `作用域：${sourceLabel(props.scope)}` : undefined,
         },
         {
           value: "done",

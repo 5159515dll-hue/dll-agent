@@ -123,6 +123,33 @@ describe("continuation-gate: gate function", () => {
     expect(result.completion_status).toBeDefined()
   })
 
+  it("does not treat final report status tables as blocking unfinished work", () => {
+    const text = `
+## 最终报告
+
+| 状态 | 项目 | 说明 |
+|---|---|---|
+| PASS | reasoning_effort | 已修复并验证 |
+| PARTIAL | live API | 缺少真实 API key，仅 mock verified |
+| FAIL | unrelated backlog | 不在本轮范围 |
+
+## 已实现能力
+- P0 修复完成，验证通过
+
+## 部分实现能力
+- live verified 需要用户提供 API key
+`
+    const result = checkContinuationGate({
+      assistantText: text,
+      isCompletionClaim: true,
+      state: freshState(),
+      sessionID: "test-session",
+      userGoal: "修复 P0 runtime blocker",
+    })
+    expect(result.passed).toBe(true)
+    expect(result.has_blocking_unfinished).toBe(false)
+  })
+
   it("does not block for non-completion claim", () => {
     const result = checkContinuationGate({
       assistantText: "Let me think about the next step...",

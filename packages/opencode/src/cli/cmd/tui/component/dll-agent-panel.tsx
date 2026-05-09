@@ -127,6 +127,11 @@ function quotaLine(value: any) {
   if (!value) return "local est. only"
   if (value.stale) {
     if (value.status === "missing_key") return "missing key [stale]"
+    if (value.status === "configured") return "configured; quota unavailable [stale]"
+    if (value.status === "expired") return "expired [stale]"
+    if (value.status === "quota_unavailable" || value.status === "no_quota_endpoint") return "quota unavailable [stale]"
+    if (value.status === "local_estimate_only") return "local est. only [stale]"
+    if (value.status === "unavailable") return "unavailable [stale]"
     if (value.status === "requires_admin_key") return "admin key needed [stale]"
     if (value.status === "endpoint_error") return "balance API rejected [stale]"
     if (value.status === "error") return "quota unavailable [stale]"
@@ -137,6 +142,11 @@ function quotaLine(value: any) {
     if (value.kind === "token_fallback") return "local est. only [stale]"
   }
   if (value.status === "missing_key") return "missing key"
+  if (value.status === "configured") return "configured; quota unavailable"
+  if (value.status === "expired") return "expired"
+  if (value.status === "quota_unavailable" || value.status === "no_quota_endpoint") return "quota unavailable"
+  if (value.status === "local_estimate_only") return "local est. only"
+  if (value.status === "unavailable") return "unavailable"
   if (value.status === "requires_admin_key") return "admin key needed"
   if (value.status === "endpoint_error") return "balance API rejected"
   if (value.status === "error") return "quota unavailable"

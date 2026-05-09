@@ -541,6 +541,49 @@ function anthropicAdaptiveEfforts(apiId: string): string[] | null {
   return null
 }
 
+function directReasoningEfforts(model: Provider.Model) {
+  return Object.entries(variants(model))
+    .filter(([, value]) => value && typeof value === "object" && "reasoningEffort" in value)
+    .map(([effort]) => effort)
+}
+
+function normalizeReasoningEffortValue(value: unknown, allowed: string[]) {
+  if (typeof value !== "string") return undefined
+  if (allowed.includes(value)) return value
+  if ((value === "max" || value === "xhigh") && allowed.includes("high")) return "high"
+  if ((value === "none" || value === "minimal") && allowed.includes("low")) return "low"
+  return undefined
+}
+
+/**
+ * Final provider/model-aware guard for reasoning effort options.
+ *
+ * Model options may come from config, role-model registry wrappers, agent options,
+ * or explicit variants. This function runs after those sources have been merged
+ * and before providerOptions/SDK invocation so unsupported values like
+ * `reasoningEffort: "max"` never leak to OpenAI-compatible providers that only
+ * accept low/medium/high.
+ */
+export function normalizeReasoningOptions(model: Provider.Model, options: Record<string, any>) {
+  const result = { ...options }
+  const raw = result.reasoningEffort ?? result.reasoning_effort
+  delete result.reasoning_effort
+
+  if (raw === undefined) return result
+
+  const allowed = directReasoningEfforts(model)
+  const normalized = normalizeReasoningEffortValue(raw, allowed)
+
+  if (normalized) {
+    result.reasoningEffort = normalized
+    return result
+  }
+
+  delete result.reasoningEffort
+  if (!model.capabilities.reasoning) delete result.reasoningSummary
+  return result
+}
+
 export function variants(model: Provider.Model): Record<string, Record<string, any>> {
   if (!model.capabilities.reasoning) return {}
 

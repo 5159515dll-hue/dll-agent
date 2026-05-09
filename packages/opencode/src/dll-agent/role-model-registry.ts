@@ -4,7 +4,7 @@
  * Unified Role Model Registry: single source of truth for all dll-agent role
  * model mappings. Supports three-tier override resolution:
  *
- *   session override > project override > global override > built-in default
+ *   explicit session override > session override > project override > global override > built-in default
  *
  * All role model changes are written to evidence.
  */
@@ -54,7 +54,7 @@ export interface EffectiveRoleModel {
   onDemandOnly: boolean
   /** Resolved for agent.ts / supervisor.ts use: { providerID, modelID } */
   parsed: { providerID: string; modelID: string }
-  /** Whether the provider is known to be configured (best-effort check) */
+  /** Diagnostic hint only. Final availability is Provider.Service.getModel/getLanguage. */
   providerAvailable: boolean
 }
 
@@ -149,7 +149,11 @@ const BUILT_IN_DEFAULTS: Record<DllRole, Omit<RoleModelConfig, "scope">> = {
 // ─── Config file paths ──────────────────────────────────────────────────────
 
 function globalConfigPath() {
-  return path.join(os.homedir(), ".dll-agent", "config", "role-models.jsonc")
+  return path.join(configRoot(), "config", "role-models.jsonc")
+}
+
+function configRoot() {
+  return process.env.DLL_AGENT_CONFIG_ROOT || path.join(os.homedir(), ".dll-agent")
 }
 
 function projectConfigPath(projectDir?: string) {
@@ -164,7 +168,7 @@ function projectConfigPath(projectDir?: string) {
 
 function sessionOverridePath(sessionID?: string) {
   if (!sessionID) return null
-  return path.join(os.homedir(), ".dll-agent", "sessions", sessionID, "supervisor.json")
+  return path.join(configRoot(), "sessions", sessionID, "supervisor.json")
 }
 
 // ─── Config loading (sync) ─────────────────────────────────────────────────
@@ -288,7 +292,8 @@ export function isVoiceModel(model: string): boolean {
 /**
  * Resolve the effective model for a given role.
  *
- * Priority: session override > project override > global override > built-in default
+ * Priority: explicit/session override > project override > global override > built-in default.
+ * Provider availability and metadata are intentionally not decided here.
  */
 export function resolveRoleModel(
   role: DllRole,
@@ -354,19 +359,19 @@ function buildEffective(
 }
 
 /**
- * Best-effort check if a provider is available.
- * Checks known provider keys in environment variables.
+ * Best-effort diagnostic hint only. OpenCode Provider.Service remains the source
+ * of truth for provider existence, model metadata, auth, transport, and errors.
  */
 function checkProviderAvailable(model: string): boolean {
   const { providerID } = parseModelString(model)
   const envKeyMap: Record<string, string> = {
-    deepseek: "DEEPSEEK_API_KEY",
-    openai: "OPENAI_API_KEY",
+    deepseek: process.env.DLL_AGENT_DEEPSEEK_API_KEY ? "DLL_AGENT_DEEPSEEK_API_KEY" : "DEEPSEEK_API_KEY",
+    openai: process.env.DLL_AGENT_OPENAI_API_KEY ? "DLL_AGENT_OPENAI_API_KEY" : "OPENAI_API_KEY",
     anthropic: "ANTHROPIC_API_KEY",
     google: "GOOGLE_API_KEY",
-    kimi: "KIMI_API_KEY",
-    zai: "ZAI_API_KEY",
-    mimo: "MIMO_API_KEY",
+    kimi: process.env.DLL_AGENT_KIMI_API_KEY ? "DLL_AGENT_KIMI_API_KEY" : "KIMI_API_KEY",
+    zai: process.env.DLL_AGENT_ZAI_API_KEY ? "DLL_AGENT_ZAI_API_KEY" : "ZAI_API_KEY",
+    mimo: process.env.DLL_AGENT_MIMO_API_KEY ? "DLL_AGENT_MIMO_API_KEY" : "MIMO_API_KEY",
     openrouter: "OPENROUTER_API_KEY",
     mistral: "MISTRAL_API_KEY",
     qwen: "QWEN_API_KEY",
@@ -374,7 +379,7 @@ function checkProviderAvailable(model: string): boolean {
     gemini: "GOOGLE_API_KEY",
   }
   const envKey = envKeyMap[providerID.toLowerCase()]
-  if (!envKey) return false // Unknown provider — assume available for custom/OpenAI-compat
+  if (!envKey) return true
   return !!process.env[envKey]
 }
 
@@ -658,10 +663,9 @@ export function resolveAvailableModel(
 /**
  * Resolve the main conversation model from the dll-agent commander role.
  *
- * dll-agent's role-model-registry is the single source of truth for all role
- * model assignments, including the commander (main conversation model).
- * All session/prompt model lookups delegate here when dll-agent is enabled
- * — there is no fallback to any external provider system's defaultModel().
+ * dll-agent's role-model-registry is the single entry point for role model
+ * assignments, including the commander (main conversation model). Callers must
+ * pass the result through OpenCode Provider.Service before using it.
  */
 export function resolveMainModel(
   sessionID?: string,

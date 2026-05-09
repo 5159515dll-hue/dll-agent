@@ -6,11 +6,14 @@ import { buildVerifierSubtask, pickVerifierAgent, decide, recordReviewerCall, ma
 import type { MessageV2 } from "../../src/session/message-v2"
 
 const cleanupSessions: string[] = []
+const cleanupFiles: string[] = []
 
 afterEach(() => {
   for (const id of cleanupSessions.splice(0)) {
     fs.rmSync(path.join(os.homedir(), ".dll-agent", "sessions", id), { recursive: true, force: true })
   }
+  for (const file of cleanupFiles.splice(0)) fs.rmSync(file, { force: true })
+  delete process.env.DLL_AGENT_EVIDENCE_FILE
 })
 
 function sessionID(name: string) {
@@ -77,6 +80,18 @@ function toolErrorMsg(tool: string, errorText: string, command?: string): Messag
       } as any,
     ],
   }
+}
+
+function useEvidenceFile(name: string) {
+  const file = path.join(os.tmpdir(), `dll-agent-${name}-${Date.now()}-${Math.random().toString(16).slice(2)}.jsonl`)
+  cleanupFiles.push(file)
+  process.env.DLL_AGENT_EVIDENCE_FILE = file
+  return file
+}
+
+function readEvidence(file: string) {
+  if (!fs.existsSync(file)) return []
+  return fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
 }
 
 describe("DllAgentSupervisor.buildVerifierSubtask", () => {
@@ -684,5 +699,43 @@ describe("DllAgentSupervisor.Phase6.defaultCommander", () => {
     expect(decision.reviewers.length).toBe(0)
     // Decision is valid
     expect(decision.should_review).toBe(false)
+  })
+})
+
+describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
+  test("user correction triggers requirements-inspector even when it costs more", () => {
+    const sid = sessionID("correctness_user_correction")
+    const decision = decide([userMsg("msg_user_corr", "不对，不是这个目标，你跑偏了，按我原来的要求修。")], sid, 1)
+    expect(decision.reviewers).toContain("requirements-inspector")
+  })
+
+  test("high-risk repeated failure can route more than one reviewer", () => {
+    const sid = sessionID("correctness_high_risk_multi")
+    const messages = [
+      userMsg("msg_user_multi", "不对，继续完成所有目标，不能跳过验证。"),
+      toolErrorMsg("bash", "doctor failed: provider routing broken", "dll-agent doctor"),
+      toolErrorMsg("bash", "doctor failed: provider routing broken", "dll-agent doctor"),
+      asstMsg("已完成，但 tests not run and doctor failed"),
+    ]
+    const decision = decide(messages, sid, 1)
+    expect(decision.reviewers.length).toBeGreaterThan(1)
+    expect(decision.reviewers).toContain("requirements-inspector")
+    expect(decision.reviewers).toContain("chief-engineer")
+  })
+
+  test("MiMo multimodal reviewer does not enter pure text/code tasks", () => {
+    const sid = sessionID("correctness_mimo_text")
+    const decision = decide([userMsg("msg_user_mimo_text", "检查这段代码和截图这个词，但没有实际图片附件。")], sid, 1)
+    expect(decision.reviewers).not.toContain("multimodal-context-interpreter")
+  })
+
+  test("routing evidence records correctness_reason and cost_reason", () => {
+    const evidence = useEvidenceFile("routing")
+    const sid = sessionID("routing_evidence")
+    decide([userMsg("msg_user_routing", "不对，这个实现跑偏了。")], sid, 1)
+    const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
+    expect(entries.length).toBeGreaterThan(0)
+    expect(entries[0].payload.correctness_reason).toBeTruthy()
+    expect("cost_reason" in entries[0].payload).toBe(true)
   })
 })

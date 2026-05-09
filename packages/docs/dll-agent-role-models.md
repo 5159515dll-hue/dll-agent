@@ -7,8 +7,15 @@ The Role Model Registry is a unified system for managing which LLM model each dl
 ## Architecture
 
 ```
-session override > project override > global override > built-in default
+explicit session override from TUI or /role-model-set
+> session role override
+> project role override
+> global role override
+> built-in role default
+> Provider default model fallback
 ```
+
+Role Model Registry is the unified entry point for dll-agent role model selection. It does not replace the OpenCode Provider system. Every effective role model must still be validated by `Provider.Service.getModel()` before use.
 
 ### Three-tier override resolution
 
@@ -38,10 +45,11 @@ session override > project override > global override > built-in default
 ## Slash Commands
 
 ### `/role-models`
-显示所有角色当前配置的模型、来源（内置/全局/项目/会话）、provider 可用性及按需调用状态。
+显示所有角色当前配置的模型、来源（内置/全局/项目/会话）、provider 诊断 hint 及按需调用状态。该命令本地渲染状态，不触发 LLM。
 
 ### `/role-model-set <role> <provider/model> [--scope session|project|global]`
 为指定角色设置当前使用模型。默认 scope 为 `session`。
+该命令写入 Role Model Registry 的 override 链，并在写入前通过 Provider resolver 校验目标模型，不触发 LLM。
 
 示例：
 ```
@@ -100,9 +108,17 @@ Same format as global config. Overrides global config for matching roles.
 
 ## Fallback Mechanism
 
-When a role's primary model provider has no API key configured, the registry tries each fallback model in order. The first available model wins.
+The registry stores fallback lists and source/scope. Runtime availability is decided by OpenCode Provider resolution, not by registry env-key checks. Registry `providerAvailable` is only a diagnostic hint for status UI.
 
-If all fallbacks are unavailable, the primary model is used anyway (the caller should handle the error).
+If all role candidates fail Provider resolution, prompt/session code may use Provider default model as the final validated fallback and must write routing evidence.
+
+## Provider Boundary
+
+Role Model Registry owns role mapping, session/project/global overrides, fallback lists, source/scope, and user-visible role model status.
+
+OpenCode Provider owns provider existence, model metadata, API key/baseURL, transport, request body transformation, `reasoning_effort` compatibility, tool calling, multimodal capability, quota/status, and provider errors.
+
+The registry must not bypass `Provider.Service` or provider-specific request normalization.
 
 ## Runtime Integration
 
@@ -115,6 +131,12 @@ If all fallbacks are unavailable, the primary model is used anyway (the caller s
 - `buildSubtask()`: resolves model from registry per reviewer role, with session override support
 - `buildTaskCompletionSubtask()`: resolves model from registry
 - `markReviewerCompleted()`: uses registry model for result ledger
+
+### Session prompt (`prompt.ts`)
+- TUI model picker selections for commander are converted into commander session-scope overrides.
+- `/role-model-set` writes into the same override chain.
+- Prompt execution uses the effective role model resolver; it does not manually stitch together separate `input.model`, agent model, and registry paths.
+- The resolved model is provider-validated before the user message is persisted.
 
 ### Agent (`agent.ts`)
 - Agent defaults resolved from registry at startup via `resolveRoleModel()`
@@ -131,6 +153,15 @@ If all fallbacks are unavailable, the primary model is used anyway (the caller s
 4. Missing provider keys: config saved but model marked `unavailable`, fallback used at runtime
 5. Expired/rate-limited models: fallback to next available
 6. Role permissions are separate from model selection
+
+## Reasoning Effort Compatibility
+
+`reasoningEffort` may come from registry config, wrapper-generated model options, agent options, or explicit variants. Before providerOptions/SDK invocation, `ProviderTransform.normalizeReasoningOptions()` applies a final provider/model-aware guard:
+
+- supported `max` stays `max`
+- OpenAI-compatible low/medium/high models map `max` to `high`
+- unsupported models omit `reasoningEffort`
+- snake_case `reasoning_effort` is normalized and never leaks as illegal `max`
 
 ## Extending with New Models
 
@@ -155,8 +186,8 @@ To add a new model provider:
 |------------|--------|
 | Role Model Registry with built-in defaults | ✅ Implemented |
 | Three-tier override (session > project > global) | ✅ Implemented |
-| `/role-models` slash command template | ✅ Implemented (template, execution via commander) |
-| `/role-model-set` with scope support | ✅ Implemented |
+| `/role-models` slash command | ✅ Implemented as local status command, no LLM call |
+| `/role-model-set` with scope support | ✅ Implemented as local mutation command, no LLM call |
 | `/role-model-reset` with scope support | ✅ Implemented |
 | `/role-model-test` smoke test template | ✅ Implemented |
 | `/role-model-fallback-add/remove` | ✅ Implemented |
@@ -170,14 +201,14 @@ To add a new model provider:
 | Doctor role model health check | ✅ Implemented |
 | Evidence written on model changes | ✅ Implemented |
 | Fallback chain resolution | ✅ Implemented |
-| Provider availability checking | ✅ Implemented |
+| Provider availability checking | ✅ Provider.Service is final authority; registry hint only |
 | Voice/TTS model guard | ✅ Implemented |
 | Config conflict detection (global+project overlap) | ✅ Implemented |
 | Tests (37 tests, all pass) | ✅ Implemented |
 | Typecheck (4/4 pass) | ✅ Verified |
 | Full test suite (569/569 pass) | ✅ Verified |
 | Doctor (PASS/WARN, no FAIL) | ✅ Verified |
-| Session override real-time refresh for slash commands | ⚠️ Partial — session overrides applied at supervisor auto-trigger time; slash commands use agent model loaded at startup |
+| Session override real-time refresh for slash commands | ✅ prompt/session resolves effective role model at runtime |
 | Model context limits from registry | ⚠️ Partial — `MODEL_CONTEXT_LIMITS` table still hardcoded in supervisor.ts |
 
 ## Implementation Files

@@ -39,8 +39,6 @@ const UNFINISHED_INDICATOR_PATTERNS: RegExp[] = [
   /仍有.*(待|未).*完成/i,
   /尚未.*(完成|实现|修复|接入)/i,
   /(still|remains)\s+(pending|todo|incomplete|unresolved)/i,
-  /PARTIAL/i,
-  /BLOCKED/i,
   /推迟/i,
   /不在.*(本轮|本次).*范围/i,
   /需要.*(继续|进一步|下一步)/i,
@@ -88,9 +86,13 @@ export function detectUnfinishedIndicators(text: string): {
   hasUnfinished: boolean
   matchedPatterns: string[]
 } {
+  const scanText = text
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("|"))
+    .join("\n")
   const matchedPatterns: string[] = []
   for (const pattern of UNFINISHED_INDICATOR_PATTERNS) {
-    const match = text.match(pattern)
+    const match = scanText.match(pattern)
     if (match) {
       matchedPatterns.push(match[0])
     }
@@ -130,6 +132,13 @@ export function extractUnfinishedItems(
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim()
     if (!line) continue
+    if (line.startsWith("|")) continue
+    const isListLine = /^[-*•]\s+|^\d+[.)]\s+/.test(line)
+    if (/^#+\s*(最终报告|验证结果|已实现|部分实现|未实现|当前状态|状态说明|final report|verification|implemented|partial|not implemented)/i.test(line)) {
+      inUnfinishedSection = false
+      sectionKind = "non_blocking_followup"
+      continue
+    }
 
     // Detect section headers
     const blockingMatch = line.match(
@@ -141,25 +150,31 @@ export function extractUnfinishedItems(
     const followupMatch = line.match(
       /(non.?blocking|下一步|follow.?up|后续|P2|P3|roadmap)/i,
     )
+    const unfinishedMatch = line.match(/^(#+\s*)?(未完成|待完成|TODO|todo|unfinished|incomplete)\s*[:：]?$/i)
 
-    if (blockingMatch) {
+    if (!isListLine && blockingMatch) {
       inUnfinishedSection = true
       sectionKind = "blocking_unfinished"
       continue
     }
-    if (userInputMatch) {
+    if (!isListLine && userInputMatch) {
       inUnfinishedSection = true
       sectionKind = "requires_user_input"
       continue
     }
-    if (followupMatch) {
+    if (!isListLine && followupMatch) {
+      inUnfinishedSection = true
+      sectionKind = "non_blocking_followup"
+      continue
+    }
+    if (!isListLine && unfinishedMatch) {
       inUnfinishedSection = true
       sectionKind = "non_blocking_followup"
       continue
     }
 
     // Extract items starting with list markers
-    const itemMatch = line.match(/^[-*•]\s+(.+)$|^\d+[.)]\s+(.+)$|^[|#]\s*(.+)/)
+    const itemMatch = line.match(/^[-*•]\s+(.+)$|^\d+[.)]\s+(.+)$/)
     if (!itemMatch) continue
 
     const description = (itemMatch[1] || itemMatch[2] || itemMatch[3] || "").trim()
@@ -611,4 +626,3 @@ export function consumeContinuationPacket(packet: ContinuationPacket): {
 
   return { shouldContinue, actionItems, summary }
 }
-

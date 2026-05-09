@@ -10,8 +10,12 @@ import { iife } from "@/util/iife"
 import { useToast } from "../ui/toast"
 import { useArgs } from "./args"
 import { useSDK } from "./sdk"
+import { useProject } from "./project"
+import { useRoute } from "./route"
 import { RGBA } from "@opentui/core"
 import { Filesystem } from "@/util/filesystem"
+import { enabled as profileEnabled } from "@/dll-agent/profile"
+import { resolveRoleModel } from "@/dll-agent/role-model-registry"
 
 export function parseModel(model: string) {
   const [providerID, ...rest] = model.split("/")
@@ -27,6 +31,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const sync = useSync()
     const sdk = useSDK()
     const toast = useToast()
+    const project = useProject()
+    const route = useRoute()
 
     function isModelValid(model: { providerID: string; modelID: string }) {
       const provider = sync.data.provider.find((x) => x.id === model.providerID)
@@ -199,6 +205,15 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
       const currentModel = createMemo(() => {
         const a = agent.current()
+        if (profileEnabled() && a?.name === "commander") {
+          const effective = resolveRoleModel(
+            "commander",
+            route.data.type === "session" ? route.data.sessionID : undefined,
+            project.instance.path().worktree || project.instance.directory(),
+          )
+          const model = parseModel(effective.primary)
+          if (isModelValid(model)) return model
+        }
         return (
           getFirstValidModel(
             () => a && modelStore.model[a.name],

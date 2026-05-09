@@ -13,11 +13,7 @@ import { write as writeEvidence, redact } from "./evidence"
 import { recordGateBlock, isGateRetryExhausted } from "./gates"
 import { ProviderID, ModelID } from "@/provider/schema"
 import { SessionID, MessageID, PartID } from "@/session/schema"
-import {
-  resolveRoleModel,
-  resolveAvailableModel,
-  type DllRole,
-} from "./role-model-registry"
+import { resolveRoleModel, type DllRole } from "./role-model-registry"
 import {
   type SupervisorState,
   type TriggerDecision,
@@ -436,7 +432,7 @@ function buildReviewerContext(
     contextLines.push(resultSummary)
   }
 
-  return truncate(contextLines.join("\n"), 8_000)
+  return truncate(contextLines.join("\n"), 5_000)
 }
 
 export function reviewerRuntimeMs(reviewer: string) {
@@ -503,6 +499,79 @@ export function assessRisk(metrics: Metrics): RiskLevel {
   return "low"
 }
 
+function hasNonTextInput(messages: MessageV2.WithParts[]) {
+  return messages.slice(-8).some((message) =>
+    message.parts.some((part) => {
+      if (part.type !== "file") return false
+      const mime = "mime" in part && typeof part.mime === "string" ? part.mime : ""
+      return /^(image|audio|video)\//i.test(mime) || /pdf|presentation|powerpoint/i.test(mime)
+    }),
+  )
+}
+
+function reviewerModelCandidates(reviewer: ReviewerRole, sessionID: string) {
+  const effective = resolveRoleModel(reviewerToDllRole(reviewer), sessionID, process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR)
+  return {
+    selected: effective.primary,
+    candidates: [effective.primary, ...effective.fallback],
+  }
+}
+
+function maxReviewersForRouting(risk: RiskLevel, metrics: Metrics) {
+  if (
+    risk === "high" ||
+    metrics.reviewerConflictSignal ||
+    metrics.repeatedToolFailure ||
+    (metrics.finalClaim && !metrics.realToolEvidence)
+  ) return 3
+  if (risk === "medium" || metrics.recentUserCorrection || metrics.userCorrections > 0 || metrics.kimiCompletionCheckSignal) return 2
+  return COOLDOWN_CONFIG.max_reviewers_per_round
+}
+
+function reviewerRequiredForCorrectness(reviewer: ReviewerRole, reason: string, risk: RiskLevel, metrics: Metrics) {
+  if (risk === "high") return true
+  if (reviewer === "requirements-inspector" && (metrics.recentUserCorrection || metrics.userCorrections > 0 || metrics.scopeExpandedSignal || metrics.glmCompletionClaimSignal)) return true
+  if (reviewer === "chief-engineer" && (metrics.repeatedToolFailure || metrics.toolFailures >= 3 || metrics.permissionDenied > 0)) return true
+  if (reviewer === "role-cross" && metrics.reviewerConflictSignal) return true
+  if (reviewer === "task-completion-archivist" && metrics.kimiCompletionCheckSignal) return true
+  if (reviewer === "final-auditor" && metrics.finalClaim) return true
+  if (reviewer === "multimodal-context-interpreter" && reason.includes("multimodal input")) return true
+  return false
+}
+
+function writeRoutingEvidence(input: {
+  sessionID: string
+  taskID: string
+  role: ReviewerRole | "commander"
+  selectedModel?: string
+  candidateModels: string[]
+  riskLevel: RiskLevel
+  triggerReason: string
+  skippedReviewers?: string[]
+  skipReason?: string | null
+  correctnessReason: string
+  costReason?: string | null
+  evidenceRefs?: string[]
+  fallbackReason?: string | null
+  requiredForCorrectness: boolean
+}) {
+  writeEvidence("model.routing_decision", {
+    task_id: input.taskID,
+    role: input.role,
+    selected_model: input.selectedModel ?? null,
+    candidate_models: input.candidateModels,
+    risk_level: input.riskLevel,
+    trigger_reason: input.triggerReason,
+    skipped_reviewers: input.skippedReviewers ?? [],
+    skip_reason: input.skipReason ?? null,
+    correctness_reason: input.correctnessReason,
+    cost_reason: input.costReason ?? null,
+    evidence_refs: input.evidenceRefs ?? [],
+    fallback_reason: input.fallbackReason ?? null,
+    whether_required_for_correctness: input.requiredForCorrectness,
+  }, input.sessionID)
+}
+
 // ─── 触发决策 ─────────────────────────────────────────────────────────────
 
 /**
@@ -520,16 +589,34 @@ export function decide(
   const reasons: Record<ReviewerRole, string> = {} as Record<ReviewerRole, string>
   const reviewers: ReviewerRole[] = []
   const fingerprints: Partial<Record<ReviewerRole, string>> = {}
+  const risk = assessRisk(metrics)
 
   const addReviewer = (reviewer: ReviewerRole, reason: string) => {
     if (reviewers.includes(reviewer)) return
     const state = loadState(sessionID)
+    const model = reviewerModelCandidates(reviewer, sessionID)
+    const required = reviewerRequiredForCorrectness(reviewer, reason, risk, metrics)
     if (state.completed_reviews?.includes(reviewer)) {
       writeEvidence("cooldown.skipped", {
         reason: "reviewer_already_completed_this_phase",
         reviewer,
         phase: state.phase,
       }, sessionID)
+      writeRoutingEvidence({
+        sessionID,
+        taskID: sessionID,
+        role: reviewer,
+        selectedModel: model.selected,
+        candidateModels: model.candidates,
+        riskLevel: risk,
+        triggerReason: reason,
+        skippedReviewers: [reviewer],
+        skipReason: "reviewer_already_completed_this_phase",
+        correctnessReason: required ? "required reviewer already completed in this phase" : "reviewer not required after prior completion",
+        costReason: "avoid repeating reviewer over the same phase evidence",
+        evidenceRefs: [`reviewer:${reviewer}`],
+        requiredForCorrectness: required,
+      })
       return
     }
     if (state.queued_reviewers?.includes(reviewer) || state.running_reviewers?.includes(reviewer)) {
@@ -539,13 +626,59 @@ export function decide(
         queued: state.queued_reviewers ?? [],
         running: state.running_reviewers ?? [],
       }, sessionID)
+      writeRoutingEvidence({
+        sessionID,
+        taskID: sessionID,
+        role: reviewer,
+        selectedModel: model.selected,
+        candidateModels: model.candidates,
+        riskLevel: risk,
+        triggerReason: reason,
+        skippedReviewers: [reviewer],
+        skipReason: "reviewer_already_queued_or_running",
+        correctnessReason: "existing queued/running reviewer will satisfy the trigger",
+        costReason: "avoid duplicate reviewer dispatch",
+        evidenceRefs: [`reviewer:${reviewer}`],
+        requiredForCorrectness: required,
+      })
       return
     }
     const fingerprint = makeTriggerFingerprint(messages, reviewer, reason)
-    if (isCooldown(sessionID, reviewer, currentStep, fingerprint)) return
+    if (isCooldown(sessionID, reviewer, currentStep, fingerprint)) {
+      writeRoutingEvidence({
+        sessionID,
+        taskID: sessionID,
+        role: reviewer,
+        selectedModel: model.selected,
+        candidateModels: model.candidates,
+        riskLevel: risk,
+        triggerReason: reason,
+        skippedReviewers: [reviewer],
+        skipReason: "fingerprint_cooldown",
+        correctnessReason: required ? "correctness-required reviewer deferred by cooldown; gate must not treat this as completed" : "reviewer not correctness-required for this duplicate fingerprint",
+        costReason: "avoid repeating the same reviewer for the same failure/evidence fingerprint",
+        evidenceRefs: [fingerprint],
+        requiredForCorrectness: required,
+      })
+      return
+    }
     reviewers.push(reviewer)
     reasons[reviewer] = reason
     fingerprints[reviewer] = fingerprint
+    writeRoutingEvidence({
+      sessionID,
+      taskID: sessionID,
+      role: reviewer,
+      selectedModel: model.selected,
+      candidateModels: model.candidates,
+      riskLevel: risk,
+      triggerReason: reason,
+      skippedReviewers: [],
+      correctnessReason: required ? "reviewer is required for correctness under current risk/trigger state" : "reviewer selected as useful supporting check",
+      costReason: required ? null : "selected within low-value-call guard budget",
+      evidenceRefs: [fingerprint],
+      requiredForCorrectness: required,
+    })
   }
 
   // 规则 1：用户纠偏 → requirements-inspector
@@ -583,17 +716,9 @@ export function decide(
     const reason = metrics.repeatedToolFailure
       ? "repeated tool failure detected (same error pattern)"
       : `${metrics.toolFailures} tool failures in recent messages`
-    const chiefFingerprint = makeTriggerFingerprint(messages, "chief-engineer", reason)
-    if (!isCooldown(sessionID, "chief-engineer", currentStep, chiefFingerprint)) {
-      reviewers.push("chief-engineer")
-      reasons["chief-engineer"] = reason
-      fingerprints["chief-engineer"] = chiefFingerprint
-    } else {
-      writeEvidence("cooldown.skipped", {
-        reason: "chief_engineer_in_cooldown_no_role_cross_fallback",
-        reviewer: "role-cross",
-        original_reason: reason,
-      }, sessionID)
+    addReviewer("chief-engineer", reason)
+    if (metrics.toolFailures >= 4 || metrics.reviewerConflictSignal) {
+      addReviewer("role-cross", "third repeated failure or reviewer conflict requires cross-review")
     }
   }
 
@@ -607,10 +732,11 @@ export function decide(
     addReviewer("role-cross", "reviewer conflict signal detected")
   }
 
-  // 规则 6：高风险最终声明且缺验证 → 先阻断而非直接调 OpenAI
+  // 规则 6：高风险最终声明且缺验证 → final gate + high-risk auditor
   if (metrics.finalClaim && !metrics.verificationEvidence) {
-    // 这里不直接调 final-auditor，由 gates 层处理。
-    // 只登记到 state 中。
+    if (risk === "high") {
+      addReviewer("final-auditor", "high-risk final claim without verification evidence")
+    }
   }
 
   // 规则 8 (Phase 6): GLM completion-claim-check
@@ -652,9 +778,25 @@ export function decide(
   // 规则 12 (Phase 8): Multimodal input signal → multimodal-context-interpreter
   // Trigger the multimodal role when non-text inputs (images, video, audio, etc.)
   // are detected but only on-demand — not for every task.
-  if (metrics.multimodalSignal) {
+  if (metrics.multimodalSignal && hasNonTextInput(messages)) {
     const reason = "multimodal input detected (screenshot, image, video, audio, PPT figure, chart, etc.)"
     addReviewer("multimodal-context-interpreter" as ReviewerRole, reason)
+  } else if (metrics.multimodalSignal) {
+    writeRoutingEvidence({
+      sessionID,
+      taskID: sessionID,
+      role: "multimodal-context-interpreter",
+      selectedModel: reviewerModelCandidates("multimodal-context-interpreter" as ReviewerRole, sessionID).selected,
+      candidateModels: reviewerModelCandidates("multimodal-context-interpreter" as ReviewerRole, sessionID).candidates,
+      riskLevel: risk,
+      triggerReason: "multimodal keyword signal without non-text input",
+      skippedReviewers: ["multimodal-context-interpreter"],
+      skipReason: "pure_text_or_code_task",
+      correctnessReason: "MiMo multimodal reviewer is not required without actual non-text input",
+      costReason: "prevent multimodal/TTS model from entering a pure code task",
+      evidenceRefs: [],
+      requiredForCorrectness: false,
+    })
   }
 
   // 规则 7（auto-verifier）：completion blocked + 缺真实 tool evidence → 自动注入 verifier subtask
@@ -674,16 +816,39 @@ export function decide(
     }, sessionID)
   }
 
-  // Rate-limit: 每轮最多触发 5 个 reviewer
-  if (reviewers.length > COOLDOWN_CONFIG.max_reviewers_per_round) {
-    const skipped = reviewers.slice(COOLDOWN_CONFIG.max_reviewers_per_round)
+  const maxReviewers = maxReviewersForRouting(risk, metrics)
+  if (reviewers.length > maxReviewers) {
+    const required = reviewers.filter((reviewer) => reviewerRequiredForCorrectness(reviewer, reasons[reviewer], risk, metrics))
+    const optional = reviewers.filter((reviewer) => !required.includes(reviewer))
+    const selected = required.length >= maxReviewers
+      ? required
+      : [...required, ...optional.slice(0, maxReviewers - required.length)]
+    const skipped = reviewers.filter((reviewer) => !selected.includes(reviewer))
     for (const r of skipped) {
       writeEvidence("cooldown.skipped", {
-        reason: "max_reviewers_per_round",
+        reason: "correctness_aware_routing_budget",
         reviewer: r,
+        risk,
+        max_reviewers: maxReviewers,
       }, sessionID)
+      const model = reviewerModelCandidates(r, sessionID)
+      writeRoutingEvidence({
+        sessionID,
+        taskID: sessionID,
+        role: r,
+        selectedModel: model.selected,
+        candidateModels: model.candidates,
+        riskLevel: risk,
+        triggerReason: reasons[r],
+        skippedReviewers: [r],
+        skipReason: "correctness_aware_routing_budget",
+        correctnessReason: "reviewer was not required for correctness after required reviewers were selected",
+        costReason: "avoid low-value multi-model meeting beyond the current risk budget",
+        evidenceRefs: fingerprints[r] ? [fingerprints[r]!] : [],
+        requiredForCorrectness: false,
+      })
     }
-    reviewers.splice(COOLDOWN_CONFIG.max_reviewers_per_round)
+    reviewers.splice(0, reviewers.length, ...selected)
   }
 
   writeEvidence("supervisor.decision", {
@@ -896,12 +1061,29 @@ export function generateSubtasks(
         maxAgeMinutes: 120,
       })
       if (dedup.isRedundant && dedup.recommendedAction === "reuse_existing") {
+        const model = reviewerModelCandidates(reviewer, sessionID)
         writeEvidence("result.dedup_blocked", {
           reviewer,
           reason,
           existing_packet_id: dedup.existingResults[0]?.packet_id,
           covered_scope: dedup.sufficiency?.coveredScope,
         }, sessionID)
+        writeRoutingEvidence({
+          sessionID,
+          taskID: sessionID,
+          role: reviewer,
+          selectedModel: model.selected,
+          candidateModels: model.candidates,
+          riskLevel: loadState(sessionID).risk,
+          triggerReason: reason,
+          skippedReviewers: [reviewer],
+          skipReason: "verified_result_reused",
+          correctnessReason: "existing result is verified, reusable, and not stale",
+          costReason: "avoid repeating reviewer over equivalent verified evidence",
+          evidenceRefs: dedup.evidenceRefs,
+          requiredForCorrectness: false,
+        })
+        markReviewerCompleted(sessionID, reviewer)
         // Skip this subtask — a reusable result already exists
         continue
       }
@@ -912,7 +1094,6 @@ export function generateSubtasks(
           existing_packet_id: dedup.existingResults[0]?.packet_id,
           action: "verify_existing",
         }, sessionID)
-        continue
       }
     } catch {
       // Dedup check must not block subtask dispatch
@@ -960,20 +1141,6 @@ function buildSubtask(
   const model = {
     providerID: ProviderID.make(effective.parsed.providerID),
     modelID: ModelID.make(effective.parsed.modelID),
-  }
-  // If primary model provider is unavailable, try fallback chain
-  if (!effective.providerAvailable && effective.fallback.length > 0) {
-    const resolved = resolveAvailableModel(dllRole, sessionID, process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR)
-    if (resolved.usedFallback) {
-      const fbParsed = resolved.model.indexOf("/") === -1
-        ? { providerID: resolved.model, modelID: "" }
-        : {
-            providerID: resolved.model.slice(0, resolved.model.indexOf("/")),
-            modelID: resolved.model.slice(resolved.model.indexOf("/") + 1),
-          }
-      model.providerID = ProviderID.make(fbParsed.providerID)
-      model.modelID = ModelID.make(fbParsed.modelID)
-    }
   }
   const compactContext = buildReviewerContext(reviewer, reason, metrics, messages, sessionID)
 

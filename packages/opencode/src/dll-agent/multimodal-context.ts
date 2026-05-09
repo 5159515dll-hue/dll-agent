@@ -211,7 +211,8 @@ export function writeMultimodalEvidence(
 // ─── Session-level storage ─────────────────────────────────────────────────
 
 function packetStorePath(sessionID: string): string {
-  return path.join(os.homedir(), ".dll-agent", "sessions", sessionID, "multimodal-packets.jsonl")
+  const root = process.env.DLL_AGENT_CONFIG_ROOT || path.join(os.homedir(), ".dll-agent")
+  return path.join(root, "sessions", sessionID, "multimodal-packets.jsonl")
 }
 
 export function savePacket(sessionID: string, packet: MultimodalContextPacket) {
@@ -297,7 +298,7 @@ export function markPacketsStale(sessionID: string, sourceHash: string) {
 
 const SENSITIVE_PATTERNS: RegExp[] = [
   /(?:api[_-]?key|token|password|passwd|secret)\s*[:=]\s*[^\s,}]+/gi,
-  /sk-[A-Za-z0-9_-]{12,}/g,
+  /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}/g,
   /Bearer\s+[A-Za-z0-9._-]+/gi,
   /ghp_[A-Za-z0-9_]+/g,
   // QR code content hints

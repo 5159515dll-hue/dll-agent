@@ -24,11 +24,15 @@ import fs from "fs"
 import path from "path"
 import os from "os"
 
-const testDir = path.join(os.homedir(), ".dll-agent", "test-role-model-registry")
+const configRoot = path.join(os.tmpdir(), `dll-agent-role-model-registry-${process.pid}`)
+process.env.DLL_AGENT_CONFIG_ROOT = configRoot
+
+const testDir = path.join(os.tmpdir(), `dll-agent-role-model-registry-project-${process.pid}`)
 const projectDir = path.join(testDir, "project")
 const projectCfgPath = path.join(projectDir, ".dll-agent", "role-models.jsonc")
-const sessionDir = path.join(os.homedir(), ".dll-agent", "sessions", "test-session")
+const sessionDir = path.join(configRoot, "sessions", "test-session")
 const sessionStatePath = path.join(sessionDir, "supervisor.json")
+const realGlobalPath = path.join(configRoot, "config", "role-models.jsonc")
 
 // We import from the source directly
 // Note: We cannot import from "@/dll-agent/role-model-registry" because
@@ -46,18 +50,27 @@ let registry: typeof import("../../src/dll-agent/role-model-registry")
 beforeEach(async () => {
   // Clean test environment
   if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true })
+  if (fs.existsSync(configRoot)) fs.rmSync(configRoot, { recursive: true })
+  process.env.DLL_AGENT_CONFIG_ROOT = configRoot
   // Dynamically import to pick up changes
   registry = await import("../../src/dll-agent/role-model-registry")
 })
 
 afterEach(() => {
   if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true })
-  if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true })
+  if (fs.existsSync(configRoot)) fs.rmSync(configRoot, { recursive: true })
   // Restore any env vars
+  delete process.env.DLL_AGENT_CONFIG_ROOT
   delete process.env.DEEPSEEK_API_KEY
+  delete process.env.DLL_AGENT_DEEPSEEK_API_KEY
   delete process.env.ZAI_API_KEY
+  delete process.env.DLL_AGENT_ZAI_API_KEY
   delete process.env.KIMI_API_KEY
+  delete process.env.DLL_AGENT_KIMI_API_KEY
   delete process.env.OPENAI_API_KEY
+  delete process.env.DLL_AGENT_OPENAI_API_KEY
+  delete process.env.MIMO_API_KEY
+  delete process.env.DLL_AGENT_MIMO_API_KEY
 })
 
 // Helper: write a config file
@@ -153,39 +166,27 @@ describe("built-in defaults", () => {
 // =============================================================================
 describe("global override", () => {
   test("global override takes priority over built-in defaults", () => {
-    // os.homedir() cannot be mocked in Bun, so we save/restore the real
-    // config file around the test to isolate it.
-    const realPath = path.join(os.homedir(), ".dll-agent", "config", "role-models.jsonc")
-    const bakPath = realPath + ".test-bak"
+    writeJsonc(realGlobalPath, {
+      version: 1,
+      roles: {
+        commander: { primary: "openai/gpt-5.5-pro", enabled: true },
+        "requirements-inspector": { primary: "mimo/mimo-v2.5-pro", enabled: true },
+      },
+    })
 
-    if (fs.existsSync(realPath)) fs.renameSync(realPath, bakPath)
+    // Resolve without project/session → global tier
+    const commander = registry.resolveRoleModel("commander")
+    expect(commander.primary).toBe("openai/gpt-5.5-pro")
+    expect(commander.source).toBe("global")
 
-    try {
-      writeJsonc(realPath, {
-        version: 1,
-        roles: {
-          commander: { primary: "openai/gpt-5.5-pro", enabled: true },
-          "requirements-inspector": { primary: "mimo/mimo-v2.5-pro", enabled: true },
-        },
-      })
+    const inspector = registry.resolveRoleModel("requirements-inspector")
+    expect(inspector.primary).toBe("mimo/mimo-v2.5-pro")
+    expect(inspector.source).toBe("global")
 
-      // Resolve without project/session → global tier
-      const commander = registry.resolveRoleModel("commander")
-      expect(commander.primary).toBe("openai/gpt-5.5-pro")
-      expect(commander.source).toBe("global")
-
-      const inspector = registry.resolveRoleModel("requirements-inspector")
-      expect(inspector.primary).toBe("mimo/mimo-v2.5-pro")
-      expect(inspector.source).toBe("global")
-
-      // Non-overridden role still uses built-in
-      const ce = registry.resolveRoleModel("chief-engineer")
-      expect(ce.primary).toBe("deepseek/deepseek-v4-pro")
-      expect(ce.source).toBe("built-in")
-    } finally {
-      if (fs.existsSync(realPath)) fs.unlinkSync(realPath)
-      if (fs.existsSync(bakPath)) fs.renameSync(bakPath, realPath)
-    }
+    // Non-overridden role still uses built-in
+    const ce = registry.resolveRoleModel("chief-engineer")
+    expect(ce.primary).toBe("deepseek/deepseek-v4-pro")
+    expect(ce.source).toBe("built-in")
   })
 })
 
@@ -320,9 +321,13 @@ describe("provider availability", () => {
   test("provider missing produces unavailable status, no crash", () => {
     // Ensure no API keys set
     delete process.env.DEEPSEEK_API_KEY
+    delete process.env.DLL_AGENT_DEEPSEEK_API_KEY
     delete process.env.OPENAI_API_KEY
+    delete process.env.DLL_AGENT_OPENAI_API_KEY
     delete process.env.ZAI_API_KEY
+    delete process.env.DLL_AGENT_ZAI_API_KEY
     delete process.env.KIMI_API_KEY
+    delete process.env.DLL_AGENT_KIMI_API_KEY
 
     const result = registry.resolveRoleModel("commander")
     // Should still return a valid result, not crash
@@ -422,6 +427,7 @@ describe("doctorCheck", () => {
     process.env.ZAI_API_KEY = "sk-test"
     process.env.KIMI_API_KEY = "sk-test"
     process.env.OPENAI_API_KEY = "sk-test"
+    process.env.MIMO_API_KEY = "sk-test"
 
     const issues = registry.doctorCheck()
     expect(issues.length).toBe(0)
@@ -430,13 +436,18 @@ describe("doctorCheck", () => {
     delete process.env.ZAI_API_KEY
     delete process.env.KIMI_API_KEY
     delete process.env.OPENAI_API_KEY
+    delete process.env.MIMO_API_KEY
   })
 
   test("warns when provider keys are missing", () => {
     delete process.env.DEEPSEEK_API_KEY
+    delete process.env.DLL_AGENT_DEEPSEEK_API_KEY
     delete process.env.ZAI_API_KEY
+    delete process.env.DLL_AGENT_ZAI_API_KEY
     delete process.env.KIMI_API_KEY
+    delete process.env.DLL_AGENT_KIMI_API_KEY
     delete process.env.OPENAI_API_KEY
+    delete process.env.DLL_AGENT_OPENAI_API_KEY
 
     const issues = registry.doctorCheck()
     // Should have warnings for each active role with missing provider key

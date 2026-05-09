@@ -36,7 +36,14 @@ import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { enabled as profileEnabled, autoAllowAll as profileAutoAllow, quality as profileQuality, verify as profileVerify, roleRoster as profileRoleRoster, roleCommands as profileRoleCommands, systemPrompt as profileSystemPrompt, writeEvidence as profileWriteEvidence } from "@/dll-agent/profile"
-import { resolveMainModel } from "@/dll-agent/role-model-registry"
+import {
+  isDllRole,
+  listRoleModels,
+  resolveRoleModel,
+  setRoleModelOverride,
+  validateRoleModel,
+  type DllRole,
+} from "@/dll-agent/role-model-registry"
 import { decide as supervisorDecide, updateState as supervisorUpdateState, loadState as supervisorLoadState, saveState as supervisorSaveState, isCooldown as supervisorIsCooldown, recordReviewerCall, generateSubtasks, buildVerifierSubtask, buildTaskCompletionSubtask, markReviewerCompleted, setQueuedReviewers, setRunningReviewers, isReadOnlyReviewer, reviewerRuntimeMs as getReviewerRuntimeMs, modelContextLimit } from "@/dll-agent/supervisor"
 import { checkEvidenceGate, checkReconciliationGate, isGateRetryExhausted, buildGateBlockSummary } from "@/dll-agent/gates"
 import { checkCap as checkCostCap, trackLastCall } from "@/dll-agent/cost-cap"
@@ -577,7 +584,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
       const { task: taskTool } = yield* registry.named()
-      const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
+      const taskRole = profileEnabled() ? roleForAgent(task.agent) : undefined
+      const resolvedTaskModel = taskRole
+        ? yield* resolveEffectiveRoleModel({
+            role: taskRole,
+            sessionID,
+            projectDir: ctx.worktree,
+            triggerReason: "subtask effective role model",
+          })
+        : undefined
+      const taskModel = resolvedTaskModel
+        ? yield* getModel(resolvedTaskModel.providerID, resolvedTaskModel.modelID, sessionID)
+        : task.model
+          ? yield* getModel(task.model.providerID, task.model.modelID, sessionID)
+          : model
       const assistantMessage: MessageV2.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
         role: "assistant",
@@ -787,10 +807,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               throw error
             }
             let model = input.model ?? agent.model ?? (yield* lastModel(input.sessionID))
-            // When dll-agent is enabled, the role-model registry is the single source of truth
-            if (profileEnabled()) {
-              const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
-              model = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+            const role = profileEnabled() ? roleForAgent(agent.name) : undefined
+            if (role) {
+              model = yield* resolveEffectiveRoleModel({
+                role,
+                sessionID: input.sessionID,
+                projectDir: ctx.worktree,
+                explicitModel: input.model,
+                triggerReason: input.model ? "explicit TUI/session model selection" : "shell effective role model",
+              })
             }
             const userMsg: MessageV2.User = {
               id: input.messageID ?? MessageID.ascending(),
@@ -949,15 +974,90 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return yield* Effect.failCause(exit.cause)
     })
 
+    function modelToString(model: { providerID: ProviderID; modelID: ModelID }) {
+      return `${model.providerID}/${model.modelID}`
+    }
+
+    function roleForAgent(agentName: string): DllRole | undefined {
+      if (isDllRole(agentName)) return agentName
+      if (agentName === "build" || agentName === "plan") return "commander"
+      return undefined
+    }
+
+    const resolveEffectiveRoleModel = Effect.fn("SessionPrompt.resolveEffectiveRoleModel")(function* (input: {
+      role: DllRole
+      sessionID: SessionID
+      projectDir?: string
+      explicitModel?: { providerID: ProviderID; modelID: ModelID }
+      triggerReason: string
+    }) {
+      if (input.explicitModel) {
+        const explicit = modelToString(input.explicitModel)
+        const validation = validateRoleModel(explicit)
+        if (validation.valid) {
+          setRoleModelOverride(input.role, explicit, "session", input.sessionID, input.projectDir)
+        }
+      }
+
+      const effective = resolveRoleModel(input.role, input.sessionID, input.projectDir)
+      const candidates = [effective.primary, ...effective.fallback]
+      for (const candidate of candidates) {
+        const parsed = Provider.parseModel(candidate)
+        const exit = yield* provider.getModel(parsed.providerID, parsed.modelID).pipe(Effect.exit)
+        if (Exit.isSuccess(exit)) {
+          const selected = { providerID: parsed.providerID, modelID: parsed.modelID }
+          evidenceWrite(
+            "model.routing_decision",
+            {
+              task_id: input.sessionID,
+              role: input.role,
+              selected_model: modelToString(selected),
+              candidate_models: candidates,
+              risk_level: "low",
+              trigger_reason: input.triggerReason,
+              skipped_reviewers: [],
+              skip_reason: null,
+              correctness_reason: "effective role model resolved and provider-validated",
+              cost_reason: null,
+              evidence_refs: [],
+              fallback_reason: candidate === effective.primary ? null : `primary unavailable: ${effective.primary}`,
+              whether_required_for_correctness: true,
+              source: effective.source,
+            },
+            input.sessionID,
+          )
+          return selected
+        }
+      }
+
+      const fallback = yield* provider.defaultModel()
+      yield* getModel(fallback.providerID, fallback.modelID, input.sessionID)
+      evidenceWrite(
+        "model.routing_decision",
+        {
+          task_id: input.sessionID,
+          role: input.role,
+          selected_model: modelToString(fallback),
+          candidate_models: candidates,
+          risk_level: "low",
+          trigger_reason: input.triggerReason,
+          skipped_reviewers: [],
+          skip_reason: null,
+          correctness_reason: "role model candidates unavailable; Provider default model validated as final fallback",
+          cost_reason: null,
+          evidence_refs: [],
+          fallback_reason: "all role model candidates failed Provider.Service.getModel",
+          whether_required_for_correctness: true,
+          source: "provider-default",
+        },
+        input.sessionID,
+      )
+      return fallback
+    })
+
     const lastModel = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
-      // When dll-agent is enabled, commander role-model is the single source of truth
-      if (profileEnabled()) {
-        const ctx = yield* InstanceState.context
-        const cmdr = resolveMainModel(sessionID, ctx.worktree)
-        return { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
-      }
       return yield* provider.defaultModel()
     })
 
@@ -973,12 +1073,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
 
       let model = input.model ?? ag.model ?? (yield* lastModel(input.sessionID))
-      // When dll-agent is enabled, the role-model registry is the single source of truth
-      // for model selection — the commander's model overrides all automatic paths
-      if (profileEnabled()) {
+      const role = profileEnabled() ? roleForAgent(ag.name) : undefined
+      if (role) {
         const ctx = yield* InstanceState.context
-        const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
-        model = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+        model = yield* resolveEffectiveRoleModel({
+          role,
+          sessionID: input.sessionID,
+          projectDir: ctx.worktree,
+          explicitModel: input.model,
+          triggerReason: input.model ? "explicit TUI/session model selection" : "prompt effective role model",
+        })
       }
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
@@ -1415,6 +1519,117 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       return { info, parts }
     }, Effect.scoped)
+
+    const roleModelCommandResponse = Effect.fn("SessionPrompt.roleModelCommandResponse")(function* (
+      input: CommandInput,
+      text: string,
+    ) {
+      const ctx = yield* InstanceState.context
+      const model = yield* resolveEffectiveRoleModel({
+        role: "commander",
+        sessionID: input.sessionID,
+        projectDir: ctx.worktree,
+        triggerReason: "local role-model command response",
+      })
+      const userMsg: MessageV2.User = {
+        id: input.messageID ?? MessageID.ascending(),
+        sessionID: input.sessionID,
+        time: { created: Date.now() },
+        role: "user",
+        agent: input.agent ?? "commander",
+        model: { providerID: model.providerID, modelID: model.modelID },
+      }
+      yield* sessions.updateMessage(userMsg)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: userMsg.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}`,
+      } satisfies MessageV2.TextPart)
+
+      const assistant: MessageV2.Assistant = {
+        id: MessageID.ascending(),
+        sessionID: input.sessionID,
+        parentID: userMsg.id,
+        mode: "commander",
+        agent: "commander",
+        cost: 0,
+        path: { cwd: ctx.directory, root: ctx.worktree },
+        time: { created: Date.now(), completed: Date.now() },
+        role: "assistant",
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: model.modelID,
+        providerID: model.providerID,
+      }
+      yield* sessions.updateMessage(assistant)
+      const part: MessageV2.TextPart = {
+        id: PartID.ascending(),
+        messageID: assistant.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text,
+      }
+      yield* sessions.updatePart(part)
+      yield* bus.publish(Command.Event.Executed, {
+        name: input.command,
+        sessionID: input.sessionID,
+        arguments: input.arguments,
+        messageID: assistant.id,
+      })
+      return { info: assistant, parts: [part] }
+    })
+
+    function parseRoleModelSetArgs(args: string) {
+      const tokens = args.match(argsRegex)?.map((arg) => arg.replace(quoteTrimRegex, "")) ?? []
+      const role = tokens[0]
+      const model = tokens[1]
+      const scopeIndex = tokens.indexOf("--scope")
+      const scope = scopeIndex >= 0 ? tokens[scopeIndex + 1] : "session"
+      return { role, model, scope }
+    }
+
+    const handleLocalRoleModelCommand = Effect.fn("SessionPrompt.handleLocalRoleModelCommand")(function* (
+      input: CommandInput,
+    ) {
+      const ctx = yield* InstanceState.context
+      if (input.command === "role-models") {
+        const rows = listRoleModels(input.sessionID, ctx.worktree).map((item) => {
+          const fallback = item.fallback.length ? item.fallback.join(" -> ") : "-"
+          const availability = item.providerAvailable ? "hint=configured" : "hint=unknown_or_missing"
+          return `- ${item.role}: ${item.primary} | source=${item.source} | fallback=${fallback} | enabled=${item.enabled} | ${availability}`
+        })
+        return yield* roleModelCommandResponse(input, ["dll-agent role models:", ...rows].join("\n"))
+      }
+
+      if (input.command !== "role-model-set") return undefined
+
+      const parsed = parseRoleModelSetArgs(input.arguments)
+      if (!parsed.role || !isDllRole(parsed.role)) {
+        return yield* roleModelCommandResponse(input, "Usage: /role-model-set <role> <provider/model> [--scope session|project|global]")
+      }
+      if (!parsed.model || !validateRoleModel(parsed.model).valid) {
+        return yield* roleModelCommandResponse(input, "Invalid model. Expected provider/model.")
+      }
+      if (parsed.scope !== "session" && parsed.scope !== "project" && parsed.scope !== "global") {
+        return yield* roleModelCommandResponse(input, "Invalid scope. Expected session, project, or global.")
+      }
+
+      const model = Provider.parseModel(parsed.model)
+      yield* getModel(model.providerID, model.modelID, input.sessionID)
+      const change = setRoleModelOverride(parsed.role, parsed.model, parsed.scope, input.sessionID, ctx.worktree)
+      if (!change) return yield* roleModelCommandResponse(input, `Failed to write ${parsed.scope} override for ${parsed.role}.`)
+      const effective = resolveRoleModel(parsed.role, input.sessionID, ctx.worktree)
+      return yield* roleModelCommandResponse(
+        input,
+        [
+          `Updated ${parsed.role} model.`,
+          `previous=${change.previousPrimary}`,
+          `current=${effective.primary}`,
+          `source=${effective.source}`,
+        ].join("\n"),
+      )
+    })
 
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
@@ -2476,6 +2691,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* elog.info("command", { sessionID: input.sessionID, command: input.command, agent: input.agent })
+      if (profileEnabled() && (input.command === "role-models" || input.command === "role-model-set")) {
+        const local = yield* handleLocalRoleModelCommand(input)
+        if (local) return local
+      }
       const cmd = yield* commands.get(input.command)
       if (!cmd) {
         const available = (yield* commands.list()).map((c) => c.name)
@@ -2525,7 +2744,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
       template = template.trim()
 
-      const taskModel = yield* Effect.gen(function* () {
+      let taskModel = yield* Effect.gen(function* () {
         if (cmd.model) return Provider.parseModel(cmd.model)
         if (cmd.agent) {
           const cmdAgent = yield* agents.get(cmd.agent)
@@ -2534,12 +2753,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         if (input.model) return Provider.parseModel(input.model)
         return yield* lastModel(input.sessionID)
       })
-      // When dll-agent is enabled, the role-model registry is the single source of truth
       let resolvedModel = taskModel
       if (profileEnabled()) {
         const ctx = yield* InstanceState.context
-        const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
-        resolvedModel = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+        const role = roleForAgent(agentName)
+        if (role) {
+          resolvedModel = yield* resolveEffectiveRoleModel({
+            role,
+            sessionID: input.sessionID,
+            projectDir: ctx.worktree,
+            explicitModel: input.model ? Provider.parseModel(input.model) : undefined,
+            triggerReason: input.model ? "explicit command model selection" : "command effective role model",
+          })
+          taskModel = resolvedModel
+        }
       }
 
       yield* getModel(resolvedModel.providerID, resolvedModel.modelID, input.sessionID)
@@ -2562,18 +2789,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               agent: agent.name,
               description: cmd.description ?? "",
               command: input.command,
-              model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
+              model: { providerID: resolvedModel.providerID, modelID: resolvedModel.modelID },
               prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
             },
           ]
         : [...templateParts, ...(input.parts ?? [])]
 
       const userAgent = isSubtask ? (input.agent ?? (yield* agents.defaultAgent())) : agentName
-      const userModel = isSubtask
-        ? input.model
-          ? Provider.parseModel(input.model)
-          : yield* lastModel(input.sessionID)
-        : taskModel
+      const userModel = resolvedModel
 
       yield* plugin.trigger(
         "command.execute.before",

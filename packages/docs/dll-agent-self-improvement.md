@@ -94,14 +94,30 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 
 ### role-model-registry.ts (NEW — Phase 8)
 统一 Role Model Registry：所有 dll-agent 角色的模型来源走同一个解析逻辑。
-- 三层覆盖：session override > project override > global override > built-in default
+- 覆盖顺序：TUI/`/role-model-set` explicit session override > session override > project override > global override > built-in default > Provider default fallback
 - 支持 11 个角色（含 3 个 future role）
 - Fallback chain 解析：primary 不可用时自动使用 fallback
-- Provider 可用性检测（API key env var check）
+- Provider 可用性 hint（API key env var check，仅诊断；最终以 OpenCode Provider.Service 为准）
 - Voice/TTS 模型 guard（禁止用于 coding role）
 - 配置冲突检测（global + project 同时定义同一角色）
 - 所有模型变更写入 evidence
 **代码模式**: ✅ flat exports。
+
+### Correctness-Aware Model Routing Policy (P1)
+模型路由目标不是单纯少调用模型，而是在用户目标完成、正确性、evidence 充分性和安全边界优先的前提下，拦截重复、过期、无证据、无触发条件、低价值的模型调用。
+- 普通低风险任务默认 commander 单独执行。
+- 用户纠偏必须触发 requirements-inspector。
+- repeated failure 必须升级 chief-engineer / role-cross。
+- final claim 缺 evidence 必须触发 final gate / verifier；高风险 final claim 可触发 final-auditor。
+- high-risk provider/routing/gate/evidence/permission 修改允许 2-3 个必要 reviewer，不受低风险默认 1 reviewer 限制。
+- 每次 commander/reviewer/subtask/fallback/skipped reviewer 都写 `model.routing_decision` evidence，包含 correctness_reason 与 cost_reason。
+
+### Provider request normalization (P0)
+`reasoningEffort` 的最终兜底在 `session/llm.ts` 合并 model/agent/variant options 后执行，再进入 `ProviderTransform.providerOptions()`。
+- provider/model 支持 `max` 时保留。
+- provider/model 只支持 `low|medium|high` 时 `max -> high`。
+- provider/model 不支持 reasoning effort 时删除该字段。
+- registry 或 wrapper 仍带 `max` 时也不会发送非法 `reasoning_effort=max`。
 
 ## 实现状态
 

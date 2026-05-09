@@ -24,21 +24,26 @@ import fs from "fs"
 import path from "path"
 import os from "os"
 
-const testDir = path.join(os.homedir(), ".dll-agent", "test-multimodal")
+const configRoot = path.join(os.tmpdir(), `dll-agent-multimodal-config-${process.pid}`)
+process.env.DLL_AGENT_CONFIG_ROOT = configRoot
+
+const testDir = path.join(os.tmpdir(), `dll-agent-multimodal-${process.pid}`)
 const sessionDir = path.join(testDir, "sessions", "test-multimodal-session")
 
 beforeEach(() => {
   if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true })
+  if (fs.existsSync(configRoot)) fs.rmSync(configRoot, { recursive: true })
+  process.env.DLL_AGENT_CONFIG_ROOT = configRoot
   fs.mkdirSync(sessionDir, { recursive: true })
 })
 
-  afterEach(() => {
-    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true })
-    // Also clean canonical session dir used by savePacket/loadPackets
-    const canonicalDir = path.join(os.homedir(), ".dll-agent", "sessions", "test-multimodal-session")
-    if (fs.existsSync(canonicalDir)) fs.rmSync(canonicalDir, { recursive: true })
-    delete process.env.MIMO_API_KEY
-  })
+afterEach(() => {
+  if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true })
+  if (fs.existsSync(configRoot)) fs.rmSync(configRoot, { recursive: true })
+  delete process.env.DLL_AGENT_CONFIG_ROOT
+  delete process.env.MIMO_API_KEY
+  delete process.env.DLL_AGENT_MIMO_API_KEY
+})
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
@@ -399,11 +404,13 @@ describe("dedup and stale detection", () => {
 describe("provider availability", () => {
   test("MiMo shows unavailable when MIMO_API_KEY missing", () => {
     delete process.env.MIMO_API_KEY
+    delete process.env.DLL_AGENT_MIMO_API_KEY
     const effective = registry.resolveRoleModel("multimodal-context-interpreter")
     expect(effective.providerAvailable).toBe(false)
   })
 
   test("MiMo shows available when MIMO_API_KEY present", () => {
+    delete process.env.DLL_AGENT_MIMO_API_KEY
     process.env.MIMO_API_KEY = "sk-test-mimo-key"
     const effective = registry.resolveRoleModel("multimodal-context-interpreter")
     expect(effective.providerAvailable).toBe(true)
