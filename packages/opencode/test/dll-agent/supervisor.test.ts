@@ -3,6 +3,8 @@ import os from "os"
 import path from "path"
 import { afterEach, describe, expect, test } from "bun:test"
 import { buildVerifierSubtask, pickVerifierAgent, decide, recordReviewerCall, markReviewerCompleted, isReadOnlyReviewer, updateState, buildFinalReportContext, loadCooldown, loadState, modelContextLimit, buildTaskCompletionSubtask, saveState, setQueuedReviewers, setRunningReviewers } from "../../src/dll-agent/supervisor"
+import { finalGate } from "../../src/dll-agent/gates"
+import { writeRoutingEvidence } from "../../src/dll-agent/routing-evidence"
 import type { MessageV2 } from "../../src/session/message-v2"
 
 const cleanupSessions: string[] = []
@@ -737,5 +739,86 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
     expect(entries.length).toBeGreaterThan(0)
     expect(entries[0].payload.correctness_reason).toBeTruthy()
     expect("cost_reason" in entries[0].payload).toBe(true)
+  })
+
+  test("ordinary short task writes commander_only routing evidence", () => {
+    const evidence = useEvidenceFile("routing-commander-only")
+    const sid = sessionID("routing_commander_only")
+    const decision = decide([userMsg("msg_user_short", "查看 git status")], sid, 1)
+    expect(decision.reviewers).toEqual([])
+    const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
+    expect(entries.some((entry) => entry.payload.action === "commander_only")).toBe(true)
+    expect(entries.find((entry) => entry.payload.action === "commander_only")?.payload.role).toBe("commander")
+  })
+
+  test("high-risk provider/routing/gate task allows multiple reviewers", () => {
+    const sid = sessionID("routing_high_risk_governance")
+    const decision = decide([
+      userMsg("msg_user_high_risk", "修改 provider routing gate evidence result ledger permission 相关逻辑，必须严格验证。"),
+    ], sid, 1)
+    expect(decision.reviewers.length).toBeGreaterThan(1)
+    expect(decision.reviewers).toContain("requirements-inspector")
+    expect(decision.reviewers).toContain("chief-engineer")
+    expect(decision.metrics.high_risk_task_signal).toBe(true)
+  })
+
+  test("correctness-required skipped reviewer writes unresolved routing risk and final gate blocks", () => {
+    const evidence = useEvidenceFile("routing-risk")
+    const sid = sessionID("routing_unresolved_risk")
+    writeRoutingEvidence({
+      sessionID: sid,
+      taskID: sid,
+      role: "final-auditor",
+      selectedModel: "openai/gpt-5.5-pro",
+      candidateModels: ["openai/gpt-5.5-pro"],
+      riskLevel: "high",
+      triggerReason: "high-risk final claim without verification evidence",
+      skippedReviewers: ["final-auditor"],
+      skipReason: "correctness_aware_routing_budget",
+      correctnessReason: "correctness-required final auditor was skipped by budget and remains unresolved",
+      costReason: "budget cap",
+      evidenceRefs: ["gate:final"],
+      requiredForCorrectness: true,
+    })
+    const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
+    expect(entries[0].payload.unresolved_routing_risk).toBe(true)
+    expect(entries[0].payload.skipped_reviewer_details[0].correctness_required).toBe(true)
+    const result = finalGate({
+      evidenceGate: {
+        passed: true,
+        needs_evidence: false,
+        needs_review: false,
+        block_reason: null,
+        synthetic_hint: null,
+      },
+      supervisorState: {
+        version: 1,
+        phase: "default",
+        risk: "high",
+        required_reviews: [],
+        completed_reviews: [],
+        blocked_completion: false,
+        block_reason: null,
+        reviewer_conflict: false,
+        metrics: {
+          tool_failures: 0,
+          permission_denied: 0,
+          user_corrections: 0,
+          context_percent: 0,
+          context_tokens: 0,
+          final_claim: true,
+          verification_evidence: true,
+          reviewer_conflict_signal: false,
+          repeated_tool_failure: false,
+          real_tool_evidence: true,
+        },
+        updated_at: new Date().toISOString(),
+      },
+      reconciliationConflicts: [],
+      costExceeded: false,
+      sessionID: sid,
+    })
+    expect(result.allowed).toBe(false)
+    expect(result.reasons.join("\n")).toContain("correctness-required reviewer skipped")
   })
 })

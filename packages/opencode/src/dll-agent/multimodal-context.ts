@@ -202,10 +202,211 @@ export function writeMultimodalEvidence(
     model?: string
     overall_confidence?: MultimodalConfidence
     context_sufficient?: boolean
+    context_packet_id?: string | null
+    result_packet_id?: string
+    structured_output_missing?: boolean
+    validation_issues?: string[]
   },
   sessionID?: string,
 ) {
   writeEvidence(type, payload, sessionID)
+}
+
+// ─── Reviewer output normalization ─────────────────────────────────────────
+
+const INPUT_TYPES: MultimodalInputType[] = [
+  "screenshot",
+  "image",
+  "webpage_visual",
+  "ppt_figure",
+  "chart",
+  "flowchart",
+  "video",
+  "audio",
+  "ui",
+  "document_visual",
+]
+
+const CONFIDENCES: MultimodalConfidence[] = ["low", "medium", "high"]
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function stringField(record: Record<string, unknown>, key: string, fallback = "") {
+  const value = record[key]
+  return typeof value === "string" ? redactMultimodalContent(value) : fallback
+}
+
+function nullableStringField(record: Record<string, unknown>, key: string) {
+  const value = record[key]
+  if (value === null || value === undefined) return null
+  return typeof value === "string" ? redactMultimodalContent(value) : null
+}
+
+function stringArrayField(record: Record<string, unknown>, key: string) {
+  const value = record[key]
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === "string").map((item) => redactMultimodalContent(item))
+}
+
+function confidenceField(record: Record<string, unknown>, key: string, fallback: MultimodalConfidence) {
+  const value = record[key]
+  return typeof value === "string" && CONFIDENCES.includes(value as MultimodalConfidence)
+    ? value as MultimodalConfidence
+    : fallback
+}
+
+function inputTypeField(record: Record<string, unknown>) {
+  const value = record.input_type
+  return typeof value === "string" && INPUT_TYPES.includes(value as MultimodalInputType)
+    ? value as MultimodalInputType
+    : "image"
+}
+
+function observationsField(record: Record<string, unknown>) {
+  const value = record.observations
+  if (!Array.isArray(value)) return []
+  return value.filter(isRecord).map((item) => {
+    const category = stringField(item, "category", "other")
+    return {
+      description: stringField(item, "description", "No description supplied."),
+      category: (
+        ["text_content", "visual_layout", "error", "warning", "structure", "data", "other"].includes(category)
+          ? category
+          : "other"
+      ) as MultimodalObservation["category"],
+      confidence: confidenceField(item, "confidence", "low"),
+    }
+  })
+}
+
+function extractJsonCandidate(rawText: string) {
+  const fenced = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)
+  if (fenced?.[1]) return fenced[1]
+  const start = rawText.indexOf("{")
+  const end = rawText.lastIndexOf("}")
+  if (start >= 0 && end > start) return rawText.slice(start, end + 1)
+  return rawText
+}
+
+function redactedPacket(packet: MultimodalContextPacket): MultimodalContextPacket {
+  return {
+    ...packet,
+    user_goal: redactMultimodalContent(packet.user_goal),
+    source_ref: redactMultimodalContent(packet.source_ref),
+    task_relevance: redactMultimodalContent(packet.task_relevance),
+    observations: packet.observations.map((observation) => ({
+      ...observation,
+      description: redactMultimodalContent(observation.description),
+    })),
+    detected_text: packet.detected_text ? redactMultimodalContent(packet.detected_text) : null,
+    visual_structure: packet.visual_structure ? redactMultimodalContent(packet.visual_structure) : null,
+    errors_or_warnings: packet.errors_or_warnings.map((item) => redactMultimodalContent(item)),
+    important_details: packet.important_details.map((item) => redactMultimodalContent(item)),
+    uncertainties: packet.uncertainties.map((item) => redactMultimodalContent(item)),
+    evidence_refs: packet.evidence_refs.map((item) => redactMultimodalContent(item)),
+    redaction_status: "redacted",
+  }
+}
+
+export function parseMultimodalPacketOutput(rawText: string, input: {
+  sessionID?: string
+  model: string
+  fallbackUserGoal: string
+  fallbackEvidenceRefs?: string[]
+}): MultimodalContextPacket | null {
+  try {
+    const parsed = JSON.parse(extractJsonCandidate(rawText)) as unknown
+    if (!isRecord(parsed) || parsed.packet_type !== "multimodal_context_packet") return null
+    return redactedPacket({
+      packet_type: "multimodal_context_packet",
+      packet_id: stringField(parsed, "packet_id", makePacketId(input.sessionID)),
+      source_hash: stringField(parsed, "source_hash", hashSource({ content: rawText })),
+      role: "multimodal-context-interpreter",
+      model: stringField(parsed, "model", input.model),
+      input_type: inputTypeField(parsed),
+      user_goal: stringField(parsed, "user_goal", input.fallbackUserGoal),
+      source_ref: stringField(parsed, "source_ref", "multimodal-subtask-output"),
+      task_relevance: stringField(parsed, "task_relevance", "non-text input context for the current task"),
+      observations: observationsField(parsed),
+      detected_text: nullableStringField(parsed, "detected_text"),
+      visual_structure: nullableStringField(parsed, "visual_structure"),
+      errors_or_warnings: stringArrayField(parsed, "errors_or_warnings"),
+      important_details: stringArrayField(parsed, "important_details"),
+      uncertainties: stringArrayField(parsed, "uncertainties"),
+      overall_confidence: confidenceField(parsed, "overall_confidence", "low"),
+      context_sufficient: parsed.context_sufficient === true,
+      recommended_next_role: nullableStringField(parsed, "recommended_next_role"),
+      evidence_refs: [
+        ...stringArrayField(parsed, "evidence_refs"),
+        ...(input.fallbackEvidenceRefs ?? []),
+      ],
+      redaction_status: parsed.redaction_status === "redacted" ? "redacted" : "none",
+      created_at: stringField(parsed, "created_at", new Date().toISOString()),
+      stale: parsed.stale === true,
+      invalidation_reason: nullableStringField(parsed, "invalidation_reason") ?? undefined,
+    })
+  } catch {
+    return null
+  }
+}
+
+export function normalizeMultimodalPacketOutput(input: {
+  rawText?: string
+  sessionID?: string
+  model: string
+  fallbackUserGoal: string
+  contextPacketID?: string
+  evidenceRefs?: string[]
+}) {
+  const rawText = input.rawText ?? ""
+  const parsed = rawText ? parseMultimodalPacketOutput(rawText, {
+    sessionID: input.sessionID,
+    model: input.model,
+    fallbackUserGoal: input.fallbackUserGoal,
+    fallbackEvidenceRefs: input.evidenceRefs,
+  }) : null
+  if (parsed) {
+    const validation = validatePacket(parsed)
+    return {
+      packet: parsed,
+      structuredOutputMissing: false,
+      valid: validation.valid,
+      validationIssues: validation.issues,
+    }
+  }
+
+  const summary = redactMultimodalContent(rawText.replace(/\s+/g, " ").slice(0, 800))
+  const packet = buildMultimodalPacket({
+    sessionID: input.sessionID,
+    model: input.model,
+    inputType: "image",
+    userGoal: input.fallbackUserGoal,
+    sourceRef: input.contextPacketID ? `context_handoff:${input.contextPacketID}` : "multimodal-subtask-output",
+    sourceHash: hashSource({ content: rawText || input.fallbackUserGoal }),
+    taskRelevance: "fallback packet for an unstructured multimodal reviewer output",
+    observations: [{
+      description: summary || "Multimodal reviewer did not return a structured packet.",
+      category: "warning",
+      confidence: "low",
+    }],
+    detectedText: null,
+    visualStructure: null,
+    errorsOrWarnings: ["structured multimodal_context_packet missing"],
+    importantDetails: [],
+    uncertainties: ["raw multimodal reviewer output could not be parsed as structured JSON"],
+    overallConfidence: "low",
+    contextSufficient: false,
+    recommendedNextRole: "commander",
+    evidenceRefs: input.evidenceRefs ?? [],
+  })
+  return {
+    packet: redactedPacket(packet),
+    structuredOutputMissing: true,
+    valid: false,
+    validationIssues: ["structured multimodal_context_packet missing"],
+  }
 }
 
 // ─── Session-level storage ─────────────────────────────────────────────────

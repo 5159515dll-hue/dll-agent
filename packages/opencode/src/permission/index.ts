@@ -179,6 +179,7 @@ export const layer = Layer.effect(
 
     const ask = Effect.fn("Permission.ask")(function* (input: AskInput) {
       const { approved, pending } = yield* InstanceState.get(state)
+      const instance = yield* InstanceState.context
       const { ruleset, ...request } = input
 
       // dll-agent risk-based pre-check: auto-allow low-risk, gate high-risk
@@ -187,6 +188,8 @@ export const layer = Layer.effect(
         patterns: [...request.patterns],
         metadata: request.metadata as Record<string, unknown> | undefined,
         sessionID: request.sessionID,
+        projectRoot: instance.worktree,
+        cwd: instance.worktree,
       })
       if (preCheck.intercepted && preCheck.action === "allow") {
         log.info("dll-agent auto-approved", {

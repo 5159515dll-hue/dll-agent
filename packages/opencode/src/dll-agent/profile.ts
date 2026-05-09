@@ -93,7 +93,8 @@ export function modeSummary() {
       "cross-review", "team-review",
       "role-models", "role-model-set",
       "multimodal-context",
-      "capability-status",
+      "capability-status", "task-trajectory", "model-usage", "routing-report",
+      "doctor-next", "regression-status",
     ],
     subagents: ["chief-engineer", "requirements-inspector", "long-context-archivist", "final-auditor", "role-cross", "multimodal-context-interpreter"],
   }
@@ -137,6 +138,36 @@ export function roleCommands() {
       agent: "commander",
       template:
         "Direct local command handled by dll-agent runtime. It must render current task status without making an LLM call.",
+    },
+    "task-trajectory": {
+      description: "显示当前任务的只读 flight recorder / trajectory evidence 摘要。",
+      agent: "commander",
+      template:
+        "Direct local command handled by dll-agent runtime. It must render task trajectory without making an LLM call.",
+    },
+    "model-usage": {
+      description: "显示当前 session 的模型使用、成本估算和 routing 决策摘要。",
+      agent: "commander",
+      template:
+        "Direct local command handled by dll-agent runtime. It must render model usage without making an LLM call.",
+    },
+    "routing-report": {
+      description: "显示 correctness-aware routing 决策、跳过 reviewer 原因和 unresolved risk。",
+      agent: "commander",
+      template:
+        "Direct local command handled by dll-agent runtime. It must render routing evidence without making an LLM call.",
+    },
+    "doctor-next": {
+      description: "把 doctor warn/fail 转成下一步动作建议，不执行 repair。",
+      agent: "commander",
+      template:
+        "Direct local command handled by dll-agent runtime. It must render doctor next actions without making an LLM call.",
+    },
+    "regression-status": {
+      description: "显示 20 个核心 regression scenario 的 not_run/passed/failed/partial/blocked 状态。",
+      agent: "commander",
+      template:
+        "Direct local command handled by dll-agent runtime. It must render regression scenario status without making an LLM call.",
     },
     "permissions": {
       description: "切换 dll-agent 权限模式。用法：/permissions [default|auto-review|full-access]",
@@ -292,7 +323,7 @@ export function systemPrompt() {
     "The UI may show one active agent, but dll-agent is a role team. The commander should do normal work directly and call real subagents through the task tool when the task is complex, high-risk, stuck, weakly evidenced, or challenged by the user.",
     "Do not call OpenAI for ordinary status, ordinary planning, routine coding, or first-pass answers.",
     "Available subagents: chief-engineer, requirements-inspector, long-context-archivist, final-auditor, role-cross.",
-    "Available role commands: /dll-status, /task-status, /permissions, /quality, /verify, /model-capability, /roles, /chief-engineer, /requirements-check, /context-check, /final-audit, /cross-review, /team-review, /role-models, /role-model-set, /multimodal-context, /capability-status.",
+    "Available role commands: /dll-status, /task-status, /task-trajectory, /model-usage, /routing-report, /doctor-next, /regression-status, /permissions, /quality, /verify, /model-capability, /roles, /chief-engineer, /requirements-check, /context-check, /final-audit, /cross-review, /team-review, /role-models, /role-model-set, /multimodal-context, /capability-status.",
     "Prompting is layered: source-level invariants are short and global; role prompts are role-specific; task packets are phase-specific; evidence packets are retrieved precisely; cross-role packets are temporary and removed after recovery.",
     "Do not feed every instruction to every model. Keep each model focused on its role unless role crossing is explicitly needed for recovery.",
     "",

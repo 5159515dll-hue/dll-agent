@@ -31,7 +31,15 @@ Every completed subtask produces a `ResultPacket`:
   "subtask_goal": "Review by requirements-inspector: Chinese requirement alignment",
   "claimed_result": "Review verdict: pass | Score: 92",
   "completion_status": "VERIFIED_COMPLETE",
-  "files_changed": [],
+  "files_changed": [
+    {
+      "filePath": "packages/opencode/src/dll-agent/result-ledger.ts",
+      "changeSummary": "ResultPacket schema update",
+      "hashAfter": "sha256...",
+      "mtimeMsAfter": 1715155200000,
+      "sizeAfter": 12345
+    }
+  ],
   "artifacts_produced": [],
   "commands_run": [],
   "verification_results": [{"name": "reviewer_score", "status": "passed"}],
@@ -56,8 +64,8 @@ Every completed subtask produces a `ResultPacket`:
 | ResultPacket write | `result-ledger.ts:writeResult()` | Called by `supervisor.ts:markReviewerCompleted()` |
 | ResultPacket query | `result-ledger.ts:queryResults()` | Filterable by role, status, files, timestamp |
 | Results summary | `result-ledger.ts:buildResultsSummary()` | Text block for reviewer context |
-| Sufficiency check | `result-sufficiency-gate.ts:checkResultSufficiency()` | Returns `sufficient/partial/stale/insufficient` verdict; verified results without evidence are downgraded to verification-required |
-| Staleness detection | `result-sufficiency-gate.ts:isResultStale()` + hash check | Time-based, explicit stale/invalidated status, and `files_changed[].hashAfter` mismatch |
+| Sufficiency check | `result-sufficiency-gate.ts:checkResultSufficiency()` | Returns verdict plus dispatch/recovery action: `reuse_existing`, `verify_existing`, `continue_from_existing`, `repair_existing`, `blocked_missing_evidence`, `blocked_stale`, `blocked_context_insufficient`, or `no_existing_result` |
+| Staleness detection | `result-sufficiency-gate.ts:isResultStale()` + file snapshot checks | Time-based, explicit stale/invalidated status, `files_changed[].hashAfter` mismatch, file deletion, and `mtimeMsAfter/sizeAfter` fallback |
 | Deduplication gate | `deduplication-gate.ts:checkDeduplication()` | Returns `redundant/not_redundant` verdict |
 | Dispatch decision | `deduplication-gate.ts:buildDedupDispatchDecision()` | Converts dedup verdict into hard dispatch skip / verify / continue / repair action |
 | Dedup context injection | `deduplication-gate.ts:buildDedupContextSummary()` | Text block for commander/gate hints |
@@ -65,14 +73,15 @@ Every completed subtask produces a `ResultPacket`:
 | Reviewer context enhanced | `supervisor.ts:buildReviewerContext()` | Includes results summary from ledger |
 | Continuation packet populated | `continuation-gate.ts:buildContinuationPacket()` | `already_completed`, `files_involved`, `commands_run` from ledger |
 | Gate/runtime integration | `prompt.ts:gatePendingHints` + final gate loop | Verified duplicate commander completion is blocked until it reuses the existing packet or justifies redo |
-| Final gate ledger requirement | `gates.ts:finalGate()` | Goal Contract sessions cannot claim PASS without a matching verified `ResultPacket` |
+| Final gate ledger requirement | `gates.ts:finalGate()` | Goal Contract sessions cannot claim PASS without a matching verified `ResultPacket`; stale, missing evidence, low-confidence fallback, partial, failed, and blocking reviewer packets are direct blockers |
+| Recovery loop ledger reuse | `recovery-loop.ts:planRecovery()` | Checks Result Ledger before repairing; verified non-stale packets produce `reuse_existing_result`, unverified packets produce `run_verification` |
 | Evidence types | `interfaces.ts:EvidenceRecordType` | `result.produced`, `result.reused`, `result.invalidated`, `result.dedup_blocked`, `result.dedup_allowed`, `result.stale_detected` |
 
 ### ⚠️ Partially Implemented
 
 | Feature | Status | Gap |
 |---------|--------|-----|
-| File-hash staleness | Runtime verified for `hashAfter` | Git index/tree hash comparison is not implemented; current check compares stored packet hash to current file bytes |
+| File-hash staleness | Runtime verified for `hashAfter`, missing file, and mtime/size fallback | Git index/tree hash comparison is not implemented; current check compares stored packet snapshot to current file bytes or stat metadata |
 | Tool-execution dedup | Runtime enforced for reviewer dispatch and final commander completion claims | Individual low-level tool calls are not globally intercepted; enforcement happens before reviewer subtask dispatch and before final completion exits |
 | Cross-session result sharing | Session-scoped | Results only visible within one session |
 
@@ -87,13 +96,24 @@ Every completed subtask produces a `ResultPacket`:
 
 When a model attempts to execute work:
 1. **Result exists + VERIFIED_COMPLETE** → `reuse_existing` (BLOCK re-execution)
-2. **Result exists + VERIFIED_COMPLETE but missing evidence / passed verification** → `verify_existing` (only verify, don't redo)
-3. **Result exists + PARTIAL** → `continue_from_existing` (fill gaps only)
-4. **Result exists + FAILED** → `repair_existing` (redo allowed with diagnosis)
-5. **Result exists + STALE/INVALIDATED** → `redo_allowed` (existing result invalid)
-6. **No result exists** → `no_existing_result` (execute normally)
+2. **Result exists + VERIFIED_COMPLETE but missing evidence** → `blocked_missing_evidence` (collect evidence; don't treat as complete)
+3. **Result exists + UNVERIFIED or verification stale** → `verify_existing` (only verify, don't redo)
+4. **Result exists + PARTIAL** → `continue_from_existing` (fill gaps only)
+5. **Result exists + FAILED** → `repair_existing` (redo allowed with diagnosis)
+6. **Result exists + STALE/hash changed/file deleted** → `blocked_stale` or `redo_allowed` after explicit redo/reverify reason
+7. **No result exists** → `no_existing_result` (execute normally)
 
-For Goal Contract sessions, `finalGate()` also requires a matching `VERIFIED_COMPLETE` result packet before allowing final PASS. Natural-language summaries are not accepted as a substitute for Result Ledger state.
+For Goal Contract sessions, `finalGate()` also requires a matching `VERIFIED_COMPLETE` result packet before allowing final PASS. Natural-language summaries and low-confidence fallback reviewer summaries are not accepted as a substitute for Result Ledger state.
+
+## Artifact Reuse Policy
+
+Implemented runtime rules:
+
+- code/doc/ppt/xlsx/pdf/screenshot/audit report/generated script/log artifacts are reusable only when the producing `ResultPacket` is `VERIFIED_COMPLETE`, has passed verification evidence, and is not stale.
+- stored file snapshots use `hashAfter` when available; if no hash is available, `mtimeMsAfter + sizeAfter` is used as a fallback.
+- a changed or deleted tracked file marks the result stale and blocks final PASS until reverified or redone with justification.
+- generated artifact summaries are not evidence; only `evidence_refs` and passed `verification_results` can support reuse.
+- user original files are not overwritten by reuse policy; downstream work should create a new result packet or explicitly cite the existing artifact.
 
 ## Doctor Checks
 

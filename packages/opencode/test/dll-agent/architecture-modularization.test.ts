@@ -8,13 +8,24 @@ import {
   buildDedupGateBlock,
 } from "../../src/dll-agent/session-gate-orchestrator"
 import {
+  isDllLocalCommand,
+  renderDllLocalCommand,
+} from "../../src/dll-agent/session-command-adapter"
+import {
+  buildObservabilitySummaryLine,
+  buildQuotaStatusLine,
+  commandLine,
+  modeLine,
+} from "../../src/dll-agent/tui-status-adapter"
+import {
   drainSupervisorDispatchBatch,
   planReviewerDispatchGroups,
 } from "../../src/dll-agent/reviewer-dispatch"
+import { buildContinuationRuntimeActions } from "../../src/dll-agent/session-runtime-adapter"
 import { buildReviewerResultPacket, writeReviewerResult } from "../../src/dll-agent/reviewer-result-bridge"
 import { loadResults } from "../../src/dll-agent/result-ledger"
 import type { CapabilityOrchestrationResult } from "../../src/dll-agent/capability-orchestrator"
-import type { EvidenceGateResult, ReviewerOutput, SupervisorState } from "../../src/dll-agent/interfaces"
+import type { ContinuationGateResult, ContinuationPacket, EvidenceGateResult, ReviewerOutput, SupervisorState } from "../../src/dll-agent/interfaces"
 import type { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 
@@ -99,7 +110,122 @@ function supervisorState(overrides: Partial<SupervisorState> = {}): SupervisorSt
   }
 }
 
+function continuationPacket(overrides: Partial<ContinuationPacket> = {}): ContinuationPacket {
+  return {
+    packet_type: "task_continuation",
+    packet_id: "cont_arch",
+    session_id: "ses_arch",
+    user_goal: "finish the requested implementation",
+    goal_contract_ref: null,
+    current_phase: "default",
+    completion_claim: "done",
+    completion_status: "PARTIAL_CONTINUED",
+    final_status: "CONTINUATION_REQUIRED",
+    blocking_unfinished: [{
+      id: "verify",
+      kind: "blocking_unfinished",
+      description: "verification not run",
+      why_blocking: "required verification is missing",
+      evidence_refs: ["evidence:verification"],
+      required_action: "run verification",
+      recommended_role: "chief-engineer",
+      verification_required: ["typecheck"],
+      risk_level: "medium",
+    }],
+    non_blocking_followup: [],
+    requires_user_input: [],
+    missing_verification: ["typecheck"],
+    blocking_reviewer_findings: [],
+    missing_result_refs: [],
+    required_actions: ["run verification"],
+    recommended_next_role: "commander",
+    verification_required: ["typecheck"],
+    evidence_refs: ["evidence:verification"],
+    context_packet_refs: [],
+    budget_state: {
+      continuation_count: 0,
+      max_continuations: 5,
+      max_repairs_per_item: 2,
+    },
+    already_completed: [],
+    files_involved: [],
+    commands_run: [],
+    verification_results: [],
+    reviewer_blocks: [],
+    next_execution_plan: [],
+    stop_reason: null,
+    redaction_status: "redacted",
+    ...overrides,
+  }
+}
+
+function continuationResult(overrides: Partial<ContinuationGateResult> = {}): ContinuationGateResult {
+  const packet = continuationPacket()
+  return {
+    passed: false,
+    completion_status: "PARTIAL_CONTINUED",
+    has_blocking_unfinished: true,
+    has_user_input_required: false,
+    has_non_blocking: false,
+    blocking_items: packet.blocking_unfinished,
+    continuation_packet: packet,
+    synthetic_hint: "continue before final PASS",
+    block_reason: "continuation required before final completion",
+    ...overrides,
+  }
+}
+
 describe("Phase 9 architecture modularization helpers", () => {
+  test("session-command-adapter recognizes local no-LLM commands", () => {
+    expect(isDllLocalCommand("task-status")).toBe(true)
+    expect(isDllLocalCommand("task-trajectory")).toBe(true)
+    expect(isDllLocalCommand("model-usage")).toBe(true)
+    expect(isDllLocalCommand("routing-report")).toBe(true)
+    expect(isDllLocalCommand("doctor-next")).toBe(true)
+    expect(isDllLocalCommand("regression-status")).toBe(true)
+    expect(isDllLocalCommand("permissions")).toBe(true)
+    expect(isDllLocalCommand("team-review")).toBe(false)
+  })
+
+  test("session-command-adapter renders local status without prompt orchestration", () => {
+    const text = renderDllLocalCommand({
+      command: "regression-status",
+      arguments: "",
+      sessionID: sessionID("local_command"),
+      projectDir: process.cwd(),
+    })
+    expect(text).toContain("dll-agent regression status")
+    expect(text).toContain("not_run=20")
+  })
+
+  test("session-command-adapter keeps invalid permissions local and explicit", () => {
+    const text = renderDllLocalCommand({
+      command: "permissions",
+      arguments: "unsafe",
+      sessionID: sessionID("permissions"),
+      projectDir: process.cwd(),
+    })
+    expect(text).toContain("Invalid permission mode")
+    expect(text).toContain("default|auto-review|full-access")
+  })
+
+  test("tui-status-adapter preserves compact status lines", () => {
+    expect(commandLine(true)).toContain("/task-status")
+    expect(modeLine()).toContain("quality=")
+    expect(buildQuotaStatusLine({
+      quota: {
+        providers: {
+          mimo: { status: "no_quota_endpoint" },
+        },
+      },
+      width: 160,
+    })).toContain("M:quota n/a")
+    expect(buildObservabilitySummaryLine({
+      report: undefined,
+      width: 120,
+    })).toContain("observability trajectory:unknown")
+  })
+
   test("appendGateBlock composes block reasons and hints without losing existing gate output", () => {
     const result = appendGateBlock(
       gateResult({ block_reason: "evidence missing", synthetic_hint: "run tests" }),
@@ -140,6 +266,68 @@ describe("Phase 9 architecture modularization helpers", () => {
     expect(groups.map((group) => group.mode)).toEqual(["parallel-read", "serial-write", "parallel-read"])
     expect(groups[0].tasks.map((task) => task.agent)).toEqual(["requirements-inspector", "long-context-archivist"])
     expect(groups[1].tasks.map((task) => task.agent)).toEqual(["chief-engineer"])
+  })
+
+  test("session-runtime-adapter returns no continuation actions when gate passes", () => {
+    const actions = buildContinuationRuntimeActions({
+      sessionID: sessionID("runtime_pass"),
+      state: supervisorState(),
+      continuationResult: continuationResult({
+        passed: true,
+        blocking_items: [],
+        continuation_packet: null,
+        synthetic_hint: null,
+        block_reason: null,
+      }),
+      userGoal: "finish task",
+      assistantText: "verified complete",
+    })
+
+    expect(actions).toEqual([])
+  })
+
+  test("session-runtime-adapter turns continuation block into structured runtime actions", () => {
+    const actions = buildContinuationRuntimeActions({
+      sessionID: sessionID("runtime_actions"),
+      state: supervisorState(),
+      continuationResult: continuationResult(),
+      userGoal: "finish task",
+      assistantText: "done",
+      path: "first-break",
+    })
+
+    expect(actions.map((action) => action.type)).toEqual([
+      "save_supervisor_state",
+      "write_evidence",
+      "write_recovery_decision",
+      "inject_synthetic_hint",
+      "inject_synthetic_hint",
+      "queue_task_completion_check",
+    ])
+    expect(actions.find((action) => action.type === "write_evidence")).toMatchObject({
+      event: "continuation_gate.attempt_recorded",
+    })
+    expect(actions.find((action) => action.type === "queue_task_completion_check")).toMatchObject({
+      userGoal: "finish task",
+      assistantText: "done",
+    })
+  })
+
+  test("session-runtime-adapter emits budget exhausted action without queueing a reviewer", () => {
+    const actions = buildContinuationRuntimeActions({
+      sessionID: sessionID("runtime_budget"),
+      state: supervisorState({ continuation_count: 5 }),
+      continuationResult: continuationResult(),
+      userGoal: "finish task",
+      assistantText: "done",
+      path: "second-break",
+    })
+
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({
+      type: "continuation_budget_exhausted",
+      reason: expect.stringContaining("Maximum continuation count"),
+    })
   })
 
   test("drainSupervisorDispatchBatch drains only trailing supervisor subtasks", () => {

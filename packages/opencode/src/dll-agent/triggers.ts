@@ -26,6 +26,8 @@ export type Metrics = {
   phaseSwitchSignal: boolean
   /** Phase 8: Multimodal signal — detected when non-text input (images, video, audio, etc.) is present */
   multimodalSignal: boolean
+  /** High-risk governance/runtime area touched: provider/routing/gate/evidence/permission/quota/MCP/etc. */
+  highRiskTaskSignal: boolean
 }
 
 function textOf(parts: MessageV2.Part[]) {
@@ -119,6 +121,8 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
   // Phase 8: Multimodal input patterns
   const multimodalPattern =
     /(截图|screenshot|图片|image|photo|网页.*(?:视觉|截图|布局)|webpage.*visual|PPT.*(?:图示|figure|截图)|slides?.*figure|流程图|flowchart|图表|chart|graph|视频|video|音频|audio|录音|UI.*(?:截图|视觉|screenshot)|界面.*(?:截图|视觉)|\.(?:png|jpg|jpeg|gif|webp|bmp|mp4|mov|avi|webm|mp3|wav|ogg)\b)/i
+  const highRiskTaskPattern =
+    /(provider|routing|route|gate|evidence|result ledger|dedup|permission|secrets?|auth|model switching|role model|doctor failed|quota|cost policy|MCP runtime|上游同步|远程发布|删除|覆盖|破坏性|权限|凭据|模型切换|结果账本|证据|审查路由)/i
 
   const SCANNABLE_TOOLS = new Set(["bash", "edit", "write", "task"])
   const toolErrors: string[] = []
@@ -191,6 +195,7 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     phaseSwitchSignal: phaseSwitchPattern.test(messageText(lastUser)),
     // Phase 8: Multimodal input signal
     multimodalSignal: multimodalPattern.test(allText),
+    highRiskTaskSignal: highRiskTaskPattern.test(allText),
   }
 }
 
@@ -235,4 +240,3 @@ export function verifiedToolEvidence(messages: MessageV2.WithParts[]): boolean {
   }
   return false
 }
-

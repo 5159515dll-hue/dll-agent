@@ -83,5 +83,6 @@ describe("permission-mode", () => {
     expect(text).toContain("/permissions default")
     expect(text).toContain("/permissions auto-review")
     expect(text).toContain("/permissions full-access")
+    expect(text).toContain("grant all permissions")
   })
 })

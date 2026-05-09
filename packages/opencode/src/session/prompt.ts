@@ -37,7 +37,8 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { enabled as profileEnabled, autoAllowAll as profileAutoAllow, quality as profileQuality, verify as profileVerify, roleRoster as profileRoleRoster, roleCommands as profileRoleCommands, systemPrompt as profileSystemPrompt, writeEvidence as profileWriteEvidence } from "@/dll-agent/profile"
 import { resolveRoleModel, setRoleModelOverride } from "@/dll-agent/role-model-registry"
-import { resolveEffectiveRoleModel, roleForAgent } from "@/dll-agent/role-model-runtime"
+import { roleForAgent } from "@/dll-agent/role-model-runtime"
+import { resolveRoleProviderModel } from "@/dll-agent/role-provider-bridge"
 import {
   parseRoleModelSetArgs,
   roleModelSetSuccessText,
@@ -45,7 +46,7 @@ import {
   validateRoleModelSetArgs,
 } from "@/dll-agent/role-model-command"
 import { decide as supervisorDecide, updateState as supervisorUpdateState, loadState as supervisorLoadState, saveState as supervisorSaveState, isCooldown as supervisorIsCooldown, recordReviewerCall, generateSubtasks, buildVerifierSubtask, buildTaskCompletionSubtask, markReviewerCompleted, setQueuedReviewers, setRunningReviewers, isReadOnlyReviewer, reviewerRuntimeMs as getReviewerRuntimeMs, modelContextLimit } from "@/dll-agent/supervisor"
-import { checkEvidenceGate, checkReconciliationGate, isGateRetryExhausted, buildGateBlockSummary } from "@/dll-agent/gates"
+import { checkEvidenceGate, checkReconciliationGate, finalGate, isGateRetryExhausted, buildGateBlockSummary } from "@/dll-agent/gates"
 import { checkCap as checkCostCap, trackLastCall } from "@/dll-agent/cost-cap"
 import { checkCrossReviewTrigger } from "@/dll-agent/cross-review-bridge"
 import { metrics as computeTriggerMetrics, messageText } from "@/dll-agent/triggers"
@@ -56,7 +57,7 @@ import { buildGlobalEffective, buildEffectiveManifest, loadProjectOverlay } from
 import { GLOBAL_DEFAULT_TOOLS, DEFAULT_MANIFEST } from "@/dll-agent/tool-catalog"
 import { buildPromptIndex } from "@/dll-agent/tool-prompt"
 import { buildActionableError, formatActionableError } from "@/dll-agent/actionable-error"
-import { checkContinuationGate, isContinuationBudgetExhausted, parseKimiContinuationOutput, consumeContinuationPacket, buildBudgetExhaustedReport } from "@/dll-agent/continuation-gate"
+import { checkContinuationGate, parseKimiContinuationOutput, consumeContinuationPacket, buildBudgetExhaustedReport } from "@/dll-agent/continuation-gate"
 import {
   checkDeduplication,
   buildDedupContextSummary,
@@ -65,15 +66,16 @@ import {
 } from "@/dll-agent/deduplication-gate"
 import { orchestrateCapabilities, type CapabilityOrchestrationResult } from "@/dll-agent/capability-orchestrator"
 import { runCapabilityActions } from "@/dll-agent/capability-action-runner"
+import {
+  preflightMcpRuntime,
+  recordMcpRuntimeConnected,
+  recordMcpRuntimeConnectFailed,
+} from "@/dll-agent/mcp-runtime"
+import { runLspPrewarmRuntime } from "@/dll-agent/lsp-bridge"
 import { reconcileSessionState } from "@/dll-agent/session-reconciler"
 import { ensureGoalContract } from "@/dll-agent/goal-contract"
 import { extractLatestFailure, planRecovery, buildRecoveryHint, buildBlockedRecoveryReport, writeRecoveryDecision } from "@/dll-agent/recovery-loop"
-import {
-  normalizePermissionMode,
-  renderPermissionModeStatus,
-  setPermissionMode,
-} from "@/dll-agent/permission-mode"
-import { renderTaskStatus } from "@/dll-agent/task-observability"
+import { isDllLocalCommand, renderDllLocalCommand } from "@/dll-agent/session-command-adapter"
 import { buildLocalCommandResponse } from "@/dll-agent/session-adapter"
 import {
   appendGateBlock,
@@ -81,6 +83,10 @@ import {
   buildDedupGateBlock,
   capabilityGateEvidence,
 } from "@/dll-agent/session-gate-orchestrator"
+import {
+  buildContinuationRuntimeActions,
+  type SessionRuntimeAction,
+} from "@/dll-agent/session-runtime-adapter"
 import { drainSupervisorDispatchBatch, planReviewerDispatchGroups } from "@/dll-agent/reviewer-dispatch"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
@@ -608,7 +614,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const { task: taskTool } = yield* registry.named()
       const taskRole = profileEnabled() ? roleForAgent(task.agent) : undefined
       const resolvedTaskModel = taskRole
-        ? yield* resolveEffectiveRoleModel({
+        ? yield* resolveRoleProviderModel({
             role: taskRole,
             sessionID,
             projectDir: ctx.worktree,
@@ -810,6 +816,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         text: "Summarize the task tool output above and continue with your task.",
         synthetic: true,
       } satisfies MessageV2.TextPart)
+      return result?.output
     })
 
     const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput, ready?: Latch.Latch) {
@@ -833,11 +840,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             let model = input.model ?? agent.model ?? (yield* lastModel(input.sessionID))
             const role = profileEnabled() ? roleForAgent(agent.name) : undefined
             if (role) {
-              model = yield* resolveEffectiveRoleModel({
+              model = yield* resolveRoleProviderModel({
                 role,
                 sessionID: input.sessionID,
                 projectDir: ctx.worktree,
                 explicitModel: input.model,
+                persistExplicitOverride: !!input.model && agent.mode !== "subagent",
                 triggerReason: input.model ? "explicit TUI/session model selection" : "shell effective role model",
                 provider,
                 validateModel: getModel,
@@ -1021,11 +1029,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const role = profileEnabled() ? roleForAgent(ag.name) : undefined
       if (role) {
         const ctx = yield* InstanceState.context
-        model = yield* resolveEffectiveRoleModel({
+        model = yield* resolveRoleProviderModel({
           role,
           sessionID: input.sessionID,
           projectDir: ctx.worktree,
           explicitModel: input.model,
+          persistExplicitOverride: !!input.model && ag.mode !== "subagent",
           triggerReason: input.model ? "explicit TUI/session model selection" : "prompt effective role model",
           provider,
           validateModel: getModel,
@@ -1486,7 +1495,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       text: string,
     ) {
       const ctx = yield* InstanceState.context
-      const model = yield* resolveEffectiveRoleModel({
+      const model = yield* resolveRoleProviderModel({
         role: "commander",
         sessionID: input.sessionID,
         projectDir: ctx.worktree,
@@ -1551,35 +1560,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const handleLocalDllStatusCommand = Effect.fn("SessionPrompt.handleLocalDllStatusCommand")(function* (
       input: CommandInput,
     ) {
-      if (input.command !== "task-status") return undefined
       const ctx = yield* InstanceState.context
+      const rendered = renderDllLocalCommand({
+        command: input.command,
+        arguments: input.arguments,
+        sessionID: input.sessionID,
+        projectDir: ctx.worktree,
+      })
+      if (!rendered) return undefined
       return yield* roleModelCommandResponse(
         input,
-        renderTaskStatus({
-          sessionID: input.sessionID,
-          projectDir: ctx.worktree,
-        }),
+        rendered,
       )
-    })
-
-    const handleLocalPermissionsCommand = Effect.fn("SessionPrompt.handleLocalPermissionsCommand")(function* (
-      input: CommandInput,
-    ) {
-      if (input.command !== "permissions") return undefined
-      const mode = normalizePermissionMode(input.arguments)
-      if (input.arguments.trim() && !mode) {
-        return yield* roleModelCommandResponse(
-          input,
-          [
-            "Invalid permission mode.",
-            "Usage: /permissions [default|auto-review|full-access]",
-            "",
-            renderPermissionModeStatus(),
-          ].join("\n"),
-        )
-      }
-      if (mode) setPermissionMode(mode, input.sessionID)
-      return yield* roleModelCommandResponse(input, renderPermissionModeStatus())
     })
 
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
@@ -1623,6 +1615,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         let capabilityRuntime: CapabilityOrchestrationResult | undefined
         let lastCapabilityFingerprint: string | undefined
         const executedCapabilityActions = new Set<string>()
+        const executedLspPrewarm = new Set<string>()
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1654,6 +1647,54 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+          const applyContinuationRuntimeActions = Effect.fn(
+            "SessionPrompt.applyContinuationRuntimeActions",
+          )(function* (actions: SessionRuntimeAction[]) {
+            for (const action of actions) {
+              if (action.type === "save_supervisor_state") {
+                supervisorSaveState(sessionID, action.state)
+                continue
+              }
+              if (action.type === "write_evidence") {
+                evidenceWrite(action.event, action.payload, sessionID)
+                continue
+              }
+              if (action.type === "write_recovery_decision") {
+                writeRecoveryDecision(sessionID, action.decision)
+                continue
+              }
+              if (action.type === "inject_synthetic_hint") {
+                gatePendingHints.push(action.hint)
+                continue
+              }
+              if (action.type === "queue_task_completion_check") {
+                const kimiSubtask = buildTaskCompletionSubtask(
+                  sessionID,
+                  action.userGoal,
+                  action.assistantText,
+                  action.state,
+                )
+                tasks.push(kimiSubtask)
+                yield* slog.info("continuation gate triggered Kimi task-completion check", {
+                  source: "session-runtime-adapter",
+                })
+                continue
+              }
+              if (action.type === "continuation_budget_exhausted") {
+                yield* slog.warn("continuation budget exhausted", {
+                  reason: action.reason,
+                })
+                const blockedReport = buildBudgetExhaustedReport({
+                  sessionID,
+                  userGoal: action.userGoal,
+                  reason: action.reason,
+                  packet: action.packet,
+                })
+                gatePendingHints.push(blockedReport.report)
+              }
+            }
+          })
 
           // ─── dll-agent supervisor integration ─────────────────────────────
           if (profileEnabled() && !session.parentID && lastUser.agent === "commander") {
@@ -1689,18 +1730,39 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 const failure = extractLatestFailure(msgs)
                 if (failure) {
                   updatedState.repair_counts ??= {}
+                  updatedState.recovery_phase_counts ??= {}
+                  updatedState.recovery_total_count ??= 0
                   const recovery = planRecovery({
                     failure,
                     repairCounts: updatedState.repair_counts,
-                    maxRecoveryAttempts: 5,
+                    maxRecoveryAttempts: 3,
+                    phaseAttempts: updatedState.recovery_phase_counts[updatedState.phase] ?? 0,
+                    taskAttempts: updatedState.recovery_total_count,
+                    maxPhaseAttempts: 5,
+                    maxTaskAttempts: 8,
+                    sessionID,
+                    taskGoal: messageText(msgs.find((msg) => msg.info.id === lastUser.id) ?? msgs.findLast((msg) => msg.info.role === "user") ?? msgs[msgs.length - 1]).slice(0, 500),
+                    projectDir: ctx.directory,
                   })
                   updatedState.repair_counts[recovery.fingerprint] = recovery.recoveryAttempts + 1
+                  updatedState.recovery_phase_counts[updatedState.phase] =
+                    (updatedState.recovery_phase_counts[updatedState.phase] ?? 0) + 1
+                  updatedState.recovery_total_count = (updatedState.recovery_total_count ?? 0) + 1
                   supervisorSaveState(sessionID, updatedState)
                   writeRecoveryDecision(sessionID, recovery)
+                  evidenceWrite("recovery.attempt_started", {
+                    action: recovery.action,
+                    failure_type: recovery.failure_type,
+                    fingerprint: recovery.fingerprint,
+                    budget_state: recovery.budget_state,
+                    safe_to_auto_execute: recovery.safe_to_auto_execute,
+                  }, sessionID)
                   if (recovery.userActionRequired || !recovery.shouldContinue) {
                     gatePendingHints.push(buildBlockedRecoveryReport(recovery))
                     evidenceWrite("recovery.blocked", {
                       status: recovery.status,
+                      action: recovery.action,
+                      failure_type: recovery.failure_type,
                       category: recovery.category,
                       fingerprint: recovery.fingerprint,
                       reason: recovery.reason,
@@ -1708,6 +1770,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   } else {
                     gatePendingHints.push(buildRecoveryHint(recovery))
                     evidenceWrite("recovery.prompt_injected", {
+                      action: recovery.action,
+                      failure_type: recovery.failure_type,
                       category: recovery.category,
                       fingerprint: recovery.fingerprint,
                       reviewer: recovery.reviewer,
@@ -1983,41 +2047,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   state,
                   sessionID,
                   userGoal: currentTaskGoal,
+                  projectDir: ctx.directory,
                 })
                 if (!continuationResult.passed) {
-                  const budgetCheck = isContinuationBudgetExhausted({
-                    continuationCount: state.continuation_count ?? 0,
-                    repairCounts: state.repair_counts ?? {},
-                    blockingItems: continuationResult.blocking_items,
-                  })
-                  if (!budgetCheck.exhausted) {
-                    if (continuationResult.synthetic_hint) {
-                      gatePendingHints.push(continuationResult.synthetic_hint)
-                    }
-                    const kimiSubtask = buildTaskCompletionSubtask(
-                      sessionID,
-                      lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : "",
-                      lastAssistantText,
-                      state,
-                    )
-                    tasks.push(kimiSubtask)
-                    yield* slog.info("continuation gate triggered Kimi task-completion check", {
-                      block_reason: continuationResult.block_reason,
-                      blocking_items: continuationResult.blocking_items.length,
-                    })
-                  } else {
-                    yield* slog.warn("continuation budget exhausted", {
-                      reason: budgetCheck.reason,
-                      continuation_count: state.continuation_count ?? 0,
-                    })
-                    const blockedReport = buildBudgetExhaustedReport({
-                      sessionID,
-                      userGoal: currentTaskGoal,
-                      reason: budgetCheck.reason ?? "continuation budget exhausted",
-                      packet: continuationResult.continuation_packet,
-                    })
-                    gatePendingHints.push(blockedReport.report)
-                  }
+                  yield* applyContinuationRuntimeActions(buildContinuationRuntimeActions({
+                    sessionID,
+                    state,
+                    continuationResult,
+                    userGoal: currentTaskGoal,
+                    assistantText: lastAssistantText,
+                    path: "first-break",
+                  }))
                 }
 
                 const gateResult = checkEvidenceGate({
@@ -2031,6 +2071,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   sessionID,
                   projectDir: ctx.directory,
                 }, msgs)
+
+                if (!continuationResult.passed) {
+                  Object.assign(gateResult, appendGateBlock(gateResult, {
+                    reason: continuationResult.block_reason ?? "continuation required before final completion",
+                    hint: continuationResult.synthetic_hint,
+                  }))
+                  evidenceWrite("continuation_gate.final_path_blocked", {
+                    reason: continuationResult.block_reason,
+                    packet_id: continuationResult.continuation_packet?.packet_id ?? null,
+                    completion_status: continuationResult.completion_status,
+                    evidence_refs: continuationResult.continuation_packet?.evidence_refs ?? [],
+                    context_packet_refs: continuationResult.continuation_packet?.context_packet_refs ?? [],
+                  }, sessionID)
+                }
 
                 if (dedupHardBlock) {
                   Object.assign(gateResult, appendGateBlock(
@@ -2056,6 +2110,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   isCompletionClaim: metrics.finalClaim,
                   assistantText: lastAssistantText,
                   state,
+                  sessionID,
                 })
                 if (!reconResult.passed) {
                   Object.assign(gateResult, appendGateBlock(gateResult, {
@@ -2065,7 +2120,29 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   evidenceWrite("gate.reconciliation_blocked", {
                     reason: reconResult.block_reason,
                     completed_reviews: state.completed_reviews,
+                    context_packet_refs: reconResult.context_packet_refs,
+                    audit_risks: reconResult.audit_risks,
                   }, sessionID)
+                }
+
+                const finalResult = finalGate({
+                  evidenceGate: gateResult,
+                  supervisorState: state,
+                  reconciliationConflicts: reconResult.passed ? [] : [reconResult.block_reason ?? "reconciliation required"],
+                  costExceeded: costCheck.exceeded,
+                  sessionID,
+                  projectDir: ctx.directory,
+                })
+                if (!finalResult.allowed) {
+                  Object.assign(gateResult, appendGateBlock(gateResult, {
+                    reason: `final gate blocked completion: ${finalResult.reasons.slice(0, 4).join("; ")}`,
+                    hint: `<dll-agent-final-gate>
+Final PASS is blocked by runtime gates:
+${finalResult.reasons.slice(0, 8).map((reason, index) => `${index + 1}. ${reason}`).join("\n")}
+
+Continue execution or produce a blocked/partial report with evidence; do not claim VERIFIED_COMPLETE.
+</dll-agent-final-gate>`,
+                  }))
                 }
 
                 if (!gateResult.passed && gateResult.synthetic_hint) {
@@ -2177,9 +2254,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           if (profileEnabled() && tasks.length >= 2) {
             const batch = drainSupervisorDispatchBatch(tasks)
             if (batch.length >= 2) {
-              const completeSupervisorTask = (task: MessageV2.SubtaskPart) => {
+              const completeSupervisorTask = (task: MessageV2.SubtaskPart, rawText?: string) => {
                 try {
-                  markReviewerCompleted(sessionID, task.agent as ReviewerRole)
+                  markReviewerCompleted(sessionID, task.agent as ReviewerRole, undefined, { rawText })
                 } catch {}
               }
               const runSingleSupervisorTask = Effect.fn("SessionPrompt.runSingleSupervisorTask")(function* (
@@ -2195,8 +2272,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   readOnly: isReadOnlyReviewer(task.agent),
                 })
                 try {
-                  yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
-                  completeSupervisorTask(task)
+                  const rawText = yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+                  completeSupervisorTask(task, rawText)
                 } finally {
                   try {
                     setRunningReviewers(sessionID, [])
@@ -2218,11 +2295,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   reviewers: group.map((b) => b.agent),
                 })
                 try {
-                  yield* Effect.all(
+                  const rawOutputs = yield* Effect.all(
                     group.map((b) => handleSubtask({ task: b, model, lastUser, sessionID, session, msgs })),
                     { concurrency: "unbounded" },
                   )
-                  for (const b of group) completeSupervisorTask(b)
+                  for (const [index, b] of group.entries()) completeSupervisorTask(b, rawOutputs[index])
                 } finally {
                   try {
                     setRunningReviewers(sessionID, [])
@@ -2252,12 +2329,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 setRunningReviewers(sessionID, [task.agent])
               } catch {}
             }
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+            const rawText = yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
             // ─── dll-agent: mark reviewer completed ─────────────────────────
             if (profileEnabled() && task.command === "dll-agent-supervisor") {
               try {
                 // task.agent 是 reviewer 名称（如 requirements-inspector）
-                markReviewerCompleted(sessionID, task.agent as any)
+                markReviewerCompleted(sessionID, task.agent as any, undefined, { rawText })
                 setRunningReviewers(sessionID, [])
                 // Phase 5: consume continuation packet from Kimi task-completion-archivist output
                 if (task.agent === "task-completion-archivist") {
@@ -2433,14 +2510,56 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
             }
 
+            if (profileEnabled() && !session.parentID && !executedLspPrewarm.has(ctx.directory)) {
+              executedLspPrewarm.add(ctx.directory)
+              yield* Effect.promise(() =>
+                runLspPrewarmRuntime({
+                  projectRoot: ctx.directory,
+                  sessionID,
+                  adapter: {
+                    hasClients: (file) => Effect.runPromise(lsp.hasClients(file)),
+                    touchFile: (file) => Effect.runPromise(lsp.touchFile(file)),
+                  },
+                }),
+              ).pipe(
+                Effect.catch((error) =>
+                  Effect.sync(() => {
+                    evidenceWrite("lsp.prewarm_failed", {
+                      projectRoot: ctx.directory,
+                      error: String(error),
+                    }, sessionID)
+                  }),
+                ),
+                Effect.forkIn(scope),
+              )
+            }
+
             if (profileEnabled() && !session.parentID && capabilityRuntime?.mcpRequests.length) {
               for (const request of capabilityRuntime.mcpRequests) {
                 if (!request.auto_connect) continue
+                const entry = capabilityRuntime.registry.entries.find((candidate) => candidate.id === request.entry_id)
+                let runtimeDecision: ReturnType<typeof preflightMcpRuntime> | undefined
                 try {
                   const statusBefore = yield* mcp.status()
-                  if (statusBefore[request.name]?.status === "connected") continue
+                  runtimeDecision = preflightMcpRuntime({
+                    request,
+                    entry,
+                    openCodeStatus: statusBefore[request.name]?.status,
+                    sessionID,
+                    projectDir: ctx.directory,
+                    role: roleForAgent(agent.name) ?? "commander",
+                    userGoal: capabilityRuntime.plan.rationale,
+                    explicitlyAuthorized: false,
+                  })
+                  if (runtimeDecision.action === "skip_already_connected") continue
+                  if (runtimeDecision.action !== "allow_connect") continue
                   yield* mcp.add(request.name, request.config)
                   const statusAfter = yield* mcp.status()
+                  recordMcpRuntimeConnected({
+                    decision: runtimeDecision,
+                    status: statusAfter[request.name]?.status ?? "unknown",
+                    sessionID,
+                  })
                   evidenceWrite("capability.mcp_connected", {
                     name: request.name,
                     entry_id: request.entry_id,
@@ -2454,6 +2573,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     error: String(mcpErr),
                     fingerprint: capabilityRuntime.fingerprint,
                   }, sessionID)
+                  if (runtimeDecision) {
+                    recordMcpRuntimeConnectFailed({
+                      decision: runtimeDecision,
+                      error: mcpErr,
+                      sessionID,
+                    })
+                  }
                   yield* slog.error("capability MCP connect failed", {
                     name: request.name,
                     error: String(mcpErr),
@@ -2601,7 +2727,28 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 const metrics = computeTriggerMetrics(msgs)
                 const lastAsst = msgs.findLast((m) => m.info.role === "assistant")
                 const lastAsstText = messageText(lastAsst)
+                const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
+                const currentTaskGoal = lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : ""
                 const costCheck = checkCostCap(sessionID, msgs)
+
+                const continuationResult = checkContinuationGate({
+                  assistantText: lastAsstText,
+                  isCompletionClaim: metrics.finalClaim,
+                  state,
+                  sessionID,
+                  userGoal: currentTaskGoal,
+                  projectDir: ctx.directory,
+                })
+                if (!continuationResult.passed) {
+                  yield* applyContinuationRuntimeActions(buildContinuationRuntimeActions({
+                    sessionID,
+                    state,
+                    continuationResult,
+                    userGoal: currentTaskGoal,
+                    assistantText: lastAsstText,
+                    path: "second-break",
+                  }))
+                }
 
                 const gateResult = checkEvidenceGate({
                   assistantText: lastAsstText,
@@ -2615,6 +2762,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   projectDir: ctx.directory,
                 }, msgs)
 
+                if (!continuationResult.passed) {
+                  Object.assign(gateResult, appendGateBlock(gateResult, {
+                    reason: continuationResult.block_reason ?? "continuation required before final completion",
+                    hint: continuationResult.synthetic_hint,
+                  }))
+                  evidenceWrite("continuation_gate.final_path_blocked", {
+                    reason: continuationResult.block_reason,
+                    packet_id: continuationResult.continuation_packet?.packet_id ?? null,
+                    completion_status: continuationResult.completion_status,
+                    evidence_refs: continuationResult.continuation_packet?.evidence_refs ?? [],
+                    context_packet_refs: continuationResult.continuation_packet?.context_packet_refs ?? [],
+                    path: "second-break",
+                  }, sessionID)
+                }
+
                 const capabilityBlock = buildCapabilityGateBlock(capabilityRuntime, metrics.finalClaim)
                 if (capabilityBlock) {
                   Object.assign(gateResult, appendGateBlock(gateResult, capabilityBlock))
@@ -2626,6 +2788,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   isCompletionClaim: metrics.finalClaim,
                   assistantText: lastAsstText,
                   state,
+                  sessionID,
                 })
                 if (!reconResult.passed) {
                   Object.assign(gateResult, appendGateBlock(gateResult, {
@@ -2635,7 +2798,29 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   evidenceWrite("gate.reconciliation_blocked", {
                     reason: reconResult.block_reason,
                     completed_reviews: state.completed_reviews,
+                    context_packet_refs: reconResult.context_packet_refs,
+                    audit_risks: reconResult.audit_risks,
                   }, sessionID)
+                }
+
+                const finalResult = finalGate({
+                  evidenceGate: gateResult,
+                  supervisorState: state,
+                  reconciliationConflicts: reconResult.passed ? [] : [reconResult.block_reason ?? "reconciliation required"],
+                  costExceeded: costCheck.exceeded,
+                  sessionID,
+                  projectDir: ctx.directory,
+                })
+                if (!finalResult.allowed) {
+                  Object.assign(gateResult, appendGateBlock(gateResult, {
+                    reason: `final gate blocked completion: ${finalResult.reasons.slice(0, 4).join("; ")}`,
+                    hint: `<dll-agent-final-gate>
+Final PASS is blocked by runtime gates:
+${finalResult.reasons.slice(0, 8).map((reason, index) => `${index + 1}. ${reason}`).join("\n")}
+
+Continue execution or produce a blocked/partial report with evidence; do not claim VERIFIED_COMPLETE.
+</dll-agent-final-gate>`,
+                  }))
                 }
 
                 if (!gateResult.passed) {
@@ -2692,12 +2877,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const local = yield* handleLocalRoleModelCommand(input)
         if (local) return local
       }
-      if (profileEnabled() && input.command === "task-status") {
+      if (profileEnabled() && isDllLocalCommand(input.command)) {
         const local = yield* handleLocalDllStatusCommand(input)
-        if (local) return local
-      }
-      if (profileEnabled() && input.command === "permissions") {
-        const local = yield* handleLocalPermissionsCommand(input)
         if (local) return local
       }
       const cmd = yield* commands.get(input.command)
@@ -2763,11 +2944,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const ctx = yield* InstanceState.context
         const role = roleForAgent(agentName)
         if (role) {
-          resolvedModel = yield* resolveEffectiveRoleModel({
+          resolvedModel = yield* resolveRoleProviderModel({
             role,
             sessionID: input.sessionID,
             projectDir: ctx.worktree,
             explicitModel: input.model ? Provider.parseModel(input.model) : undefined,
+            persistExplicitOverride: false,
             triggerReason: input.model ? "explicit command model selection" : "command effective role model",
             provider,
             validateModel: getModel,

@@ -120,6 +120,21 @@ export interface SupervisorState {
   queued_reviewers?: string[]
   /** 当前正在并发 dispatch 的 reviewer（用于 TUI 展示） */
   running_reviewers?: string[]
+  /** reviewer 最近一次输入上下文 packet，用于 reviewer result / gate 追踪 */
+  reviewer_context_packets?: Partial<Record<ReviewerRole, {
+    context_packet_id: string
+    built_at: string
+  }>>
+  /** reviewer run envelopes isolate same-model multi-role decisions and link results to their input context */
+  role_run_envelopes?: Partial<Record<ReviewerRole, {
+    role_run_id: string
+    role_instance_id: string
+    model: string
+    context_packet_id?: string | null
+    action_fingerprint: string
+    independence_mode: "isolated" | "arbitration"
+    built_at: string
+  }>>
   /** gate block 重试计数: block_reason → 已重试次数 (防止无限循环) */
   gate_block_retries?: Record<string, number>
   /** 已迁移/归档的旧 gate retry，避免历史阻断污染当前 readiness */
@@ -128,6 +143,9 @@ export interface SupervisorState {
   continuation_count?: number
   repair_counts?: Record<string, number>
   last_continuation_packet_id?: string
+  /** Autonomous recovery budget tracking */
+  recovery_phase_counts?: Record<string, number>
+  recovery_total_count?: number
   /** Session-level role model overrides: role name → { primary, fallback, enabled } */
   role_model_overrides?: Record<string, { primary: string; fallback?: string[]; enabled?: boolean }>
   /** 最后更新时间 */
@@ -157,6 +175,8 @@ export interface SupervisorMetricsSnapshot {
   phase_switch_signal?: boolean
   /** Phase 8: Multimodal input signal */
   multimodal_signal?: boolean
+  /** Phase 5: high-risk governance/runtime task signal */
+  high_risk_task_signal?: boolean
 }
 
 // ─── Trigger 决策 ───────────────────────────────────────────────────────────
@@ -323,12 +343,33 @@ export interface ContinuationPacket {
   packet_id: string
   session_id: string
   user_goal: string
+  goal_contract_ref: string | null
   current_phase: string
   completion_claim: string
   completion_status: CompletionStatus
+  final_status:
+    | "VERIFIED_COMPLETE"
+    | "CONTINUATION_REQUIRED"
+    | "BLOCKED_USER_REQUIRED"
+    | "BLOCKED_BUDGET_EXHAUSTED"
+    | "UNVERIFIED_PARTIAL"
+    | "FAILED"
   blocking_unfinished: UnfinishedItem[]
   non_blocking_followup: UnfinishedItem[]
   requires_user_input: UnfinishedItem[]
+  missing_verification: string[]
+  blocking_reviewer_findings: string[]
+  missing_result_refs: string[]
+  required_actions: string[]
+  recommended_next_role: ReviewerRole | "commander" | null
+  verification_required: string[]
+  evidence_refs: string[]
+  context_packet_refs: string[]
+  budget_state: {
+    continuation_count: number
+    max_continuations: number
+    max_repairs_per_item: number
+  }
   already_completed: string[]
   files_involved: string[]
   commands_run: string[]
@@ -336,7 +377,7 @@ export interface ContinuationPacket {
   reviewer_blocks: string[]
   next_execution_plan: {
     step: number
-    role: ReviewerRole
+    role: ReviewerRole | "commander"
     action: string
     verification: string
   }[]
@@ -404,6 +445,7 @@ export type EvidenceRecordType =
   | "cooldown.skipped"
   | "llm.call"
   | "model.routing_decision"
+  | "context_handoff.packet_built"
   | "agent.profile.enabled"
   | "agent.get"
   | "system.environment"
@@ -416,7 +458,15 @@ export type EvidenceRecordType =
   | "continuation_gate.consumed"
   | "continuation_gate.dispatched"
   | "continuation_gate.budget_exhausted"
+  | "recovery.failure_classified"
   | "recovery.decision"
+  | "recovery.attempt_started"
+  | "recovery.attempt_finished"
+  | "recovery.verification_required"
+  | "recovery.budget_exhausted"
+  | "recovery.user_input_required"
+  | "recovery.security_blocked"
+  | "recovery.escalated_reviewer"
   | "recovery.prompt_injected"
   | "recovery.blocked"
   // Phase 7: Result Ledger evidence types

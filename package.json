@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "opencode",
-  "description": "AI-powered development tool",
+  "name": "dll-agent",
+  "description": "本地工程治理型智能编程代理",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.13",
@@ -96,10 +96,6 @@
     "@opencode-ai/sdk": "workspace:*",
     "heap-snapshot-toolkit": "1.1.3",
     "typescript": "catalog:"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/anomalyco/opencode"
   },
   "license": "MIT",
   "prettier": {

@@ -6,6 +6,10 @@ import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
+import { ProviderID, ModelID } from "@/provider/schema"
+import { enabled as profileEnabled } from "@/dll-agent/profile"
+import { resolveRoleModel } from "@/dll-agent/role-model-registry"
+import { roleForAgent } from "@/dll-agent/role-model-runtime"
 import { Effect, Exit, Schema } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 
@@ -16,6 +20,15 @@ export interface TaskPromptOps {
 }
 
 const id = "task"
+
+function parseRoleModel(model: string) {
+  const slash = model.indexOf("/")
+  if (slash === -1) return { providerID: ProviderID.make(model), modelID: ModelID.make("") }
+  return {
+    providerID: ProviderID.make(model.slice(0, slash)),
+    modelID: ModelID.make(model.slice(slash + 1)),
+  }
+}
 
 export const Parameters = Schema.Struct({
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
@@ -104,7 +117,11 @@ export const TaskTool = Tool.define(
       const msg = yield* Effect.sync(() => MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }))
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
 
-      const model = next.model ?? {
+      const role = profileEnabled() ? roleForAgent(next.name) : undefined
+      const effective = role
+        ? parseRoleModel(resolveRoleModel(role, nextSession.id, process.env.DLL_AGENT_ROOT || parent.directory).primary)
+        : undefined
+      const model = effective ?? next.model ?? {
         modelID: msg.info.modelID,
         providerID: msg.info.providerID,
       }

@@ -67,6 +67,7 @@ describe("task-observability", () => {
     saveGoalContract(buildGoalContract({
       sessionID: sid,
       userGoal: "Fix provider routing without leaking token=secret-value",
+      requiredVerification: ["typecheck", "dll-agent doctor"],
       activePlan: [{ id: "verify", description: "Run typecheck", status: "pending", evidence_refs: [] }],
     }))
     writeSupervisorState(sid)
@@ -87,6 +88,15 @@ describe("task-observability", () => {
       selected_model: "zai/glm-5.1",
       skipped_reviewers: ["final-auditor"],
     }, sid)
+    writeEvidence("continuation_gate.blocked", {
+      continuation_packet: {
+        packet_id: "cont_visibility_1",
+        final_status: "CONTINUATION_REQUIRED",
+        blocking_unfinished: [{ description: "Run typecheck" }],
+        requires_user_input: [],
+      },
+    }, sid)
+    writeEvidence("doctor.run", { overall: "WARN", passCount: 20, warnCount: 1, failCount: 0 }, sid)
 
     const report = buildTaskObservabilityReport({
       sessionID: sid,
@@ -97,7 +107,14 @@ describe("task-observability", () => {
     expect(report.goal).toContain("REDACTED")
     expect(report.phase).toBe("implementation")
     expect(report.blockers).toContain("required verification not_run")
+    expect(report.final_status_detail).toBe("CONTINUATION_REQUIRED")
+    expect(report.verification.status).toBe("not_run")
+    expect(report.verification.required).toContain("typecheck")
+    expect(report.continuation.status).toBe("required")
+    expect(report.continuation.last_packet_id).toBe("cont_visibility_1")
+    expect(report.doctor.status).toBe("warn")
     expect(report.results.partial).toBe(1)
+    expect(report.results.unverified).toBe(0)
     expect(report.routing.selected_models).toContain("zai/glm-5.1")
     expect(report.routing.skipped_reviewers).toContain("final-auditor")
     expect(report.next_actions.join("\n")).toContain("Resolve blocking items")
@@ -109,6 +126,7 @@ describe("task-observability", () => {
     cleanupFiles.push(evidenceFile)
     process.env.DLL_AGENT_EVIDENCE_FILE = evidenceFile
     writeEvidence("gate.blocked_completion", { block_reason: "missing evidence" }, sid)
+    writeEvidence("doctor.run", { overall: "FAIL", passCount: 19, warnCount: 0, failCount: 1 }, sid)
 
     const text = renderTaskStatus({
       sessionID: sid,
@@ -117,6 +135,10 @@ describe("task-observability", () => {
     })
 
     expect(text).toContain("dll-agent task status")
+    expect(text).toContain("verification:")
+    expect(text).toContain("continuation:")
+    expect(text).toContain("doctor: fail")
+    expect(text).toContain("results:")
     expect(text).toContain("trajectory:")
     expect(text).toContain("missing evidence")
     expect(text.length).toBeLessThan(4000)

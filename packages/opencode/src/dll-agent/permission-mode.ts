@@ -69,7 +69,7 @@ export function permissionModeLabel(mode: DllPermissionMode) {
 export function permissionModeDescription(mode: DllPermissionMode) {
   if (mode === "default") return "Use OpenCode's normal permission prompts and configured rules."
   if (mode === "auto-review") return "Auto-approve low-risk/project-local work; ask for high-risk or uncertain actions."
-  return "Auto-approve commander/executor tool use; read-only reviewer denials still apply."
+  return "Grant all permissions by explicit user choice; high-risk actions are allowed and recorded as Full Access overrides."
 }
 
 export function renderPermissionModeStatus() {
@@ -81,7 +81,7 @@ export function renderPermissionModeStatus() {
     "options:",
     "- default: OpenCode default permission prompts",
     "- auto-review: low-risk auto, high-risk/manual-review actions ask",
-    "- full-access: broad auto-approval for commander/executor; reviewer read-only policy still enforced",
+    "- full-access: grant all permissions by explicit user choice; high-risk actions are recorded as overrides",
     "",
     "set with:",
     "/permissions default",

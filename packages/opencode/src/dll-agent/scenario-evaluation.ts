@@ -16,6 +16,8 @@ export type ScenarioFinalStatus =
 export type ScenarioRisk = "low" | "medium" | "high"
 export type ScenarioResultStatus = "pass" | "fail"
 export type ScenarioCostTier = "none" | "low" | "medium" | "high"
+export type ScenarioEvaluationLayer = "deterministic" | "local_smoke" | "manual" | "live_required"
+export type ScenarioExternalStatus = "not_run" | "manual_not_run" | "live_not_run"
 
 export type RuntimeCapabilityStatus =
   | "implemented_runtime_verified"
@@ -73,6 +75,7 @@ export interface RealWorldScenario {
   human_intervention_required: boolean
   cost_tier: ScenarioCostTier
   token_tier: ScenarioCostTier
+  evaluation_layer: ScenarioEvaluationLayer
   required_capabilities: RuntimeCapabilityId[]
   acceptance_refs: string[]
 }
@@ -88,6 +91,9 @@ export interface ScenarioEvaluation {
   human_intervention_needed: boolean
   cost_tier: ScenarioCostTier
   token_tier: ScenarioCostTier
+  evaluation_layer: ScenarioEvaluationLayer
+  deterministic_status: ScenarioResultStatus
+  external_status: ScenarioExternalStatus
   status: ScenarioResultStatus
   errors: string[]
 }
@@ -97,9 +103,14 @@ export interface ScenarioSuiteReport {
   total: number
   pass: number
   fail: number
+  deterministic_pass: number
+  deterministic_fail: number
   false_pass_risk: number
   human_intervention_scenarios: number
   unnecessary_reviewer_scenarios: number
+  not_run_scenarios: number
+  manual_not_run_scenarios: number
+  live_not_run_scenarios: number
   scenarios: ScenarioEvaluation[]
 }
 
@@ -150,6 +161,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "low",
     token_tier: "low",
+    evaluation_layer: "local_smoke",
     required_capabilities: ["goal_contract", "evidence_gate", "final_gate", "result_ledger", "correctness_routing"],
     acceptance_refs: ["supervisor.test.ts: defaultCommander", "result-ledger.test.ts", ...baseRefs],
   },
@@ -165,6 +177,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "medium",
     token_tier: "medium",
+    evaluation_layer: "deterministic",
     required_capabilities: ["requirements_inspector", "correctness_routing", "routing_evidence", "continuation_gate"],
     acceptance_refs: ["supervisor.test.ts: user correction triggers requirements-inspector", ...baseRefs],
   },
@@ -180,6 +193,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "low",
     token_tier: "low",
+    evaluation_layer: "deterministic",
     required_capabilities: ["recovery_loop", "evidence_gate", "final_gate"],
     acceptance_refs: ["recovery-loop.test.ts: test failure gets automatic repair action", ...baseRefs],
   },
@@ -195,6 +209,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "low",
     token_tier: "low",
+    evaluation_layer: "deterministic",
     required_capabilities: ["recovery_loop", "evidence_gate", "final_gate"],
     acceptance_refs: ["recovery-loop.test.ts: typecheck failure gets automatic repair action", ...baseRefs],
   },
@@ -210,6 +225,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "medium",
     token_tier: "medium",
+    evaluation_layer: "deterministic",
     required_capabilities: ["recovery_loop", "chief_engineer", "role_cross", "correctness_routing"],
     acceptance_refs: ["recovery-loop.test.ts: repeated failure escalation", ...baseRefs],
   },
@@ -225,6 +241,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "medium",
     token_tier: "medium",
+    evaluation_layer: "deterministic",
     required_capabilities: ["evidence_gate", "final_gate", "final_auditor", "routing_evidence"],
     acceptance_refs: ["gates.test.ts: high risk completion w/o evidence", ...baseRefs],
   },
@@ -240,6 +257,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "medium",
     token_tier: "medium",
+    evaluation_layer: "deterministic",
     required_capabilities: ["goal_contract", "continuation_gate", "task_completion_archivist"],
     acceptance_refs: ["continuation-gate.test.ts: active plan unfinished", ...baseRefs],
   },
@@ -255,6 +273,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "none",
     token_tier: "low",
+    evaluation_layer: "deterministic",
     required_capabilities: ["result_ledger", "dedup_gate", "stale_detection"],
     acceptance_refs: ["result-ledger.test.ts: subsequent model can reuse verified result", ...baseRefs],
   },
@@ -270,6 +289,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "low",
     token_tier: "low",
+    evaluation_layer: "deterministic",
     required_capabilities: ["result_ledger", "dedup_gate", "stale_detection"],
     acceptance_refs: ["result-ledger.test.ts: stale result is NOT returned in reusable_only queries", ...baseRefs],
   },
@@ -285,6 +305,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "medium",
     token_tier: "medium",
+    evaluation_layer: "deterministic",
     required_capabilities: ["provider_bridge", "correctness_routing", "routing_evidence", "final_auditor"],
     acceptance_refs: ["role-model-registry.test.ts", "supervisor.test.ts: high-risk repeated failure can route more than one reviewer", ...baseRefs],
   },
@@ -300,6 +321,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: true,
     cost_tier: "none",
     token_tier: "low",
+    evaluation_layer: "manual",
     required_capabilities: ["permission_policy", "role_tool_policy", "doctor_strictness"],
     acceptance_refs: ["permission-classifier.test.ts", "role-tool-policy.test.ts", ...baseRefs],
   },
@@ -315,6 +337,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "medium",
     token_tier: "medium",
+    evaluation_layer: "live_required",
     required_capabilities: ["multimodal_context", "mimo_status", "correctness_routing"],
     acceptance_refs: ["multimodal-context.test.ts", "supervisor.test.ts: MiMo multimodal reviewer does not enter pure text/code tasks", ...baseRefs],
   },
@@ -330,6 +353,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "low",
     token_tier: "low",
+    evaluation_layer: "local_smoke",
     required_capabilities: ["mimo_status", "provider_bridge", "role_model_registry"],
     acceptance_refs: ["role-model-registry.test.ts", "tools.test.ts", ...baseRefs],
   },
@@ -345,6 +369,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "low",
     token_tier: "low",
+    evaluation_layer: "local_smoke",
     required_capabilities: ["role_model_registry", "provider_bridge", "routing_evidence"],
     acceptance_refs: ["role-model-registry.test.ts", ...baseRefs],
   },
@@ -360,6 +385,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "medium",
     token_tier: "medium",
+    evaluation_layer: "deterministic",
     required_capabilities: ["doctor_strictness", "continuation_gate", "final_gate"],
     acceptance_refs: ["continuation-gate.test.ts: doctor failed", "dll-doctor.test.ts", ...baseRefs],
   },
@@ -375,6 +401,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "none",
     token_tier: "low",
+    evaluation_layer: "local_smoke",
     required_capabilities: ["doctor_strictness", "permission_policy", "task_observability"],
     acceptance_refs: ["dll-doctor.test.ts", "evidence.test.ts: session cleanup", ...baseRefs],
   },
@@ -390,6 +417,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "low",
     token_tier: "low",
+    evaluation_layer: "deterministic",
     required_capabilities: ["result_ledger", "evidence_gate", "final_gate", "task_observability"],
     acceptance_refs: ["gates.test.ts", "task-observability.test.ts", ...baseRefs],
   },
@@ -405,6 +433,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "low",
     token_tier: "low",
+    evaluation_layer: "deterministic",
     required_capabilities: ["recovery_loop", "evidence_gate"],
     acceptance_refs: ["recovery-loop.test.ts: normal error does not stop", ...baseRefs],
   },
@@ -420,6 +449,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: true,
     cost_tier: "none",
     token_tier: "low",
+    evaluation_layer: "manual",
     required_capabilities: ["permission_policy", "recovery_loop", "doctor_strictness"],
     acceptance_refs: ["recovery-loop.test.ts: permission denied requires user authorization", ...baseRefs],
   },
@@ -435,6 +465,7 @@ export const REAL_WORLD_SCENARIOS: RealWorldScenario[] = [
     human_intervention_required: false,
     cost_tier: "high",
     token_tier: "medium",
+    evaluation_layer: "deterministic",
     required_capabilities: ["role_cross", "correctness_routing", "routing_evidence", "final_gate"],
     acceptance_refs: ["cross-review.test.ts", "gates.test.ts: reconciliation", ...baseRefs],
   },
@@ -477,6 +508,12 @@ function invariantErrors(scenario: RealWorldScenario) {
   return errors
 }
 
+function externalStatus(scenario: RealWorldScenario): ScenarioExternalStatus {
+  if (scenario.evaluation_layer === "manual") return "manual_not_run"
+  if (scenario.evaluation_layer === "live_required") return "live_not_run"
+  return "not_run"
+}
+
 export function evaluateScenario(
   scenario: RealWorldScenario,
   capabilities: Partial<Record<RuntimeCapabilityId, RuntimeCapabilityStatus>> = CURRENT_RUNTIME_CAPABILITIES,
@@ -496,6 +533,9 @@ export function evaluateScenario(
     human_intervention_needed: scenario.human_intervention_required,
     cost_tier: scenario.cost_tier,
     token_tier: scenario.token_tier,
+    evaluation_layer: scenario.evaluation_layer,
+    deterministic_status: errors.length === 0 ? "pass" : "fail",
+    external_status: externalStatus(scenario),
     status: errors.length === 0 ? "pass" : "fail",
     errors,
   }
@@ -505,11 +545,15 @@ export function evaluateRealWorldScenarioSuite(
   capabilities: Partial<Record<RuntimeCapabilityId, RuntimeCapabilityStatus>> = CURRENT_RUNTIME_CAPABILITIES,
 ): ScenarioSuiteReport {
   const scenarios = REAL_WORLD_SCENARIOS.map((scenario) => evaluateScenario(scenario, capabilities))
+  const pass = scenarios.filter((scenario) => scenario.status === "pass").length
+  const fail = scenarios.filter((scenario) => scenario.status === "fail").length
   return {
     generated_at: new Date().toISOString(),
     total: scenarios.length,
-    pass: scenarios.filter((scenario) => scenario.status === "pass").length,
-    fail: scenarios.filter((scenario) => scenario.status === "fail").length,
+    pass,
+    fail,
+    deterministic_pass: pass,
+    deterministic_fail: fail,
     false_pass_risk: scenarios.filter((scenario) =>
       scenario.final_status === "VERIFIED_COMPLETE" && scenario.evidence.length === 0,
     ).length,
@@ -517,6 +561,9 @@ export function evaluateRealWorldScenarioSuite(
     unnecessary_reviewer_scenarios: scenarios.filter((scenario) =>
       scenario.scenario_id === "S01_SHORT_CODE_TASK" && scenario.expected_route.reviewers.length > 0,
     ).length,
+    not_run_scenarios: scenarios.filter((scenario) => scenario.external_status === "not_run").length,
+    manual_not_run_scenarios: scenarios.filter((scenario) => scenario.external_status === "manual_not_run").length,
+    live_not_run_scenarios: scenarios.filter((scenario) => scenario.external_status === "live_not_run").length,
     scenarios,
   }
 }
@@ -524,10 +571,11 @@ export function evaluateRealWorldScenarioSuite(
 export function renderScenarioSuiteReport(report = evaluateRealWorldScenarioSuite()) {
   const lines = [
     "dll-agent real-world scenario evaluation",
-    `total=${report.total} pass=${report.pass} fail=${report.fail} false_pass_risk=${report.false_pass_risk}`,
+    `total=${report.total} deterministic_pass=${report.deterministic_pass} deterministic_fail=${report.deterministic_fail} false_pass_risk=${report.false_pass_risk}`,
     `human_intervention_scenarios=${report.human_intervention_scenarios} unnecessary_reviewer_scenarios=${report.unnecessary_reviewer_scenarios}`,
+    `external_status not_run=${report.not_run_scenarios} manual_not_run=${report.manual_not_run_scenarios} live_not_run=${report.live_not_run_scenarios}`,
     ...report.scenarios.map((scenario) =>
-      `${scenario.status.toUpperCase()} ${scenario.scenario_id} ${scenario.final_status} route=${[
+      `${scenario.status.toUpperCase()} ${scenario.scenario_id} ${scenario.final_status} layer=${scenario.evaluation_layer} external=${scenario.external_status} route=${[
         "commander",
         ...scenario.expected_route.reviewers,
         ...scenario.expected_route.dispatch,

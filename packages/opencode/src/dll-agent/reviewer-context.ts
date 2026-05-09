@@ -1,8 +1,9 @@
 import { execFileSync } from "child_process"
 import { messageText } from "./triggers"
-import { buildResultsSummary } from "./result-ledger"
+import { write as writeEvidence } from "./evidence"
+import { buildContextHandoffPacket, renderHandoffForRole, summarizeContextHandoffPacket } from "./context-handoff-packet"
 import type { MessageV2 } from "@/session/message-v2"
-import type { ReviewerRole, SupervisorMetricsSnapshot } from "./interfaces"
+import type { ReviewerRole, SupervisorMetricsSnapshot, SupervisorState } from "./interfaces"
 
 export function latestRealUser(messages: MessageV2.WithParts[]) {
   return [...messages]
@@ -95,19 +96,52 @@ export function buildReviewerContext(
   metrics: SupervisorMetricsSnapshot,
   messages: MessageV2.WithParts[],
   sessionID?: string,
+  options?: {
+    state?: SupervisorState
+    projectDir?: string
+    maxChars?: number
+  },
 ) {
+  return buildReviewerContextWithPacket(reviewer, reason, metrics, messages, sessionID, options).text
+}
+
+export function buildReviewerContextWithPacket(
+  reviewer: ReviewerRole,
+  reason: string,
+  metrics: SupervisorMetricsSnapshot,
+  messages: MessageV2.WithParts[],
+  sessionID?: string,
+  options?: {
+    state?: SupervisorState
+    projectDir?: string
+    maxChars?: number
+  },
+): { text: string; contextPacketID?: string } {
   const user = latestRealUser(messages)
   const userGoal = user ? truncate(messageText(user).trim(), 1_500) : "(no recent user text)"
   const paths = extractRelatedPaths(messages)
   const failures = recentToolFailureSummary(messages)
   const diff = gitDiffSummary(paths)
-
-  let resultSummary = ""
   if (sessionID) {
     try {
-      resultSummary = buildResultsSummary(sessionID)
+      const packet = buildContextHandoffPacket({
+        sessionID,
+        targetRole: reviewer,
+        routingReason: reason,
+        riskLevel: options?.state?.risk ?? "medium",
+        metrics,
+        fallbackUserGoal: userGoal,
+        changedFiles: paths.map((path) => ({ path })),
+        state: options?.state,
+        projectDir: options?.projectDir,
+      })
+      writeEvidence("context_handoff.packet_built", summarizeContextHandoffPacket(packet), sessionID)
+      return {
+        text: renderHandoffForRole(packet, reviewer, options?.maxChars ?? 5_000),
+        contextPacketID: packet.packet_id,
+      }
     } catch {
-      // Non-critical: reviewer context can proceed without ledger summary.
+      // Non-critical: reviewer context falls back to legacy summary if packet construction fails.
     }
   }
 
@@ -135,10 +169,5 @@ export function buildReviewerContext(
     failures.length ? failures.join("\n") : "- none",
   ]
 
-  if (resultSummary && resultSummary !== "No prior results in ledger.") {
-    contextLines.push(``)
-    contextLines.push(resultSummary)
-  }
-
-  return truncate(contextLines.join("\n"), 5_000)
+  return { text: truncate(contextLines.join("\n"), options?.maxChars ?? 5_000) }
 }

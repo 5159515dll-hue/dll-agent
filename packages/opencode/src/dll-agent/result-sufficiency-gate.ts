@@ -32,6 +32,17 @@ export type SufficiencyVerdict =
   | "conflict"                      // Prior result conflicts with current goal
   | "invalidated"                   // Prior result has been explicitly invalidated
 
+export type ResultSufficiencyAction =
+  | "reuse_existing"
+  | "verify_existing"
+  | "continue_from_existing"
+  | "repair_existing"
+  | "redo_allowed"
+  | "blocked_missing_evidence"
+  | "blocked_stale"
+  | "blocked_context_insufficient"
+  | "no_existing_result"
+
 export interface SufficiencyCheck {
   verdict: SufficiencyVerdict
   /** The result packets that match the query */
@@ -50,6 +61,8 @@ export interface SufficiencyCheck {
   evidenceRefs: string[]
   /** Why a candidate was treated as stale */
   staleReasons?: string[]
+  /** Dispatch/recovery level action derived from the verdict */
+  action: ResultSufficiencyAction
 }
 
 // ─── Sufficiency Check ─────────────────────────────────────────────────────
@@ -91,6 +104,7 @@ export function checkResultSufficiency(
       coveredScope: [],
       remainingGaps: [taskGoal],
       evidenceRefs: [],
+      action: "no_existing_result",
     }
   }
 
@@ -113,6 +127,21 @@ export function checkResultSufficiency(
 
   const bestResult = sorted[0]
 
+  // Check staleness: if result is marked stale/invalidated
+  if (bestResult.completion_status === "STALE" || bestResult.completion_status === "INVALIDATED") {
+    return {
+      verdict: "invalidated",
+      matchingResults: sorted,
+      bestResult,
+      canReuse: false,
+      neededActions: [`Result invalidated: ${bestResult.invalidation_reason ?? "unknown reason"}`],
+      coveredScope: [],
+      remainingGaps: [taskGoal],
+      evidenceRefs: bestResult.evidence_refs,
+      action: "redo_allowed",
+    }
+  }
+
   const staleReasons = resultStaleReasons(bestResult, options?.projectDir)
   if (staleReasons.length > 0) {
     return {
@@ -125,6 +154,7 @@ export function checkResultSufficiency(
       remainingGaps: [taskGoal],
       evidenceRefs: bestResult.evidence_refs,
       staleReasons,
+      action: "blocked_stale",
     }
   }
 
@@ -141,21 +171,8 @@ export function checkResultSufficiency(
         coveredScope: bestResult.files_changed.map((f) => f.filePath),
         remainingGaps: [taskGoal],
         evidenceRefs: bestResult.evidence_refs,
+        action: "blocked_stale",
       }
-    }
-  }
-
-  // Check staleness: if result is marked stale/invalidated
-  if (bestResult.completion_status === "STALE" || bestResult.completion_status === "INVALIDATED") {
-    return {
-      verdict: "invalidated",
-      matchingResults: sorted,
-      bestResult,
-      canReuse: false,
-      neededActions: [`Result invalidated: ${bestResult.invalidation_reason ?? "unknown reason"}`],
-      coveredScope: [],
-      remainingGaps: [taskGoal],
-      evidenceRefs: bestResult.evidence_refs,
     }
   }
 
@@ -171,6 +188,7 @@ export function checkResultSufficiency(
         coveredScope: bestResult.files_changed.map((f) => f.filePath),
         remainingGaps: ["Verified result packet is missing evidence refs or passed verification"],
         evidenceRefs: bestResult.evidence_refs,
+        action: "blocked_missing_evidence",
       }
     }
     return {
@@ -182,6 +200,7 @@ export function checkResultSufficiency(
       coveredScope: bestResult.files_changed.map((f) => f.filePath),
       remainingGaps: [],
       evidenceRefs: bestResult.evidence_refs,
+      action: "reuse_existing",
     }
   }
 
@@ -198,6 +217,7 @@ export function checkResultSufficiency(
         .filter((v) => v.status !== "passed")
         .map((v) => `Verification needed: ${v.name}`),
       evidenceRefs: bestResult.evidence_refs,
+      action: "verify_existing",
     }
   }
 
@@ -212,6 +232,7 @@ export function checkResultSufficiency(
       coveredScope: bestResult.files_changed.map((f) => f.filePath),
       remainingGaps: bestResult.unresolved_items,
       evidenceRefs: bestResult.evidence_refs,
+      action: "continue_from_existing",
     }
   }
 
@@ -226,6 +247,7 @@ export function checkResultSufficiency(
       coveredScope: [],
       remainingGaps: [taskGoal],
       evidenceRefs: bestResult.evidence_refs,
+      action: "repair_existing",
     }
   }
 
@@ -240,6 +262,7 @@ export function checkResultSufficiency(
       coveredScope: [],
       remainingGaps: [taskGoal],
       evidenceRefs: bestResult.evidence_refs,
+      action: "blocked_context_insufficient",
     }
   }
 
@@ -253,6 +276,7 @@ export function checkResultSufficiency(
     coveredScope: [],
     remainingGaps: [taskGoal],
     evidenceRefs: [],
+    action: "no_existing_result",
   }
 }
 
@@ -290,14 +314,25 @@ function normalize(text: string) {
 function resultStaleReasons(packet: ResultPacket, projectDir?: string) {
   const reasons: string[] = []
   for (const file of packet.files_changed) {
-    if (!file.hashAfter) continue
-    const currentHash = hashFile(resolvePath(file.filePath, projectDir))
-    if (!currentHash) {
-      reasons.push(`${file.filePath}: missing current file for hash check`)
+    const hasSnapshot = Boolean(file.hashAfter) || (typeof file.mtimeMsAfter === "number" && typeof file.sizeAfter === "number")
+    if (!hasSnapshot) continue
+    const fullPath = resolvePath(file.filePath, projectDir)
+    const stat = statFile(fullPath)
+    if (!stat) {
+      reasons.push(`${file.filePath}: missing current file`)
       continue
     }
-    if (currentHash !== file.hashAfter) {
-      reasons.push(`${file.filePath}: hash changed`)
+    if (file.hashAfter) {
+      const currentHash = hashFile(fullPath)
+      if (!currentHash || currentHash !== file.hashAfter) {
+        reasons.push(`${file.filePath}: hash changed`)
+        continue
+      }
+    }
+    if (!file.hashAfter && typeof file.mtimeMsAfter === "number" && typeof file.sizeAfter === "number") {
+      if (stat.size !== file.sizeAfter || Math.abs(stat.mtimeMs - file.mtimeMsAfter) > 1) {
+        reasons.push(`${file.filePath}: mtime/size changed`)
+      }
     }
   }
   return reasons
@@ -315,4 +350,27 @@ function hashFile(filePath: string) {
   } catch {
     return null
   }
+}
+
+function statFile(filePath: string) {
+  try {
+    if (!fs.existsSync(filePath)) return null
+    return fs.statSync(filePath)
+  } catch {
+    return null
+  }
+}
+
+export function artifactReuseDecision(packet: ResultPacket, projectDir?: string): {
+  reusable: boolean
+  reason: string
+  staleReasons: string[]
+} {
+  const staleReasons = resultStaleReasons(packet, projectDir)
+  if (staleReasons.length > 0) return { reusable: false, reason: "artifact changed or missing", staleReasons }
+  if (packet.completion_status !== "VERIFIED_COMPLETE") {
+    return { reusable: false, reason: `artifact result is ${packet.completion_status}`, staleReasons: [] }
+  }
+  if (!hasReusableEvidence(packet)) return { reusable: false, reason: "artifact result lacks verification evidence", staleReasons: [] }
+  return { reusable: true, reason: "artifact unchanged and verified", staleReasons: [] }
 }

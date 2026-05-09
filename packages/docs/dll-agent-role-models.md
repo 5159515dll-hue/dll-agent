@@ -17,6 +17,8 @@ explicit session override
 
 Role Model Registry is the unified entry point for dll-agent role model selection. It does not replace the OpenCode Provider system. Every effective role model must still be validated by `Provider.Service.getModel()` before use.
 
+`role-provider-bridge.ts` is the runtime boundary that enforces this rule. The registry returns an `EffectiveRoleModel`; the bridge validates candidates through OpenCode Provider, records provider metadata, applies fallback/default decisions, and writes a provider-validated session snapshot for TUI/doctor/status surfaces.
+
 ### Three-tier override resolution
 
 | Tier | Path | Scope |
@@ -121,28 +123,37 @@ The registry must not bypass `Provider.Service` or provider-specific request nor
 
 ## Runtime Integration
 
+### Role Provider Bridge (`role-provider-bridge.ts`)
+- `resolveRoleProvider()` resolves a role through the registry, validates primary/fallback candidates with `Provider.Service.getModel()`, and falls back to `Provider.Service.defaultModel()` only when all role candidates fail.
+- `resolveRoleProviderModel()` is the small runtime adapter used by prompt/session and agent registration paths.
+- `resolveRoleProviderHint()` is sync and hint-only; it is allowed for supervisor subtask metadata before the real runtime execution path provider-validates the model.
+- `readRoleProviderSnapshot()` lets TUI/doctor display the latest provider-validated runtime model instead of independently deciding a different model.
+- `role-model-runtime.ts` remains as a compatibility wrapper; new runtime code should call the bridge directly.
+
 ### Profile (`profile.ts`)
 - `roleRoster()`: reads effective models from registry (no hardcoded models)
 - `roleCommands()`: model fields intentionally omitted — runtime resolves from agent config via registry
 - `systemPrompt()`: references effective models
 
 ### Supervisor (`supervisor.ts`)
-- `buildSubtask()`: resolves model from registry per reviewer role, with session override support
-- `buildTaskCompletionSubtask()`: resolves model from registry
-- `markReviewerCompleted()`: uses registry model for result ledger
+- `buildSubtask()`: records a bridge hint for reviewer model metadata; actual execution is resolved by prompt/session through Provider validation
+- `buildTaskCompletionSubtask()`: records a bridge hint for metadata
+- `markReviewerCompleted()`: uses bridge hint for Result Ledger model attribution
 
 ### Session prompt (`prompt.ts`)
 - TUI model picker selections for commander are converted into commander global overrides by default.
 - `/role-model-set` writes into the same override chain; explicit `--scope session` remains available for temporary experiments.
 - Prompt execution uses the effective role model resolver; it does not manually stitch together separate `input.model`, agent model, and registry paths.
 - The resolved model is provider-validated before the user message is persisted.
+- Runtime role model resolution now calls Role Provider Bridge.
 
 ### Agent (`agent.ts`)
-- Agent defaults resolved from registry at startup via `resolveRoleModel()`
+- Agent defaults resolved through Role Provider Bridge and `Provider.Service.getModel()`
 - Config overrides still work via existing `cfg.agent[key].model` mechanism
 
 ### Doctor (`dll-doctor.ts`)
 - `checkRoleModelHealth()`: validates all role models, checks provider keys, flags voice/TTS models on coding roles, detects config conflicts
+- `role-provider-bridge`: checks the active session provider-validated model snapshot when a session is active
 
 ## Safety Rules
 
@@ -201,6 +212,7 @@ To add a new model provider:
 | Evidence written on model changes | ✅ Implemented |
 | Fallback chain resolution | ✅ Implemented |
 | Provider availability checking | ✅ Provider.Service is final authority; registry hint only |
+| Role Provider Bridge | ✅ Implemented runtime boundary and provider-validated snapshot |
 | Voice/TTS model guard | ✅ Implemented |
 | Config conflict detection (global+project overlap) | ✅ Implemented |
 | Tests (37 tests, all pass) | ✅ Implemented |

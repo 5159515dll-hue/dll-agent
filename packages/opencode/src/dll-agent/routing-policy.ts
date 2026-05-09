@@ -44,10 +44,41 @@ export function assessRisk(metrics: Metrics): RiskLevel {
   if (metrics.reviewerConflictSignal) score += 2
 
   if (metrics.finalClaim && !metrics.verificationEvidence) score += 3
+  if (metrics.highRiskTaskSignal) score += 4
 
   if (score >= 6) return "high"
   if (score >= 3) return "medium"
   return "low"
+}
+
+export type RoutingDecisionAction =
+  | "commander_only"
+  | "trigger_reviewer"
+  | "trigger_multiple_reviewers"
+  | "trigger_cross_review"
+  | "trigger_final_auditor"
+  | "skip_reviewer"
+  | "blocked_provider_unavailable"
+
+export type RoutingDecision = {
+  action: RoutingDecisionAction
+  role?: string
+  reviewers?: string[]
+  selected_model?: string
+  candidate_models?: string[]
+  trigger_reason: string
+  correctness_reason: string
+  cost_reason?: string
+  risk_level: RiskLevel
+  evidence_refs: string[]
+  result_refs: string[]
+  skipped_reviewers: Array<{
+    role: string
+    skip_reason: string
+    correctness_required: boolean
+  }>
+  cooldown_state?: unknown
+  budget_state?: unknown
 }
 
 export function hasNonTextInput(messages: MessageV2.WithParts[]) {
@@ -105,4 +136,3 @@ export function reviewerRequiredForCorrectness(
   if (reviewer === "multimodal-context-interpreter" && reason.includes("multimodal input")) return true
   return false
 }
-

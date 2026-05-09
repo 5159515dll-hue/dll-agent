@@ -28,6 +28,12 @@ function formatProviderCost(cost: number, providerID: string): string {
   return money.format(cost)
 }
 
+export function modelUsageIdentity(input: { providerID: string; modelID: string; name?: string | null }) {
+  const exact = `${input.providerID}/${input.modelID}`
+  if (!input.name || input.name === input.modelID) return exact
+  return `${exact} (${input.name})`
+}
+
 function readQuotaFile() {
   const file = process.env.DLL_AGENT_QUOTA_FILE
   if (!file) return
@@ -211,7 +217,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             {(item) => (
               <box paddingBottom={1}>
                 <text fg={theme().textMuted}>
-                  {item.providerID}/{item.name}
+                  {modelUsageIdentity(item)}
                 </text>
                 <text fg={theme().textMuted}>
                   local est. {formatProviderCost(item.cost, item.providerID)} · {item.tokens.toLocaleString()} tokens · {item.calls} call

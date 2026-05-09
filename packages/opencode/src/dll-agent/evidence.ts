@@ -111,3 +111,19 @@ export function write(type: string, payload: unknown, sessionID?: string) {
   }
 }
 
+export function readEntries(target: string | undefined = file()): Entry[] {
+  if (!target) return []
+  try {
+    if (!fs.existsSync(target)) return []
+    return fs.readFileSync(target, "utf8").split("\n").flatMap((line) => {
+      if (!line.trim()) return []
+      try {
+        return [JSON.parse(line) as Entry]
+      } catch {
+        return []
+      }
+    })
+  } catch {
+    return []
+  }
+}

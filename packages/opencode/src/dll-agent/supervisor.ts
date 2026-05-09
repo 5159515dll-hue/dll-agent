@@ -7,21 +7,27 @@
 
 import fs from "fs"
 import path from "path"
-import { metrics as computeMetrics, type Metrics } from "./triggers"
+import { metrics as computeMetrics } from "./triggers"
 import { write as writeEvidence, redact } from "./evidence"
-import { recordGateBlock, isGateRetryExhausted } from "./gates"
-import { ProviderID, ModelID } from "@/provider/schema"
+import {
+  applyReviewerCompletedToState,
+  applySupervisorDecisionToState,
+  clearResolvedBlockState,
+  freshSupervisorState,
+  metricsFromSupervisorSnapshot,
+  normalizeSupervisorReviewerState,
+} from "./supervisor-state-machine"
 import { SessionID, MessageID, PartID } from "@/session/schema"
-import { resolveRoleModel } from "./role-model-registry"
+import { resolveRoleProviderHint } from "./role-provider-bridge"
 import {
   type SupervisorState,
   type TriggerDecision,
   type ReviewerRole,
   type CooldownStatus,
-  type RiskLevel,
   type ReviewerOutput,
   type SupervisorMetricsSnapshot,
   COOLDOWN_CONFIG,
+  parseReviewerOutput,
 } from "./interfaces"
 import type { MessageV2 } from "@/session/message-v2"
 import { buildContinuationSubtaskPrompt } from "./continuation-gate"
@@ -29,15 +35,19 @@ import { checkDeduplication } from "./deduplication-gate"
 import { writeReviewerResult } from "./reviewer-result-bridge"
 import {
   assessRisk,
-  hasNonTextInput,
   maxReviewersForRouting,
   modelContextLimit,
   reviewerModelCandidates,
   reviewerRequiredForCorrectness,
   reviewerToDllRole,
 } from "./routing-policy"
+import { applySupervisorTriggerRules, needsAutoVerifier } from "./supervisor-trigger-rules"
+import { buildReviewerPrompt } from "./reviewer-prompt-templates"
 import { writeRoutingEvidence } from "./routing-evidence"
-import { buildReviewerContext, extractRelatedPaths, latestRealUser } from "./reviewer-context"
+import { buildReviewerContextWithPacket, extractRelatedPaths, latestRealUser } from "./reviewer-context"
+import { buildGuardDecision } from "./action-fingerprint-gate"
+import { buildRoleRunEnvelope } from "./role-run-envelope"
+import { roleToolPolicyFor } from "./role-tool-policy"
 import os from "os"
 
 export { assessRisk, modelContextLimit } from "./routing-policy"
@@ -58,7 +68,7 @@ export function loadState(sessionID: string): SupervisorState {
   } catch {
     // Corrupted state file — start fresh
   }
-  return freshState()
+  return freshSupervisorState()
 }
 
 function atomicWrite(file: string, data: string) {
@@ -70,51 +80,10 @@ function atomicWrite(file: string, data: string) {
 
 export function saveState(sessionID: string, state: SupervisorState) {
   try {
-    normalizeReviewerState(state)
+    normalizeSupervisorReviewerState(state)
     atomicWrite(stateFile(sessionID), JSON.stringify(redact(state), null, 2))
   } catch {
     // Non-critical; supervisor state persistence is best-effort
-  }
-}
-
-function normalizeReviewerState(state: SupervisorState) {
-  state.completed_reviews = [...new Set(state.completed_reviews ?? [])]
-  const completed = new Set(state.completed_reviews)
-  state.required_reviews = [...new Set((state.required_reviews ?? []).filter((r) => !completed.has(r)))]
-  state.queued_reviewers = [...new Set((state.queued_reviewers ?? []).filter((r) => !completed.has(r as ReviewerRole)))]
-    .map((r) => r as ReviewerRole)
-  state.running_reviewers = [...new Set((state.running_reviewers ?? []).filter((r) => !completed.has(r as ReviewerRole)))]
-    .map((r) => r as ReviewerRole)
-  if (completed.has("role-cross") && state.required_reviews.length === 0) state.reviewer_conflict = false
-}
-
-function freshState(): SupervisorState {
-  return {
-    version: 1,
-    phase: "default",
-    risk: "low",
-    required_reviews: [],
-    completed_reviews: [],
-    blocked_completion: false,
-    block_reason: null,
-    reviewer_conflict: false,
-    metrics: {
-      tool_failures: 0,
-      permission_denied: 0,
-      user_corrections: 0,
-      context_percent: 0,
-      context_tokens: 0,
-      final_claim: false,
-      verification_evidence: false,
-      reviewer_conflict_signal: false,
-      repeated_tool_failure: false,
-      real_tool_evidence: false,
-    },
-    active_skills: [],
-    queued_reviewers: [],
-    running_reviewers: [],
-    gate_block_retries: {},
-    updated_at: new Date().toISOString(),
   }
 }
 
@@ -427,113 +396,27 @@ export function decide(
     })
   }
 
-  // 规则 1：用户纠偏 → requirements-inspector
-  if (metrics.recentUserCorrection || metrics.userCorrections >= 1) {
-    const reason = metrics.recentUserCorrection
-      ? "user correction detected in most recent message"
-      : `user corrections detected in ${metrics.userCorrections} recent messages`
-    addReviewer("requirements-inspector", reason)
-  }
-
-  // 规则 2：长上下文 / 文档任务 → long-context-archivist
-  if (metrics.longContextSignal) {
-    const reason = metrics.contextPercent >= 40
-      ? `context at ${metrics.contextPercent}% of limit`
-      : "long-context or document-task signal detected in messages"
-    addReviewer("long-context-archivist", reason)
-  }
-
-  // 规则 2b (Phase 6): Kimi pre-report context compression
-  // When context is >=30% and final claim detected, proactively compress context
-  // via Kimi before the final report. Reduces DeepSeek token consumption on the report turn.
-  if (metrics.kimiPreReportSignal && !reviewers.includes("long-context-archivist")) {
-    const reason = `pre-report context compression: context at ${metrics.contextPercent}% with final claim`
-    addReviewer("long-context-archivist", reason)
-  }
-
-  // 规则 2c (Phase 6): Phase switch → long-context-archivist for handoff packet
-  if (metrics.phaseSwitchSignal) {
-    const reason = "phase switch or task direction change detected"
-    addReviewer("long-context-archivist", reason)
-  }
-
-  // 规则 3：重复工具失败 → chief-engineer 或 role-cross
-  if (metrics.repeatedToolFailure || metrics.toolFailures >= 3) {
-    const reason = metrics.repeatedToolFailure
-      ? "repeated tool failure detected (same error pattern)"
-      : `${metrics.toolFailures} tool failures in recent messages`
-    addReviewer("chief-engineer", reason)
-    if (metrics.toolFailures >= 4 || metrics.reviewerConflictSignal) {
-      addReviewer("role-cross", "third repeated failure or reviewer conflict requires cross-review")
-    }
-  }
-
-  // 规则 4：权限拒绝 → chief-engineer
-  if (metrics.permissionDenied >= 1 && !reviewers.includes("chief-engineer")) {
-    addReviewer("chief-engineer", `permission denied detected in ${metrics.permissionDenied} tool call(s)`)
-  }
-
-  // 规则 5：reviewer 冲突 → role-cross
-  if (metrics.reviewerConflictSignal) {
-    addReviewer("role-cross", "reviewer conflict signal detected")
-  }
-
-  // 规则 6：高风险最终声明且缺验证 → final gate + high-risk auditor
-  if (metrics.finalClaim && !metrics.verificationEvidence) {
-    if (risk === "high") {
-      addReviewer("final-auditor", "high-risk final claim without verification evidence")
-    }
-  }
-
-  // 规则 8 (Phase 6): GLM completion-claim-check
-  // Trigger requirements-inspector when a completion claim is made
-  // without real tool evidence OR when the claim contradicts unfinished indicators
-  if (metrics.glmCompletionClaimSignal && !reviewers.includes("requirements-inspector")) {
-    const reason = metrics.realToolEvidence
-      ? "completion claim with suspected contradiction (correction pattern in claim text)"
-      : "completion claim without real tool evidence — requirements check needed"
-    addReviewer("requirements-inspector", reason)
-  }
-
-  // 规则 9 (Phase 6): Kimi task-completion-archivist — completion claim with unfinished items
-  // Trigger Kimi to generate a continuation packet before allowing final stop
-  if (metrics.kimiCompletionCheckSignal) {
-    const reason = "completion claim with unfinished indicators detected"
-    addReviewer("task-completion-archivist", reason)
-  }
-
-  // 规则 10 (Phase 6): Scope expansion → requirements-inspector
-  if (metrics.scopeExpandedSignal && !reviewers.includes("requirements-inspector")) {
-    const reason = "scope expansion or feature creep detected"
-    addReviewer("requirements-inspector", reason)
-  }
-
-  // 规则 11 (Phase 6): Token-aware routing — when context is very high,
-  // prioritize Kimi for context compression over DeepSeek for further tasks.
-  // This is advisory; the actual routing happens in decide() return.
-  if (contextLimit && (metrics.contextPercent >= 60 || metrics.contextTokens > contextLimit * 0.6)) {
-    writeEvidence("routing.token_aware", {
+  applySupervisorTriggerRules({
+    metrics,
+    messages,
+    risk,
+    contextLimit,
+  }, {
+    addReviewer,
+    hasReviewer: (reviewer) => reviewers.includes(reviewer),
+    writeTokenAwareEvidence: () => writeEvidence("routing.token_aware", {
       reason: "high context — Kimi prioritization recommended",
       context_percent: metrics.contextPercent,
       context_tokens: metrics.contextTokens,
       context_limit: contextLimit,
       step: currentStep,
-    }, sessionID)
-  }
-
-  // 规则 12 (Phase 8): Multimodal input signal → multimodal-context-interpreter
-  // Trigger the multimodal role when non-text inputs (images, video, audio, etc.)
-  // are detected but only on-demand — not for every task.
-  if (metrics.multimodalSignal && hasNonTextInput(messages)) {
-    const reason = "multimodal input detected (screenshot, image, video, audio, PPT figure, chart, etc.)"
-    addReviewer("multimodal-context-interpreter" as ReviewerRole, reason)
-  } else if (metrics.multimodalSignal) {
-    writeRoutingEvidence({
+    }, sessionID),
+    writeMultimodalSkip: () => writeRoutingEvidence({
       sessionID,
       taskID: sessionID,
       role: "multimodal-context-interpreter",
-      selectedModel: reviewerModelCandidates("multimodal-context-interpreter" as ReviewerRole, sessionID).selected,
-      candidateModels: reviewerModelCandidates("multimodal-context-interpreter" as ReviewerRole, sessionID).candidates,
+      selectedModel: reviewerModelCandidates("multimodal-context-interpreter", sessionID).selected,
+      candidateModels: reviewerModelCandidates("multimodal-context-interpreter", sessionID).candidates,
       riskLevel: risk,
       triggerReason: "multimodal keyword signal without non-text input",
       skippedReviewers: ["multimodal-context-interpreter"],
@@ -542,15 +425,13 @@ export function decide(
       costReason: "prevent multimodal/TTS model from entering a pure code task",
       evidenceRefs: [],
       requiredForCorrectness: false,
-    })
-  }
+    }),
+  })
 
   // 规则 7（auto-verifier）：completion blocked + 缺真实 tool evidence → 自动注入 verifier subtask
   // 这使得模型不需要"记得"运行验证 — supervisor 在代码层强制注入验证任务。
-  const needsVerifier =
-    metrics.finalClaim && !metrics.realToolEvidence && (metrics.toolFailures === 0)
   let verifierTask: MessageV2.SubtaskPart | undefined
-  if (needsVerifier) {
+  if (needsAutoVerifier(metrics)) {
     verifierTask = buildVerifierSubtask(
       sessionID,
       "completion claim without real tool evidence (auto-verifier)",
@@ -567,7 +448,7 @@ export function decide(
     const required = reviewers.filter((reviewer) => reviewerRequiredForCorrectness(reviewer, reasons[reviewer], risk, metrics))
     const optional = reviewers.filter((reviewer) => !required.includes(reviewer))
     const selected = required.length >= maxReviewers
-      ? required
+      ? required.slice(0, maxReviewers)
       : [...required, ...optional.slice(0, maxReviewers - required.length)]
     const skipped = reviewers.filter((reviewer) => !selected.includes(reviewer))
     for (const r of skipped) {
@@ -588,13 +469,38 @@ export function decide(
         triggerReason: reasons[r],
         skippedReviewers: [r],
         skipReason: "correctness_aware_routing_budget",
-        correctnessReason: "reviewer was not required for correctness after required reviewers were selected",
+        correctnessReason: reviewerRequiredForCorrectness(r, reasons[r], risk, metrics)
+          ? "correctness-required reviewer exceeded per-round budget and remains unresolved"
+          : "reviewer was not required for correctness after required reviewers were selected",
         costReason: "avoid low-value multi-model meeting beyond the current risk budget",
         evidenceRefs: fingerprints[r] ? [fingerprints[r]!] : [],
-        requiredForCorrectness: false,
+        requiredForCorrectness: reviewerRequiredForCorrectness(r, reasons[r], risk, metrics),
       })
     }
     reviewers.splice(0, reviewers.length, ...selected)
+  }
+
+  if (reviewers.length === 0 && !verifierTask) {
+    const commanderModel = resolveRoleProviderHint({
+      role: "commander",
+      sessionID,
+      projectDir: process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR,
+    })
+    writeRoutingEvidence({
+      sessionID,
+      taskID: sessionID,
+      role: "commander",
+      action: "commander_only",
+      selectedModel: `${commanderModel.providerID}/${commanderModel.modelID}`,
+      candidateModels: [`${commanderModel.providerID}/${commanderModel.modelID}`],
+      riskLevel: risk,
+      triggerReason: "ordinary low-risk task or no correctness-required reviewer trigger",
+      skippedReviewers: [],
+      correctnessReason: "commander can proceed alone because no correction, repeated failure, evidence gap, high-risk, conflict, long-context, or multimodal trigger was present",
+      costReason: "avoid unnecessary multi-model review when correctness does not require it",
+      evidenceRefs: [],
+      requiredForCorrectness: false,
+    })
   }
 
   writeEvidence("supervisor.decision", {
@@ -628,6 +534,7 @@ export function decide(
       scope_expanded_signal: metrics.scopeExpandedSignal,
       phase_switch_signal: metrics.phaseSwitchSignal,
       multimodal_signal: metrics.multimodalSignal,
+      high_risk_task_signal: metrics.highRiskTaskSignal,
     },
   }
 }
@@ -640,58 +547,8 @@ export function updateState(
   currentState?: SupervisorState,
 ): SupervisorState {
   const state = currentState ?? loadState(sessionID)
-  const riskMetrics: Metrics = {
-    userCorrections: decision.metrics.user_corrections,
-    recentUserCorrection: decision.metrics.user_corrections > 0,
-    toolFailures: decision.metrics.tool_failures,
-    permissionDenied: decision.metrics.permission_denied,
-    repeatedToolFailure: decision.metrics.repeated_tool_failure,
-    contextTokens: decision.metrics.context_tokens,
-    contextPercent: decision.metrics.context_percent,
-    longContextSignal: decision.metrics.context_percent >= 40,
-    finalClaim: decision.metrics.final_claim,
-    verificationEvidence: decision.metrics.verification_evidence,
-    realToolEvidence: decision.metrics.real_tool_evidence,
-    reviewerConflictSignal: decision.metrics.reviewer_conflict_signal,
-    kimiCompletionCheckSignal: decision.metrics.kimi_completion_check_signal ?? false,
-    glmCompletionClaimSignal: decision.metrics.glm_completion_claim_signal ?? false,
-    kimiPreReportSignal: decision.metrics.kimi_pre_report_signal ?? false,
-    scopeExpandedSignal: decision.metrics.scope_expanded_signal ?? false,
-    phaseSwitchSignal: decision.metrics.phase_switch_signal ?? false,
-    multimodalSignal: decision.metrics.multimodal_signal ?? false,
-  }
-  const risk = assessRisk(riskMetrics)
-
-  state.phase = state.phase || "default"
-  state.risk = risk
-  state.metrics = decision.metrics
-  state.updated_at = new Date().toISOString()
-
-  for (const r of decision.reviewers) {
-    if (!state.required_reviews.includes(r)) {
-      state.required_reviews.push(r)
-    }
-  }
-
+  applySupervisorDecisionToState(state, decision)
   if (decision.metrics.final_claim && !decision.metrics.verification_evidence) {
-    state.blocked_completion = true
-    state.block_reason = "completion claim without verification evidence"
-  }
-
-  if (state.blocked_completion && state.block_reason) {
-    recordGateBlock(state, state.block_reason)
-  }
-
-  if (decision.metrics.reviewer_conflict_signal) {
-    state.reviewer_conflict = true
-  }
-
-  // Continuation budget tracking
-  if (decision.metrics.final_claim && !decision.metrics.verification_evidence) {
-    state.continuation_count ??= 0
-    state.continuation_count++
-    state.repair_counts ??= {}
-    // Persist updated budget
     writeEvidence("continuation.budget_tracked", {
       continuation_count: state.continuation_count,
       step: decision.metrics.context_tokens,
@@ -706,22 +563,20 @@ export function markReviewerCompleted(
   sessionID: string,
   reviewer: ReviewerRole,
   output?: ReviewerOutput,
+  options?: {
+    rawText?: string
+    reusedFromPacketID?: string
+  },
 ) {
   const state = loadState(sessionID)
-  if (!state.completed_reviews.includes(reviewer)) {
-    state.completed_reviews.push(reviewer)
-  }
-  state.required_reviews = state.required_reviews.filter((r) => r !== reviewer)
-  state.queued_reviewers = (state.queued_reviewers ?? []).filter((r) => r !== reviewer)
-  state.running_reviewers = (state.running_reviewers ?? []).filter((r) => r !== reviewer)
-  if (reviewer === "role-cross" && state.required_reviews.length === 0) state.reviewer_conflict = false
-
-  if (output?.block_completion) {
-    state.blocked_completion = true
-    state.block_reason = `reviewer ${reviewer} blocked completion: ${output.findings.filter(f => f.severity === "block").map(f => f.summary).join("; ")}`
-  }
-
-  state.updated_at = new Date().toISOString()
+  const contextPacketID = state.reviewer_context_packets?.[reviewer]?.context_packet_id
+  const roleRun = state.role_run_envelopes?.[reviewer]
+  const normalizedOutput = output ?? (options?.rawText ? parseReviewerOutput(options.rawText) : undefined)
+  const completed = applyReviewerCompletedToState(state, reviewer, {
+    output: normalizedOutput,
+    rawText: options?.rawText,
+    reusedFromPacketID: options?.reusedFromPacketID,
+  })
   saveState(sessionID, state)
 
   try {
@@ -742,22 +597,37 @@ export function markReviewerCompleted(
 
   writeEvidence("supervisor.reviewer_completed", {
     reviewer,
-    block_completion: output?.block_completion ?? false,
-    findings_count: output?.findings.length ?? 0,
+    block_completion: normalizedOutput?.block_completion ?? completed.blockCompletion,
+    findings_count: normalizedOutput?.findings.length ?? 0,
+    context_packet_id: contextPacketID ?? null,
+    missing_context_packet: !contextPacketID,
+    role_run_id: roleRun?.role_run_id ?? null,
+    missing_role_run_envelope: !roleRun?.role_run_id,
+    structured_output_missing: !normalizedOutput && !options?.reusedFromPacketID,
+    fallback_result: !normalizedOutput,
+    reused_from: options?.reusedFromPacketID ?? null,
   }, sessionID)
 
-  writeReviewerResult({ sessionID, reviewer, output, state })
+  writeReviewerResult({
+    sessionID,
+    reviewer,
+    output: normalizedOutput,
+    state,
+    projectDir: process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR,
+    contextPacketID,
+    roleRunID: roleRun?.role_run_id,
+    roleInstanceID: roleRun?.role_instance_id,
+    actionFingerprint: roleRun?.action_fingerprint,
+    rawText: options?.rawText,
+    reusedFromPacketID: options?.reusedFromPacketID,
+  })
 }
 
 export function clearBlockIfResolved(sessionID: string) {
   const state = loadState(sessionID)
-  if (state.required_reviews.length === 0 && state.blocked_completion) {
-    state.blocked_completion = false
-    state.block_reason = null
-    state.reviewer_conflict = false
-    state.updated_at = new Date().toISOString()
-    saveState(sessionID, state)
-  }
+  const shouldSave = state.required_reviews.length === 0 && state.blocked_completion
+  clearResolvedBlockState(state)
+  if (shouldSave) saveState(sessionID, state)
   return state
 }
 
@@ -802,9 +672,12 @@ export function generateSubtasks(
           correctnessReason: "existing result is verified, reusable, and not stale",
           costReason: "avoid repeating reviewer over equivalent verified evidence",
           evidenceRefs: dedup.evidenceRefs,
+          resultRefs: dedup.existingResults[0]?.packet_id ? [dedup.existingResults[0].packet_id] : [],
           requiredForCorrectness: false,
         })
-        markReviewerCompleted(sessionID, reviewer)
+        markReviewerCompleted(sessionID, reviewer, undefined, {
+          reusedFromPacketID: dedup.existingResults[0]?.packet_id,
+        })
         // Skip this subtask — a reusable result already exists
         continue
       }
@@ -822,10 +695,13 @@ export function generateSubtasks(
 
     const subtask = buildSubtask(reviewer, reason, decision.metrics, sessionID, messages)
     subtasks.push(subtask)
+    const contextPacketID = loadState(sessionID).reviewer_context_packets?.[reviewer]?.context_packet_id
     writeEvidence("supervisor.reviewer_called", {
       reviewer,
       reason,
       fingerprint: decision.fingerprints?.[reviewer],
+      context_packet_id: contextPacketID ?? null,
+      missing_context_packet: !contextPacketID,
     }, sessionID)
   }
 
@@ -842,188 +718,61 @@ function buildSubtask(
   // Resolve effective model from Role Model Registry
   // Uses session overrides if this session has role_model_overrides in supervisor state
   const dllRole = reviewerToDllRole(reviewer)
-  const effective = resolveRoleModel(dllRole, sessionID, process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR)
+  const effective = resolveRoleProviderHint({
+    role: dllRole,
+    sessionID,
+    projectDir: process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR,
+  })
+  const effectiveModel = `${effective.providerID}/${effective.modelID}`
   const model = {
-    providerID: ProviderID.make(effective.parsed.providerID),
-    modelID: ModelID.make(effective.parsed.modelID),
+    providerID: effective.providerID,
+    modelID: effective.modelID,
   }
-  const compactContext = buildReviewerContext(reviewer, reason, metrics, messages, sessionID)
-
-  const promptTemplates: Record<ReviewerRole, string> = {
-    "requirements-inspector": [
-      `[dll-agent supervisor auto-trigger]`,
-      `<compact-review-context>`,
-      compactContext,
-      `</compact-review-context>`,
-      ``,
-      `Act as the requirements inspector (${effective.primary}). Check:`,
-      `1. Is the current work still aligned with the user's original Chinese intent?`,
-      `2. Are there any contradictions, phase drift, or rule violations?`,
-      `3. Are all important claims backed by evidence?`,
-      ``,
-      `ROLE BOUNDARY: use the compact context first. Only read listed relevant files when needed. Do not scan the whole repo.`,
-      `The runtime enforces this reviewer as read-only; bash/edit/web/task tools are denied.`,
-      `Finish promptly and emit the JSON verdict.`,
-      ``,
-      `IMPORTANT: Output your findings in this exact machine-readable JSON format:`,
-      `\`\`\`json`,
-      JSON.stringify(emptyReviewerOutput("requirements-inspector", reason), null, 2),
-      `\`\`\``,
-      ``,
-      `Cite precise evidence. If you find blockers, set "block_completion": true and add findings with severity "block".`,
-    ].join("\n"),
-    "long-context-archivist": [
-      `[dll-agent supervisor auto-trigger]`,
-      `<compact-review-context>`,
-      compactContext,
-      `</compact-review-context>`,
-      ``,
-      `Act as the long-context archivist (${effective.primary}). Check:`,
-      `1. Are there logs, documents, baselines, or phase history that have been lost or misread?`,
-      `2. Is the conversation context coherent across the full session?`,
-      `3. Are there missing pieces of evidence from earlier phases?`,
-      ``,
-      `ROLE BOUNDARY: use the compact context first. Only read listed relevant files/logs when needed. Do not scan the whole repo.`,
-      `The runtime enforces this reviewer as read-only; bash/edit/web/task tools are denied.`,
-      `Finish promptly and emit the JSON verdict.`,
-      ``,
-      `IMPORTANT: Output in machine-readable JSON format as shown.`,
-      `\`\`\`json`,
-      JSON.stringify(emptyReviewerOutput("long-context-archivist", reason), null, 2),
-      `\`\`\``,
-    ].join("\n"),
-    "chief-engineer": [
-      `[dll-agent supervisor auto-trigger]`,
-      `<compact-review-context>`,
-      compactContext,
-      `</compact-review-context>`,
-      ``,
-      `Act as the chief engineer (${effective.primary}). Diagnose the tool failures:`,
-      `1. What is the root cause of the failures?`,
-      `2. Can the failures be fixed with a different approach, tool, or permission?`,
-      `3. Is the current task approach fundamentally broken?`,
-      ``,
-      `Propose actionable engineering fixes with exact commands/paths.`,
-      `Output in machine-readable JSON format as shown.`,
-    ].join("\n"),
-    "final-auditor": [
-      `[dll-agent supervisor auto-trigger]`,
-      `<compact-review-context>`,
-      compactContext,
-      `</compact-review-context>`,
-      ``,
-      `Act as the on-demand strategic/final auditor (${effective.primary}). Check:`,
-      `1. Is the user goal truly complete?`,
-      `2. Is there sufficient evidence for the completion claim?`,
-      `3. Are there outstanding engineering risks or unverified claims?`,
-      `4. Is the strategic direction still sound?`,
-      ``,
-      `ROLE BOUNDARY: this is a read-only audit. Do not run commands, edit files, patch files, or create subtasks.`,
-      `The runtime enforces this reviewer as read-only; write/exec/task tools are denied.`,
-      ``,
-      `Output in machine-readable JSON format as shown.`,
-      `\`\`\`json`,
-      JSON.stringify(emptyReviewerOutput("final-auditor", reason), null, 2),
-      `\`\`\``,
-    ].join("\n"),
-    "role-cross": [
-      `[dll-agent supervisor auto-trigger]`,
-      `<compact-review-context>`,
-      compactContext,
-      `</compact-review-context>`,
-      ``,
-      `Run a temporary role-crossing review (${effective.primary}). Inspect the problem from a different role's perspective:`,
-      `1. Find blind spots that the current role may have missed.`,
-      `2. Identify missing evidence.`,
-      `3. Propose actionable recovery steps.`,
-      ``,
-      `This role crossing ends after this review round. Output in machine-readable JSON format.`,
-      `\`\`\`json`,
-      JSON.stringify(emptyReviewerOutput("role-cross", reason), null, 2),
-      `\`\`\``,
-    ].join("\n"),
-    "task-completion-archivist": [
-      `[dll-agent supervisor auto-trigger]`,
-      `<compact-review-context>`,
-      compactContext,
-      `</compact-review-context>`,
-      ``,
-      `Act as the task-completion-archivist (${effective.primary}). Check whether the task is truly complete:`,
-      `1. Is the user goal fully achieved?`,
-      `2. Are there blocking unfinished items in the completion report?`,
-      `3. Classify ALL unfinished items as: blocking_unfinished | non_blocking_followup | requires_user_input`,
-      `4. If blocking items exist, generate a continuation packet with a next_execution_plan.`,
-      `5. Never mark as VERIFIED_COMPLETE if blocking unfinished items exist.`,
-      ``,
-      `ROLE BOUNDARY: use the compact context first. Only read listed relevant files when needed.`,
-      `The runtime enforces this reviewer as read-only; bash/edit/web/task tools are denied.`,
-      `Output a CONTINUATION PACKET in the following JSON format:`,
-      `\`\`\`json`,
-      JSON.stringify({
-        version: 1,
-        reviewer: "task-completion-archivist",
-        trigger_reason: reason,
-        verdict: "pass",
-        completion_status: "UNVERIFIED_COMPLETE",
-        blocking_unfinished: [],
-        non_blocking_followup: [],
-        requires_user_input: [],
-        already_completed: [],
-        next_execution_plan: [],
-        allow_final_report: false,
-        findings: [],
-        score: 100,
-        block_completion: false,
-        next_actions: [],
-        evidence_confidence: 100,
-        ts: new Date().toISOString(),
-      }, null, 2),
-      `\`\`\``,
-    ].join("\n"),
-    "multimodal-context-interpreter": [
-      `[dll-agent supervisor auto-trigger]`,
-      `<compact-review-context>`,
-      compactContext,
-      `</compact-review-context>`,
-      ``,
-      `Act as the multimodal context interpreter (${effective.primary}). Your role is to analyze non-text inputs:`,
-      `1. Identify all non-text inputs (screenshots, images, webpage visuals, PPT figures, flowcharts, charts, video, audio)`,
-      `2. Extract observations: text content, visual layout, structure, errors, warnings, important details`,
-      `3. Assign confidence (low/medium/high) to each observation`,
-      `4. Set context_sufficient=false if the input is too ambiguous`,
-      `5. NEVER claim high confidence if uncertainties remain`,
-      ``,
-      `ROLE BOUNDARY: read-only analysis. Do not modify files, run code, or make engineering decisions.`,
-      `The runtime enforces this reviewer as read-only; bash/edit/task tools are denied.`,
-      `Output a structured multimodal_context_packet using the schema from multimodal-context.ts.`,
-      ``,
-      `IMPORTANT: Output in this JSON format:`,
-      `\`\`\`json`,
-      JSON.stringify({
-        packet_type: "multimodal_context_packet",
-        packet_id: "mmctx_placeholder",
-        source_hash: "auto-generated",
-        role: "multimodal-context-interpreter",
-        model: effective.primary,
-        input_type: "screenshot",
-        user_goal: reason,
-        source_ref: "",
-        task_relevance: "",
-        observations: [],
-        detected_text: null,
-        visual_structure: null,
-        errors_or_warnings: [],
-        important_details: [],
-        uncertainties: [],
-        overall_confidence: "medium",
-        context_sufficient: true,
-        recommended_next_role: null,
-        evidence_refs: [],
-        redaction_status: "none",
-        created_at: new Date().toISOString(),
-      }, null, 2),
-      `\`\`\``,
-    ].join("\n"),
+  const projectDir = process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR
+  const context = buildReviewerContextWithPacket(reviewer, reason, metrics, messages, sessionID, {
+    state: loadState(sessionID),
+    projectDir,
+  })
+  const compactContext = context.text
+  if (context.contextPacketID) {
+    const state = loadState(sessionID)
+    state.reviewer_context_packets ??= {}
+    state.reviewer_context_packets[reviewer] = {
+      context_packet_id: context.contextPacketID,
+      built_at: new Date().toISOString(),
+    }
+    const policy = roleToolPolicyFor(dllRole)
+    const envelope = buildRoleRunEnvelope({
+      sessionID,
+      role: reviewer,
+      model: effectiveModel,
+      contextPacketID: context.contextPacketID,
+      triggerReason: reason,
+      riskLevel: state.risk,
+      allowedActions: policy.allow,
+      forbiddenActions: policy.deny,
+      files: extractRelatedPaths(messages),
+      failureFingerprint: metrics.repeated_tool_failure ? reason : null,
+    })
+    state.role_run_envelopes ??= {}
+    state.role_run_envelopes[reviewer] = {
+      role_run_id: envelope.role_run_id,
+      role_instance_id: envelope.role_instance_id,
+      model: envelope.model,
+      context_packet_id: envelope.context_packet_id,
+      action_fingerprint: envelope.action_fingerprint,
+      independence_mode: envelope.independence_mode,
+      built_at: envelope.created_at,
+    }
+    writeEvidence("role_run.envelope_built", envelope, sessionID)
+    writeEvidence("model.guard_decision", buildGuardDecision({
+      guard: "role_run_envelope",
+      action: "allow",
+      requiredForCorrectness: reviewerRequiredForCorrectness(reviewer, reason, state.risk, metricsFromSupervisorSnapshot(metrics)),
+      reason: "role run envelope preserves role boundary without changing model capability",
+    }), sessionID)
+    state.updated_at = new Date().toISOString()
+    saveState(sessionID, state)
   }
 
   return {
@@ -1035,7 +784,7 @@ function buildSubtask(
     description: `Auto reviewer: ${reviewer} triggered by ${reason}`,
     command: "dll-agent-supervisor",
     model: model,
-    prompt: promptTemplates[reviewer],
+    prompt: buildReviewerPrompt({ reviewer, reason, compactContext, effectiveModel }),
   }
 }
 
@@ -1114,7 +863,11 @@ export function buildTaskCompletionSubtask(
     userGoal: userGoal.slice(0, 100),
   }, sessionID)
 
-  const effective = resolveRoleModel("task-completion-archivist", sessionID, process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR)
+  const effective = resolveRoleProviderHint({
+    role: "task-completion-archivist",
+    sessionID,
+    projectDir: process.env.DLL_AGENT_ROOT || process.env.OPENER_DIR,
+  })
 
   return {
     type: "subtask" as const,
@@ -1124,23 +877,8 @@ export function buildTaskCompletionSubtask(
     agent: "task-completion-archivist",
     description: "Kimi task-completion-archivist: check unfinished items",
     command: "dll-agent-supervisor",
-    model: { providerID: ProviderID.make(effective.parsed.providerID), modelID: ModelID.make(effective.parsed.modelID) },
+    model: { providerID: effective.providerID, modelID: effective.modelID },
     prompt,
-  }
-}
-
-function emptyReviewerOutput(reviewer: ReviewerRole, reason: string) {
-  return {
-    version: 1,
-    reviewer,
-    trigger_reason: reason,
-    verdict: "pass" as const,
-    findings: [],
-    score: 100,
-    block_completion: false,
-    next_actions: [],
-    evidence_confidence: 100,
-    ts: new Date().toISOString(),
   }
 }
 

@@ -15,18 +15,26 @@
 
 import { classifyCommand, classifyFileOp } from "./permission-classifier"
 import { lspDoctorCheck } from "./lsp-bridge"
+import { DEFAULT_LSP_STRATEGY } from "./lsp-strategy"
 import { getStorageStats } from "./evidence-rotation"
 import { checkEvidenceGate, checkReconciliationGate, finalGate } from "./gates"
 import { checkContinuationGate } from "./continuation-gate"
 import { CAPABILITY_ORCHESTRATOR_VERSION } from "./capability-orchestrator"
+import { buildCapabilityPromptIndex } from "./capability-status"
+import { buildEffectiveCapabilityManifest } from "./capability-registry"
+import { mapAllBuiltins } from "./capability-mapping"
+import { GLOBAL_DEFAULT_TOOLS } from "./tool-catalog"
+import { SKILL_REGISTRY } from "./skill-registry"
 import { scanArtifactLedger } from "./artifact-ledger"
 import { buildEvidenceSnapshot } from "./evidence-normalizer"
 import { evaluateCompletionReadiness } from "./completion-readiness"
 import { doctorCheck as roleModelDoctorCheck } from "./role-model-registry"
+import { readRoleProviderSnapshot } from "./role-provider-bridge"
 import { doctorCheckRoleToolPolicy } from "./role-tool-policy"
 import { doctorCheckGoalContracts } from "./goal-contract"
-import { buildTaskObservabilityReport } from "./task-observability"
-import { evaluateRealWorldScenarioSuite } from "./scenario-evaluation"
+import { checkObservabilityHealth, checkScenarioEvaluationHealth } from "./doctor-checks"
+import { getPermissionMode, permissionModeDescription } from "./permission-mode"
+import { loadStatus } from "./mcp-manager"
 import type { RiskLevel } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
 import { execSync } from "child_process"
@@ -125,6 +133,21 @@ function checkRoleToolPolicy(): DoctorCheck[] {
   }]
 }
 
+function checkPermissionMode(): DoctorCheck[] {
+  const mode = getPermissionMode()
+  return [{
+    name: "permission-mode",
+    severity: mode === "full-access" ? "WARN" : "PASS",
+    message: mode === "full-access"
+      ? "Permission mode is Full Access: all permission requests are allowed by explicit user choice and should be treated as a trusted mode"
+      : `Permission mode is ${mode}: ${permissionModeDescription(mode)}`,
+    nextAction: mode === "full-access"
+      ? "Use /permissions auto-review for risk-based approvals, or /permissions default for OpenCode prompts"
+      : null,
+    evidence: `mode=${mode}`,
+  }]
+}
+
 function checkGoalContractHealth(): DoctorCheck[] {
   const result = doctorCheckGoalContracts()
   return [{
@@ -157,11 +180,25 @@ function checkLspStrategy(projectRoot: string): DoctorCheck[] {
   checks.push({
     name: "lsp-mode",
     severity: result.mode === "project-main" ? "PASS" : "WARN",
-    message: `LSP prewarm mode: ${result.mode}`,
+    message: `LSP prewarm mode: ${result.mode}; prewarm=${result.prewarmCount}, lazy=${result.lazyCount}, targets=${result.targetCount}`,
     nextAction: result.mode === "all-detected"
       ? "Consider switching to project-main mode for better performance"
       : null,
-    evidence: null,
+    evidence: `mode=${result.mode}, prewarm=${result.prewarmCount}, lazy=${result.lazyCount}, targets=${result.targetCount}`,
+  })
+
+  checks.push({
+    name: "lsp-prewarm-targets",
+    severity: result.excludedTargetCount === 0 && result.targetCount <= DEFAULT_LSP_STRATEGY.maxTotalPrewarmFiles
+      ? "PASS"
+      : "FAIL",
+    message: result.excludedTargetCount === 0
+      ? `LSP project-main prewarm targets are bounded (${result.targetCount}/${DEFAULT_LSP_STRATEGY.maxTotalPrewarmFiles}) and exclude generated/vendor dirs`
+      : `LSP prewarm target includes excluded directory (${result.excludedTargetCount})`,
+    nextAction: result.excludedTargetCount === 0
+      ? null
+      : "Fix lsp-strategy.ts excluded directory filtering before enabling runtime prewarm",
+    evidence: `excluded=${result.excludedTargetCount}`,
   })
 
   for (const warning of result.warnings) {
@@ -661,6 +698,139 @@ function checkCapabilityHealth(projectRoot?: string): DoctorCheck[] {
   })
 
   try {
+    const builtins = mapAllBuiltins(GLOBAL_DEFAULT_TOOLS, SKILL_REGISTRY)
+    const manifest = buildEffectiveCapabilityManifest({
+      builtin: builtins,
+      projectDir: projectRoot,
+      recordEvidence: false,
+    })
+    const kinds = ["skill", "tool", "mcp", "lsp", "multimodal"]
+    const missingKinds = kinds.filter((kind) => (manifest.by_kind[kind] ?? 0) === 0)
+    checks.push({
+      name: "capability-effective-manifest",
+      severity: missingKinds.length === 0 ? "PASS" : "FAIL",
+      message: missingKinds.length === 0
+        ? `Effective capability manifest covers ${kinds.join("/")} (${manifest.entries.length} entries)`
+        : `Effective capability manifest missing kind(s): ${missingKinds.join(", ")}`,
+      nextAction: missingKinds.length === 0 ? null : "Register missing built-in capability kinds",
+      evidence: `by_kind=${JSON.stringify(manifest.by_kind)}, by_status=${JSON.stringify(manifest.by_status)}`,
+    })
+
+    const promptIndex = buildCapabilityPromptIndex(manifest, 1_200)
+    checks.push({
+      name: "capability-prompt-index",
+      severity: promptIndex.length <= 1_200 && !promptIndex.includes("API_KEY=") && !promptIndex.includes("TOKEN=") ? "PASS" : "FAIL",
+      message: `Capability prompt index is bounded (${promptIndex.length}/1200 chars) and contains ids/status only`,
+      nextAction: promptIndex.length <= 1_200 ? null : "Reduce capability prompt index maximum length",
+      evidence: `length=${promptIndex.length}`,
+    })
+
+    const heavyMcp = manifest.entries.filter((entry) => entry.kind === "mcp" && entry.runtime?.heavy)
+    const runningHeavy = heavyMcp.filter((entry) => manifest.effective_status[entry.id] === "running")
+    checks.push({
+      name: "capability-heavy-mcp-on-demand",
+      severity: runningHeavy.length === 0 ? "PASS" : "WARN",
+      message: runningHeavy.length === 0
+        ? `Heavy MCP registered/on-demand and not running by manifest (${heavyMcp.map((entry) => entry.id).join(", ") || "none"})`
+        : `Heavy MCP appears running by manifest: ${runningHeavy.map((entry) => entry.id).join(", ")}`,
+      nextAction: runningHeavy.length === 0 ? null : "Verify running MCP belongs to an active user-approved task",
+      evidence: heavyMcp.map((entry) => `${entry.id}:${manifest.effective_status[entry.id]}:${entry.start_policy}`).join(", "),
+    })
+
+    const github = manifest.entries.find((entry) => entry.id === "github")
+    if (github) {
+      const status = manifest.effective_status[github.id]
+      checks.push({
+        name: "capability-github-token",
+        severity: status === "requires_key" ? "WARN" : "PASS",
+        message: status === "requires_key"
+          ? "GitHub capability is registered but token is missing; public/unauthenticated flows may be limited"
+          : `GitHub capability status: ${status}`,
+        nextAction: status === "requires_key" ? "Set GITHUB_TOKEN only if private GitHub operations are needed" : null,
+        evidence: "env_key=GITHUB_TOKEN",
+      })
+    }
+
+    const playwright = manifest.entries.find((entry) => entry.id === "playwright")
+    if (playwright) {
+      const status = manifest.effective_status[playwright.id]
+      const runtimeStatus = loadStatus(playwright.id)
+      checks.push({
+        name: "capability-playwright-on-demand",
+        severity: status === "running" || runtimeStatus.status === "running" ? "WARN" : "PASS",
+        message: `Playwright capability is ${status}; manifest/runtime does not start browser automation by default`,
+        nextAction: status === "running" || runtimeStatus.status === "running"
+          ? "Confirm Playwright belongs to an active approved session"
+          : null,
+        evidence: `start_policy=${playwright.start_policy}, heavy=${playwright.runtime?.heavy === true}, runtime=${runtimeStatus.status}`,
+      })
+    }
+
+    const mcpEntries = manifest.entries.filter((entry) => entry.kind === "mcp")
+    const runningMcp = mcpEntries
+      .map((entry) => ({ id: entry.id, status: loadStatus(entry.runtime?.mutex_key ? entry.id : entry.name).status }))
+      .filter((item) => item.status === "running")
+    checks.push({
+      name: "mcp-runtime-state",
+      severity: runningMcp.length === 0 ? "PASS" : "WARN",
+      message: runningMcp.length === 0
+        ? "MCP runtime state has no running on-demand server"
+        : `MCP runtime has running server(s): ${runningMcp.map((item) => item.id).join(", ")}`,
+      nextAction: runningMcp.length === 0 ? null : "Confirm running MCP server(s) were explicitly requested by an active task",
+      evidence: `registered=${mcpEntries.length}, running=${runningMcp.map((item) => item.id).join(",") || "none"}`,
+    })
+
+    const mcpDir = path.join(os.homedir(), ".dll-agent", "mcp")
+    const staleLocks: string[] = []
+    if (fs.existsSync(mcpDir)) {
+      for (const file of fs.readdirSync(mcpDir).filter((item) => item.endsWith(".lock"))) {
+        try {
+          const raw = JSON.parse(fs.readFileSync(path.join(mcpDir, file), "utf8"))
+          if (typeof raw.pid !== "number") {
+            staleLocks.push(file)
+            continue
+          }
+          try {
+            process.kill(raw.pid, 0)
+          } catch {
+            staleLocks.push(file)
+          }
+        } catch {
+          staleLocks.push(file)
+        }
+      }
+    }
+    checks.push({
+      name: "mcp-runtime-mutex",
+      severity: staleLocks.length === 0 ? "PASS" : "WARN",
+      message: staleLocks.length === 0
+        ? "MCP runtime mutex state is clean"
+        : `MCP runtime has stale/corrupt lock(s): ${staleLocks.join(", ")}`,
+      nextAction: staleLocks.length === 0 ? null : "Run dll-agent doctor --repair-safe after confirming no active MCP task depends on these locks",
+      evidence: `stale_locks=${staleLocks.length}`,
+    })
+
+    const multimodal = manifest.entries.find((entry) => entry.id === "multimodal-context-interpreter")
+    if (multimodal) {
+      checks.push({
+        name: "capability-multimodal-registered",
+        severity: manifest.effective_status[multimodal.id] === "running" ? "WARN" : "PASS",
+        message: `Multimodal context interpreter is registered as ${manifest.effective_status[multimodal.id]} and remains on-demand`,
+        nextAction: null,
+        evidence: `kind=${multimodal.kind}, start_policy=${multimodal.start_policy}`,
+      })
+    }
+  } catch (error) {
+    checks.push({
+      name: "capability-effective-manifest",
+      severity: "FAIL",
+      message: "Could not build effective capability manifest",
+      nextAction: "Inspect capability-registry.ts and capability-mapping.ts",
+      evidence: String(error),
+    })
+  }
+
+  try {
     if (projectRoot) {
       const promptFile = path.join(projectRoot, "packages", "opencode", "src", "session", "prompt.ts")
       if (fs.existsSync(promptFile)) {
@@ -882,57 +1052,6 @@ function checkCapabilityHealth(projectRoot?: string): DoctorCheck[] {
   return checks
 }
 
-function checkObservabilityHealth(projectRoot: string): DoctorCheck[] {
-  const checks: DoctorCheck[] = []
-  try {
-    const report = buildTaskObservabilityReport({
-      sessionID: "doctor-observability-smoke",
-      projectDir: projectRoot,
-      maxEvents: 2,
-    })
-    checks.push({
-      name: "task-observability",
-      severity: "PASS",
-      message: `Task status/trajectory renderer is available (evidence sessions=${report.cleanup.evidence_sessions})`,
-      nextAction: report.cleanup.repair_safe_recommended ? report.cleanup.recommendation : null,
-      evidence: `routing_decisions=${report.routing.decisions}, evidence_events=${report.evidence.total}`,
-    })
-  } catch (error) {
-    checks.push({
-      name: "task-observability",
-      severity: "FAIL",
-      message: "Task status/trajectory renderer failed",
-      nextAction: "Inspect task-observability.ts and /task-status command wiring",
-      evidence: String(error),
-    })
-  }
-  return checks
-}
-
-function checkScenarioEvaluationHealth(): DoctorCheck[] {
-  try {
-    const report = evaluateRealWorldScenarioSuite()
-    const severity: DoctorSeverity = report.fail > 0 || report.false_pass_risk > 0 ? "FAIL" : "PASS"
-    return [{
-      name: "real-world-scenario-evaluation",
-      severity,
-      message: severity === "PASS"
-        ? `Phase 10 regression scenarios pass (${report.pass}/${report.total}); false_pass_risk=${report.false_pass_risk}`
-        : `Phase 10 regression scenario gaps detected (${report.fail}/${report.total} failed, false_pass_risk=${report.false_pass_risk})`,
-      nextAction: severity === "PASS" ? null : "Run scenario-evaluation tests and inspect failed acceptance refs",
-      evidence: `human_intervention=${report.human_intervention_scenarios}, unnecessary_reviewer=${report.unnecessary_reviewer_scenarios}`,
-    }]
-  } catch (error) {
-    return [{
-      name: "real-world-scenario-evaluation",
-      severity: "FAIL",
-      message: "Phase 10 real-world scenario evaluator failed",
-      nextAction: "Inspect scenario-evaluation.ts",
-      evidence: String(error),
-    }]
-  }
-}
-
 // ─── Role Model Health Check ─────────────────────────────────────────────────
 
 function checkRoleModelHealth(projectRoot: string): DoctorCheck[] {
@@ -972,16 +1091,50 @@ function checkRoleModelHealth(projectRoot: string): DoctorCheck[] {
   return checks
 }
 
+function checkRoleProviderBridgeHealth(): DoctorCheck[] {
+  const sessionID = process.env.DLL_AGENT_SESSION_ID
+  if (!sessionID) {
+    return [{
+      name: "role-provider-bridge",
+      severity: "PASS",
+      message: "Role Provider Bridge ready; no active session snapshot to inspect",
+      nextAction: null,
+      evidence: "no active DLL_AGENT_SESSION_ID",
+    }]
+  }
+  const snapshot = readRoleProviderSnapshot(sessionID)
+  if (!snapshot || Object.keys(snapshot).length === 0) {
+    return [{
+      name: "role-provider-bridge",
+      severity: "WARN",
+      message: "No provider-validated role model snapshot found for active session yet",
+      nextAction: "Start or continue a dll-agent task so role models are resolved through Provider.Service",
+      evidence: `session=${sessionID}`,
+    }]
+  }
+  const unverified = Object.values(snapshot).filter((item) => !item.providerVerified)
+  return [{
+    name: "role-provider-bridge",
+    severity: unverified.length === 0 ? "PASS" : "WARN",
+    message: unverified.length === 0
+      ? `Provider-validated role model snapshot available (${Object.keys(snapshot).length} role(s))`
+      : `${unverified.length} role model snapshot(s) are not provider-validated`,
+    nextAction: unverified.length === 0 ? null : "Resolve affected roles through runtime Provider.Service before trusting TUI status",
+    evidence: `session=${sessionID}, roles=${Object.keys(snapshot).join(",")}`,
+  }]
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
  * Run a full dll-agent doctor check.
  */
-export function runDoctor(projectRoot?: string): DoctorReport {
+export function runDoctor(projectRoot?: string, options: { recordEvidence?: boolean } = {}): DoctorReport {
   const root = projectRoot ?? process.cwd()
   const allChecks: DoctorCheck[] = []
 
   // Permission checks
+  allChecks.push(...checkPermissionMode())
   allChecks.push(...checkPermissionPolicy())
   allChecks.push(...checkRoleToolPolicy())
   allChecks.push(...checkGoalContractHealth())
@@ -991,6 +1144,7 @@ export function runDoctor(projectRoot?: string): DoctorReport {
 
   // Role model health checks
   allChecks.push(...checkRoleModelHealth(root))
+  allChecks.push(...checkRoleProviderBridgeHealth())
 
   // Evidence health
   allChecks.push(...checkEvidenceHealth())
@@ -1024,7 +1178,9 @@ export function runDoctor(projectRoot?: string): DoctorReport {
     failCount,
   }
 
-  writeEvidence("doctor.run", { overall, passCount, warnCount, failCount })
+  if (options.recordEvidence !== false) {
+    writeEvidence("doctor.run", { overall, passCount, warnCount, failCount })
+  }
 
   return report
 }

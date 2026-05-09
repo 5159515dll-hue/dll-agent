@@ -50,11 +50,15 @@ describe("role-tool-policy", () => {
       expect(roleToolPolicyFor(role).mode).toBe("read_only")
       expect(config.read).toBeUndefined()
       expect(config.bash).toBe("deny")
+      expect(config.shell).toBe("deny")
       expect(config.edit).toBe("deny")
       expect(config.write).toBe("deny")
+      expect(config.file_write).toBe("deny")
+      expect(config.file_delete).toBe("deny")
       expect(config.patch).toBe("deny")
       expect(config.task).toBe("deny")
       expect(config.todowrite).toBe("deny")
+      expect(config.workflow_tool_approval).toBe("deny")
     }
   })
 

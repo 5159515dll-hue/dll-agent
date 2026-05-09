@@ -178,6 +178,64 @@ function inferVerifyCommands(tool: ToolEntry): string[] | undefined {
   return undefined
 }
 
+function infrastructureCapabilities(): CapabilityEntry[] {
+  const now = new Date().toISOString()
+  return [
+    {
+      id: "project-main-lsp",
+      kind: "lsp",
+      name: "Project-main LSP",
+      description: "项目主语言 LSP 预热策略；辅助语言保持 lazy",
+      capabilities: ["lsp", "project-main-lsp", "code-navigation"],
+      input_types: ["project-dir", "file-path"],
+      output_types: ["diagnostics", "symbols"],
+      risk_level: "low",
+      cost_level: "free",
+      requires_token: false,
+      requires_install: false,
+      install_strategy: "none",
+      start_policy: "on_demand",
+      source: "lsp-strategy.ts::DEFAULT_LSP_STRATEGY",
+      source_type: "builtin",
+      confidence: 1.0,
+      status: "registered",
+      platforms: ["any"],
+      project_scope: "global",
+      registered_at: now,
+      evidence: { trigger_reason: "builtin LSP strategy registered; runtime remains lazy" },
+    },
+    {
+      id: "multimodal-context-interpreter",
+      kind: "multimodal",
+      name: "Multimodal Context Interpreter",
+      description: "多模态输入上下文解释；纯文本/代码任务不触发",
+      capabilities: ["multimodal-context", "image-understanding", "screenshot-analysis"],
+      input_types: ["image", "screenshot", "video", "audio", "visual-document"],
+      output_types: ["multimodal_context_packet", "evidence_ref"],
+      risk_level: "medium",
+      cost_level: "medium",
+      requires_token: true,
+      requires_install: false,
+      install_strategy: "none",
+      start_policy: "on_demand",
+      dependencies: { tokens: ["MIMO_API_KEY"] },
+      security: { require_redaction: true, allow_network: true, require_consent: false },
+      triggers: {
+        file_extensions: [".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".wav", ".mp3"],
+        task_patterns: ["screenshot", "image", "视觉", "截图", "多模态"],
+      },
+      source: "multimodal-context.ts::role",
+      source_type: "builtin",
+      confidence: 1.0,
+      status: "registered",
+      platforms: ["any"],
+      project_scope: "global",
+      registered_at: now,
+      evidence: { trigger_reason: "builtin multimodal role registered; text/code tasks remain commander-only" },
+    },
+  ]
+}
+
 function mapSecurity(tool: ToolEntry): CapabilitySecurity | undefined {
   return {
     require_redaction: tool.security.require_redaction,
@@ -287,6 +345,7 @@ export function mapAllBuiltins(
   return [
     ...tools.map(toolToCapabilityEntry),
     ...skills.map(skillToCapabilityEntry),
+    ...infrastructureCapabilities(),
   ]
 }
 

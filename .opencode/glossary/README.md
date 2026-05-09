@@ -1,63 +1,46 @@
-# Locale Glossaries
+# 本地化术语表
 
-Use this folder for locale-specific translation guidance that supplements `.opencode/agent/translator.md`.
+这个目录用于保存本地化翻译补充规则。规则应服务于 dll-agent 的中文体验，避免不同文档、命令说明和界面状态使用不一致的术语。
 
-The global glossary in `translator.md` remains the source of truth for shared do-not-translate terms (commands, code, paths, product names, etc.). These locale files capture community learnings about phrasing and terminology preferences.
+## 文件命名
 
-## File Naming
+- 每个语言或地区一个文件。
+- 文件名使用小写地区标识，例如 `zh-cn.md`、`zh-tw.md`。
+- 如果只有语言级规则，可以只使用语言代码，例如 `fr.md`。
 
-- One file per locale
-- Use lowercase locale slugs that match docs locales when possible (for example, `zh-cn.md`, `zh-tw.md`)
-- If only language-level guidance exists, use the language code (for example, `fr.md`)
-- Some repo locale slugs may be aliases/non-BCP47 for consistency (for example, `br` for Brazilian Portuguese / `pt-BR`)
+## 内容建议
 
-## What To Put In A Locale File
+- 来源：触发该术语规则的 issue、PR、讨论或维护记录。
+- 不翻译项：命令、路径、配置项、模型 ID、证据 ID、provider ID。
+- 推荐译法：常见状态、命令、角色、gate、doctor 输出的统一译法。
+- 风格说明：语气、简洁度和一致性要求。
+- 避免项：容易误导用户的直译或过度营销表达。
 
-- **Sources**: PRs/issues/discussions that motivated the guidance
-- **Do Not Translate (Locale Additions)**: locale-specific terms or casing decisions
-- **Preferred Terms**: recurring UI/docs words with preferred translations
-- **Guidance**: tone, style, and consistency notes
-- **Avoid** (optional): common literal translations or wording we should avoid
-- If the repo uses a locale alias slug, document the alias in **Guidance** (for example, prose may mention `pt-BR` while config/examples use `br`)
-
-Prefer guidance that is:
-
-- Repeated across multiple docs/screens
-- Easy to apply consistently
-- Backed by a community contribution or review discussion
-
-## Template
+## 模板
 
 ```md
-# <locale> Glossary
+# <locale> 术语表
 
-## Sources
+## 来源
 
-- PR #12345: https://github.com/anomalyco/opencode/pull/12345
+- 维护记录：...
 
-## Do Not Translate (Locale Additions)
+## 不翻译项
 
-- `OpenCode` (preserve casing)
+- `dll-agent`
 
-## Preferred Terms
+## 推荐译法
 
-| English | Preferred | Notes     |
-| ------- | --------- | --------- |
-| prompt  | ...       | preferred |
-| session | ...       | preferred |
+| 原文 | 推荐译法 | 备注 |
+| --- | --- | --- |
+| prompt | 提示词 | 仅指模型输入模板 |
+| session | 会话 | 指一次本地运行上下文 |
 
-## Guidance
+## 风格说明
 
-- Prefer natural phrasing over literal translation
+- 优先使用自然、直接、可执行的中文。
 
-## Avoid
+## 避免项
 
-- Avoid ... when ...
+- 避免把 partial 翻译成“已完成”。
 ```
-
-## Contribution Notes
-
-- Mark entries as preferred when they may evolve
-- Keep examples short
-- Add or update the `Sources` section whenever you add a new rule
-- Prefer PR-backed guidance over invented term mappings; start with general guidance if no term-level corrections exist yet
