@@ -7,8 +7,7 @@
 
 import fs from "fs"
 import path from "path"
-import { execFileSync } from "child_process"
-import { metrics as computeMetrics, messageText, type Metrics } from "./triggers"
+import { metrics as computeMetrics, type Metrics } from "./triggers"
 import { write as writeEvidence, redact } from "./evidence"
 import { recordGateBlock, isGateRetryExhausted } from "./gates"
 import { ProviderID, ModelID } from "@/provider/schema"
@@ -26,7 +25,7 @@ import {
 } from "./interfaces"
 import type { MessageV2 } from "@/session/message-v2"
 import { buildContinuationSubtaskPrompt } from "./continuation-gate"
-import { buildResultsSummary, buildResultPacket, writeResult as writeResultLedger, type ResultPacket } from "./result-ledger"
+import { buildResultPacket, writeResult as writeResultLedger, type ResultPacket } from "./result-ledger"
 import { checkDeduplication } from "./deduplication-gate"
 import {
   assessRisk,
@@ -38,6 +37,7 @@ import {
   reviewerToDllRole,
 } from "./routing-policy"
 import { writeRoutingEvidence } from "./routing-evidence"
+import { buildReviewerContext, extractRelatedPaths, latestRealUser } from "./reviewer-context"
 import os from "os"
 
 export { assessRisk, modelContextLimit } from "./routing-policy"
@@ -289,21 +289,6 @@ function normalizeFingerprintPart(value: string) {
     .slice(0, 120)
 }
 
-function latestRealUser(messages: MessageV2.WithParts[]) {
-  return [...messages]
-    .reverse()
-    .find((message) => {
-      if (message.info.role !== "user") return false
-      if (messageText(message).trim().length === 0) return false
-      // 过滤纯合成消息：reviewer subtask 完成后 prompt.ts 会注入 "Summarize ..." 合成用户消息。
-      // 若不跳过，该消息会成为 latestRealUser，使 makeTriggerFingerprint 生成新指纹，
-      // 导致 isCooldown 找不到原始指纹，审查员被无限重复触发。
-      const textParts = message.parts.filter((p) => p.type === "text")
-      if (textParts.length > 0 && textParts.every((p) => "synthetic" in p && (p as any).synthetic)) return false
-      return true
-    })
-}
-
 function makeTriggerFingerprint(messages: MessageV2.WithParts[], reviewer: ReviewerRole, reason: string) {
   const user = latestRealUser(messages)
   const userID = user?.info.id ?? "no-user"
@@ -317,134 +302,6 @@ function makeTriggerFingerprint(messages: MessageV2.WithParts[], reviewer: Revie
 
 function triggerUserMessageID(messages: MessageV2.WithParts[]) {
   return String(latestRealUser(messages)?.info.id ?? "")
-}
-
-function truncate(text: string, max: number) {
-  if (text.length <= max) return text
-  return text.slice(0, max - 20) + "\n...[truncated]"
-}
-
-function extractRelatedPaths(messages: MessageV2.WithParts[]) {
-  const out = new Set<string>()
-  const pathPattern =
-    /(?:^|[\s"'`])((?:\/Users\/[^\s"'`]+|\.?\/?(?:packages|src|test|tests|docs|scripts|apps|lib|bin|config)\/[^\s"'`),;]+))/g
-  for (const message of messages.slice(-16)) {
-    const text = messageText(message)
-    for (const match of text.matchAll(pathPattern)) out.add(match[1])
-    for (const part of message.parts) {
-      if (part.type !== "tool") continue
-      const input = part.state.status === "completed" || part.state.status === "error"
-        ? part.state.input as Record<string, unknown> | undefined
-        : undefined
-      for (const key of ["filePath", "path", "filepath", "target_file"]) {
-        const value = input?.[key]
-        if (typeof value === "string" && value) out.add(value)
-      }
-      const command = typeof input?.command === "string" ? input.command : ""
-      for (const match of command.matchAll(pathPattern)) out.add(match[1])
-    }
-  }
-  return [...out].slice(0, 8)
-}
-
-function recentToolFailureSummary(messages: MessageV2.WithParts[]) {
-  const lines: string[] = []
-  for (const message of messages.slice(-12)) {
-    for (const part of message.parts) {
-      if (part.type !== "tool") continue
-      if (part.state.status === "error") {
-        lines.push(`- ${part.tool}: ${truncate(part.state.error, 320)}`)
-      }
-      if (part.state.status === "completed" && /permission denied|not allowed|error:|failed|exception|traceback/i.test(part.state.output)) {
-        const input = part.state.input as Record<string, unknown> | undefined
-        const command = typeof input?.command === "string" ? input.command : part.tool
-        lines.push(`- ${command}: ${truncate(part.state.output, 320)}`)
-      }
-    }
-  }
-  return lines.slice(-5)
-}
-
-const gitDiffCache = new Map<string, { result: string; ts: number }>()
-const GIT_DIFF_CACHE_TTL_MS = 30_000
-
-function gitDiffSummary(paths: string[]) {
-  const key = paths.slice(0, 8).sort().join("|")
-  const cached = gitDiffCache.get(key)
-  if (cached && Date.now() - cached.ts < GIT_DIFF_CACHE_TTL_MS) return cached.result
-
-  try {
-    const cwd = process.env.DLL_AGENT_ROOT || process.cwd()
-    const args = ["-C", cwd, "diff", "--stat", "--", ...paths.filter((p) => !p.startsWith("/Users/")).slice(0, 8)]
-    const output = execFileSync("git", args, {
-      encoding: "utf8",
-      timeout: 1_000,
-      maxBuffer: 12_000,
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-    const result = truncate(output.trim(), 2_000)
-    gitDiffCache.set(key, { result, ts: Date.now() })
-    return result
-  } catch {
-    const result = ""
-    gitDiffCache.set(key, { result, ts: Date.now() })
-    return result
-  }
-}
-
-function buildReviewerContext(
-  reviewer: ReviewerRole,
-  reason: string,
-  metrics: SupervisorMetricsSnapshot,
-  messages: MessageV2.WithParts[],
-  sessionID?: string,
-) {
-  const user = latestRealUser(messages)
-  const userGoal = user ? truncate(messageText(user).trim(), 1_500) : "(no recent user text)"
-  const paths = extractRelatedPaths(messages)
-  const failures = recentToolFailureSummary(messages)
-  const diff = gitDiffSummary(paths)
-
-  // Phase 7: Include result ledger summary so reviewers know what's been done
-  let resultSummary = ""
-  if (sessionID) {
-    try {
-      resultSummary = buildResultsSummary(sessionID)
-    } catch {
-      // Non-critical — skip result summary if ledger unavailable
-    }
-  }
-
-  const contextLines = [
-    `Reviewer: ${reviewer}`,
-    `Trigger reason: ${reason}`,
-    `Recent user goal/message:`,
-    userGoal,
-    ``,
-    `Supervisor metrics:`,
-    `- tool_failures=${metrics.tool_failures}`,
-    `- permission_denied=${metrics.permission_denied}`,
-    `- user_corrections=${metrics.user_corrections}`,
-    `- context_percent=${metrics.context_percent}`,
-    `- final_claim=${metrics.final_claim}`,
-    `- real_tool_evidence=${metrics.real_tool_evidence}`,
-    ``,
-    `Relevant file paths discovered from recent messages/tool calls:`,
-    paths.length ? paths.map((p) => `- ${p}`).join("\n") : "- none",
-    ``,
-    `Relevant git diff summary:`,
-    diff || "- unavailable or no local diff for discovered paths",
-    ``,
-    `Recent tool failure snippets:`,
-    failures.length ? failures.join("\n") : "- none",
-  ]
-
-  if (resultSummary && resultSummary !== "No prior results in ledger.") {
-    contextLines.push(``)
-    contextLines.push(resultSummary)
-  }
-
-  return truncate(contextLines.join("\n"), 5_000)
 }
 
 export function reviewerRuntimeMs(reviewer: string) {
