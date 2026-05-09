@@ -9,6 +9,8 @@ describe("permission-bridge", () => {
   afterEach(() => {
     delete process.env.DLL_AGENT_ENABLED
     delete process.env.DLL_AGENT_AUTO_ALLOW
+    delete process.env.DLL_AGENT_PERMISSION_MODE
+    delete process.env.DLL_AGENT_CONFIG_ROOT
     delete process.env.DLL_AGENT_EVIDENCE_FILE
   })
 
@@ -36,7 +38,7 @@ describe("permission-bridge", () => {
 
   it("classifies rm -rf (high risk) as ask", () => {
     process.env.DLL_AGENT_ENABLED = "1"
-    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    process.env.DLL_AGENT_PERMISSION_MODE = "auto-review"
     const result = permissionPreCheck({
       permission: "shell",
       patterns: ["rm", "-rf", "/tmp/test"],
@@ -45,9 +47,9 @@ describe("permission-bridge", () => {
     expect(result.action).toBe("ask")
   })
 
-  it("DLL_AGENT_AUTO_ALLOW does not bypass git push, sudo, or secret access", () => {
+  it("auto-review does not bypass git push, sudo, or secret access", () => {
     process.env.DLL_AGENT_ENABLED = "1"
-    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    process.env.DLL_AGENT_PERMISSION_MODE = "auto-review"
     const gitPush = permissionPreCheck({
       permission: "shell",
       patterns: ["git", "push", "origin", "dev"],
@@ -66,9 +68,28 @@ describe("permission-bridge", () => {
     expect(secret.action).toBe("ask")
   })
 
-  it("allows commander project-local file writes without allowing high-risk shell commands", () => {
+  it("full-access allows high-risk commander commands after role policy check", () => {
     process.env.DLL_AGENT_ENABLED = "1"
-    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    process.env.DLL_AGENT_PERMISSION_MODE = "full-access"
+    const gitPush = permissionPreCheck({
+      permission: "shell",
+      patterns: ["git", "push", "origin", "dev"],
+      metadata: { dllAgentRole: "commander" },
+    })
+    const secret = permissionPreCheck({
+      permission: "file_read",
+      patterns: ["/project/.env"],
+      projectRoot: "/project",
+      metadata: { dllAgentRole: "commander" },
+    })
+    expect(gitPush.intercepted).toBe(true)
+    expect(gitPush.action).toBe("allow")
+    expect(secret.action).toBe("allow")
+  })
+
+  it("auto-review allows commander project-local file writes without allowing high-risk shell commands", () => {
+    process.env.DLL_AGENT_ENABLED = "1"
+    process.env.DLL_AGENT_PERMISSION_MODE = "auto-review"
     const write = permissionPreCheck({
       permission: "file_write",
       patterns: ["/project/src/app.ts"],
@@ -89,7 +110,7 @@ describe("permission-bridge", () => {
   it("records role-tool policy evidence for permission decisions", () => {
     const evidenceFile = `/tmp/dll-agent-permission-bridge-${Date.now()}.jsonl`
     process.env.DLL_AGENT_ENABLED = "1"
-    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    process.env.DLL_AGENT_PERMISSION_MODE = "auto-review"
     process.env.DLL_AGENT_EVIDENCE_FILE = evidenceFile
     permissionPreCheck({
       permission: "file_write",
@@ -106,6 +127,7 @@ describe("permission-bridge", () => {
 
   it("classifies .env read (high secret risk) as ask", () => {
     process.env.DLL_AGENT_ENABLED = "1"
+    process.env.DLL_AGENT_PERMISSION_MODE = "auto-review"
     const result = permissionPreCheck({
       permission: "file_read",
       patterns: [".env"],
@@ -116,6 +138,7 @@ describe("permission-bridge", () => {
 
   it("denies mutating tools for read-only reviewer roles", () => {
     process.env.DLL_AGENT_ENABLED = "1"
+    process.env.DLL_AGENT_PERMISSION_MODE = "full-access"
     const result = permissionPreCheck({
       permission: "bash",
       patterns: ["git status"],
@@ -128,7 +151,7 @@ describe("permission-bridge", () => {
 
   it("denies final-auditor write tools", () => {
     process.env.DLL_AGENT_ENABLED = "1"
-    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    process.env.DLL_AGENT_PERMISSION_MODE = "full-access"
     const result = permissionPreCheck({
       permission: "edit",
       patterns: ["/project/src/app.ts"],

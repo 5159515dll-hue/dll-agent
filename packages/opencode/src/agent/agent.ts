@@ -24,9 +24,9 @@ import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { zod } from "@/util/effect-zod"
 import { withStatics, type DeepMutable } from "@/util/schema"
-import { enabled as dllEnabled, autoAllowAll as dllAutoAllow, writeEvidence as dllLogEvidence, roleRoster as dllRoleRoster } from "@/dll-agent/profile"
+import { enabled as dllEnabled, writeEvidence as dllLogEvidence, roleRoster as dllRoleRoster } from "@/dll-agent/profile"
 import { resolveRoleModel, type DllRole } from "@/dll-agent/role-model-registry"
-import { isReadOnlyRole, permissionConfigForRole } from "@/dll-agent/role-tool-policy"
+import { permissionConfigForRole } from "@/dll-agent/role-tool-policy"
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -110,20 +110,6 @@ export const layer = Layer.effect(
         })
 
         const user = Permission.fromConfig(cfg.permission ?? {})
-
-        // Phase 5: dll-agent 全权放行 ruleset。在 merge 末尾追加，因 evaluate 用 findLast，
-        // 最末规则胜出，从而覆盖 defaults 中 ask/deny 的项目（如 external_directory:*、doom_loop）。
-        // 仅在 dllAutoAllow() 为 true 时生效；用户可 DLL_AGENT_AUTO_ALLOW=0 关闭。
-        const dllAllowAll: Permission.Ruleset = dllAutoAllow()
-          ? Permission.fromConfig({
-              "*": "allow",
-              external_directory: { "*": "allow" },
-              doom_loop: "allow",
-              question: "allow",
-              plan_enter: "allow",
-              plan_exit: "allow",
-            })
-          : []
 
         const agents: Record<string, Info> = {
           build: {
@@ -263,9 +249,8 @@ export const layer = Layer.effect(
           }
           const rolePermission = (role: DllRole) => Permission.fromConfig(permissionConfigForRole(role))
 
-          // Phase 5 fix: dll-agent 自动放行所有权限 —— dllAllowAll 必须放在 user 之后，
-          // 因为 Permission.evaluate 用 findLast，最末规则胜出。否则 defaults 中的
-          // external_directory:* / question:ask / plan_enter:deny / *.env:ask 仍会触发弹权限。
+          // Permission mode is enforced dynamically by permissionPreCheck().
+          // Agent registration keeps static role permissions such as reviewer read-only.
           agents.commander = {
             name: "commander",
             description: "dll-agent commander. DeepSeek default executor/router; OpenAI is on-demand strategic audit only.",
@@ -281,7 +266,6 @@ export const layer = Layer.effect(
                 plan_enter: "allow",
               }),
               user,
-              dllAllowAll,
               rolePermission("commander"),
             ),
             options: {},
@@ -294,7 +278,7 @@ export const layer = Layer.effect(
             model: roleModel("chief-engineer"),
             prompt:
               "You are the dll-agent chief engineer subagent. Execute concrete engineering work, diagnose failures, use tools, install project-local dependencies when needed, and verify with real commands. Every claim must cite evidence.",
-            permission: Permission.merge(defaults, user, dllAllowAll, rolePermission("chief-engineer")),
+            permission: Permission.merge(defaults, user, rolePermission("chief-engineer")),
             options: {},
           }
           agents["requirements-inspector"] = {
@@ -308,9 +292,8 @@ export const layer = Layer.effect(
               "You are the requirements inspector. Check Chinese user intent, contradictions, rule adherence, phase drift, and whether the work still serves the real user goal. Use the compact reviewer context first. Read only listed relevant files when needed. Do NOT run bash/typecheck/build/test/git or create subtasks. Emit the required JSON verdict.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({ edit: "deny", read: "allow" }),
+              Permission.fromConfig({ edit: "deny" }),
               user,
-              dllAllowAll,
               rolePermission("requirements-inspector"),
             ),
             options: {},
@@ -326,9 +309,8 @@ export const layer = Layer.effect(
               "You are the long-context archivist. Check logs, documents, baselines, phase history, memory drift, and missing evidence. Use the compact reviewer context first. Read only listed relevant files/logs when needed. Do NOT run bash/typecheck/build/test/git or create subtasks. Emit the required JSON verdict.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({ edit: "deny", read: "allow" }),
+              Permission.fromConfig({ edit: "deny" }),
               user,
-              dllAllowAll,
               rolePermission("long-context-archivist"),
             ),
             options: {},
@@ -344,9 +326,8 @@ export const layer = Layer.effect(
               "You are the on-demand strategic/final auditor. Check evidence sufficiency, validation quality, strategic direction, engineering risk, and overclaiming before high-risk completion. This is a read-only audit role: do not run bash, edit files, patch files, spawn subtasks, or make changes.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({ webfetch: "allow", websearch: "allow", read: "allow" }),
+              Permission.fromConfig({ webfetch: "allow", websearch: "allow" }),
               user,
-              dllAllowAll,
               rolePermission("final-auditor"),
             ),
             options: {},
@@ -362,9 +343,8 @@ export const layer = Layer.effect(
               "Temporarily inspect the task from another role's viewpoint. This is not a permanent role change. Gather missing information, find blind spots, propose actionable fixes, and then return control to the normal role roster.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({ webfetch: "allow", websearch: "allow", read: "allow" }),
+              Permission.fromConfig({ webfetch: "allow", websearch: "allow" }),
               user,
-              dllAllowAll,
               rolePermission("role-cross"),
             ),
             options: {},
@@ -385,12 +365,10 @@ export const layer = Layer.effect(
             permission: Permission.merge(
               defaults,
               Permission.fromConfig({
-                read: "allow",
                 webfetch: "allow",
                 websearch: "allow",
               }),
               user,
-              dllAllowAll,
               rolePermission("multimodal-context-interpreter"),
             ),
             options: {},
@@ -409,7 +387,6 @@ export const layer = Layer.effect(
               defaults,
               Permission.fromConfig({ question: "allow", plan_enter: "allow" }),
               user,
-              dllAllowAll,
               rolePermission("executor"),
             ),
             options: {},
@@ -447,25 +424,6 @@ export const layer = Layer.effect(
           item.steps = value.steps ?? item.steps
           item.options = mergeDeep(item.options, value.options ?? {})
           item.permission = Permission.merge(item.permission, Permission.fromConfig(value.permission ?? {}))
-        }
-
-        // Phase 5: dll-agent 全权放行兜底 —— 在所有 agent（含 build/general/config 自定义）
-        // 的 permission 末尾追加 dllAllowAll。Permission.evaluate 用 findLast，最末规则胜出，
-        // 因此这一步会覆盖 defaults / user / agent-specific 中残留的 ask/deny。
-        // 例外：title/summary/compaction/explore/plan 是功能性角色（本身要 *:deny 限制工具），
-        // 不能放行；它们也不直接接收用户任务，永远不会触发"用户授权弹窗"，跳过即可。
-        if (dllAutoAllow()) {
-          const skip = new Set([
-            "title",
-            "summary",
-            "compaction",
-            "explore",
-            "plan",
-          ])
-          for (const name in agents) {
-            if (skip.has(name) || isReadOnlyRole(name)) continue
-            agents[name].permission = Permission.merge(agents[name].permission, dllAllowAll)
-          }
         }
 
         // Ensure Truncate.GLOB is allowed unless explicitly configured

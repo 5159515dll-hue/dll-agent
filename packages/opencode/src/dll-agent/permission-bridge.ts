@@ -3,13 +3,17 @@
  *
  * Bridge between risk-based permission classifier and opencode Permission pipeline.
  *
- * When dll-agent is enabled with auto-allow, this intercepts Permission.ask
- * calls and auto-approves low-risk operations while preserving high-risk gates.
+ * When dll-agent is enabled, this intercepts Permission.ask based on the
+ * selected permission mode.
  *
- * Principle: low-risk → auto-allow, medium-risk → confirm-once, high-risk → always ask.
+ * Modes:
+ * - default: do not intercept; use OpenCode permission flow.
+ * - auto-review: low-risk → auto-allow, medium-risk → confirm-once, high-risk → ask.
+ * - full-access: allow after role-tool policy; read-only reviewer denies still apply.
  */
 import { classifyPermissionRequest, permissionActionForRisk } from "./permission-classifier"
-import { enabled as profileEnabled, autoAllowAll as profileAutoAllow } from "./profile"
+import { enabled as profileEnabled } from "./profile"
+import { getPermissionMode } from "./permission-mode"
 import { classifyRoleToolRequest, roleFromMetadata } from "./role-tool-policy"
 
 export interface PermissionBridgeResult {
@@ -37,8 +41,9 @@ export function permissionPreCheck(params: {
   /** Whether this permission type has been previously confirmed in this session */
   alreadyConfirmed?: boolean
 }): PermissionBridgeResult {
-  if (!profileEnabled() || !profileAutoAllow()) {
-    return { intercepted: false, action: "ask", reason: "dll-agent auto-allow not enabled" }
+  const mode = getPermissionMode()
+  if (!profileEnabled() || mode === "default") {
+    return { intercepted: false, action: "ask", reason: `dll-agent permission mode=${mode}; using OpenCode default permission flow` }
   }
 
   const role = roleFromMetadata(params.metadata)
@@ -56,6 +61,14 @@ export function permissionPreCheck(params: {
       intercepted: true,
       action: "deny",
       reason: roleDecision.reason,
+    }
+  }
+
+  if (mode === "full-access") {
+    return {
+      intercepted: true,
+      action: "allow",
+      reason: `permission mode=full-access: auto-approved after role policy check`,
     }
   }
 

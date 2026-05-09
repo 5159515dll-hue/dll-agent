@@ -481,7 +481,7 @@ function checkResourceHealth(): DoctorCheck[] {
         name: "playwright-mcp-processes",
         severity: "WARN",
         message: `${pids.length} playwright-mcp process(es) are running; verify they belong to active sessions`,
-        nextAction: `If stale, stop via /mcp-stop playwright or run: kill ${pids.join(" ")}`,
+        nextAction: `If stale, run dll-agent doctor --repair-safe or manually kill after verifying inactive: kill ${pids.join(" ")}`,
         evidence: `pids=${pids.join(",")}`,
       })
     } else {

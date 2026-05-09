@@ -68,6 +68,11 @@ import { runCapabilityActions } from "@/dll-agent/capability-action-runner"
 import { reconcileSessionState } from "@/dll-agent/session-reconciler"
 import { ensureGoalContract } from "@/dll-agent/goal-contract"
 import { extractLatestFailure, planRecovery, buildRecoveryHint, buildBlockedRecoveryReport, writeRecoveryDecision } from "@/dll-agent/recovery-loop"
+import {
+  normalizePermissionMode,
+  renderPermissionModeStatus,
+  setPermissionMode,
+} from "@/dll-agent/permission-mode"
 import { renderTaskStatus } from "@/dll-agent/task-observability"
 import { buildLocalCommandResponse } from "@/dll-agent/session-adapter"
 import {
@@ -1557,6 +1562,26 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       )
     })
 
+    const handleLocalPermissionsCommand = Effect.fn("SessionPrompt.handleLocalPermissionsCommand")(function* (
+      input: CommandInput,
+    ) {
+      if (input.command !== "permissions") return undefined
+      const mode = normalizePermissionMode(input.arguments)
+      if (input.arguments.trim() && !mode) {
+        return yield* roleModelCommandResponse(
+          input,
+          [
+            "Invalid permission mode.",
+            "Usage: /permissions [default|auto-review|full-access]",
+            "",
+            renderPermissionModeStatus(),
+          ].join("\n"),
+        )
+      }
+      if (mode) setPermissionMode(mode, input.sessionID)
+      return yield* roleModelCommandResponse(input, renderPermissionModeStatus())
+    })
+
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -2669,6 +2694,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
       if (profileEnabled() && input.command === "task-status") {
         const local = yield* handleLocalDllStatusCommand(input)
+        if (local) return local
+      }
+      if (profileEnabled() && input.command === "permissions") {
+        const local = yield* handleLocalPermissionsCommand(input)
         if (local) return local
       }
       const cmd = yield* commands.get(input.command)

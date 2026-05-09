@@ -50,7 +50,7 @@ export interface UxSupervisorState {
 }
 
 export interface UxPermissionState {
-  mode: "risk-based-auto" | "strict" | "manual"
+  mode: "default" | "auto-review" | "full-access" | "risk-based-auto" | "strict" | "manual"
   lowRiskAutoAllow: boolean
   mediumRiskConfirmOnce: boolean
   highRiskAlwaysConfirm: boolean
@@ -117,7 +117,7 @@ export function defaultUxState(): UxState {
       crossReviewActive: false,
     },
     permissions: {
-      mode: "risk-based-auto",
+      mode: "full-access",
       lowRiskAutoAllow: true,
       mediumRiskConfirmOnce: true,
       highRiskAlwaysConfirm: true,

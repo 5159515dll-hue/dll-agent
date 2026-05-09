@@ -74,7 +74,9 @@ export function isReadOnlyRole(role: string) {
 export function permissionConfigForRole(role: DllRole): Record<string, "allow" | "deny"> {
   const policy = roleToolPolicyFor(role)
   const config: Record<string, "allow" | "deny"> = {}
-  for (const tool of policy.allow) config[tool] = "allow"
+  // Static OpenCode agent permissions should only hard-deny role boundaries.
+  // Positive allows are decided dynamically by permissionPreCheck(), otherwise
+  // /permissions default could still be bypassed by a stale "*: allow" rule.
   for (const tool of policy.deny) config[tool] = "deny"
   return config
 }

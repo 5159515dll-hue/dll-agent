@@ -59,17 +59,15 @@ Role Model Registry is the unified entry point for dll-agent role model selectio
 /role-model-set role-cross openai/gpt-5.5-pro --scope session
 ```
 
-### `/role-model-reset <role> [--scope session|project|global|all]`
-重置角色模型覆盖，回退到下一层默认配置。默认 scope 为 `session`。
+### Removed prompt-only commands
+以下命令曾作为 prompt-only 模板存在，但没有本地 runtime handler，容易让用户误以为配置已经被可靠修改。本轮已从注册命令中移除：
 
-### `/role-model-test <role>`
-对指定角色的当前模型进行轻量冒烟测试。
+- `/role-model-reset`
+- `/role-model-test`
+- `/role-model-fallback-add`
+- `/role-model-fallback-remove`
 
-### `/role-model-fallback-add <role> <provider/model> [--scope session|project|global]`
-为指定角色添加备选模型。
-
-### `/role-model-fallback-remove <role> <provider/model> [--scope session|project|global]`
-移除指定角色的备选模型。
+当前 runtime-verified 入口只保留 `/role-models` 和 `/role-model-set`。
 
 ## Configuration Files
 
@@ -189,9 +187,9 @@ To add a new model provider:
 | Three-tier override (session > project > global) | ✅ Implemented |
 | `/role-models` slash command | ✅ Implemented as local status command, no LLM call |
 | `/role-model-set` with scope support | ✅ Implemented as local mutation command, no LLM call |
-| `/role-model-reset` with scope support | ✅ Implemented |
-| `/role-model-test` smoke test template | ✅ Implemented |
-| `/role-model-fallback-add/remove` | ✅ Implemented |
+| `/role-model-reset` with scope support | removed_prompt_only |
+| `/role-model-test` smoke test template | removed_prompt_only |
+| `/role-model-fallback-add/remove` | removed_prompt_only |
 | `profile.ts` uses registry (no hardcoded models) | ✅ Implemented |
 | `roleCommands()` uses registry | ✅ Implemented (model field removed for runtime resolution) |
 | `agent.ts` uses registry for defaults | ✅ Implemented |

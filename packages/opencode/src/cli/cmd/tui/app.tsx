@@ -39,6 +39,7 @@ import { DialogHelp } from "./ui/dialog-help"
 import { CommandProvider, useCommandDialog } from "@tui/component/dialog-command"
 import { DialogAgent } from "@tui/component/dialog-agent"
 import { DialogRoleModelSet } from "@tui/component/dialog-role-model-set"
+import { DialogPermissions } from "@tui/component/dialog-permissions"
 import { DialogSessionList } from "@tui/component/dialog-session-list"
 import { DialogConsoleOrg } from "@tui/component/dialog-console-org"
 import { KeybindProvider, useKeybind } from "@tui/context/keybind"
@@ -517,6 +518,17 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
       },
       onSelect: () => {
         dialog.replace(() => <DialogMcp />)
+      },
+    },
+    {
+      title: "Permissions",
+      value: "dll-agent.permissions",
+      category: "dll-agent",
+      slash: {
+        name: "permissions",
+      },
+      onSelect: () => {
+        dialog.replace(() => <DialogPermissions />)
       },
     },
     {

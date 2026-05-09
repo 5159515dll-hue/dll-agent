@@ -20,7 +20,6 @@ function load<A>(dir: string, fn: (svc: Agent.Interface) => Effect.Effect<A>) {
 
 afterEach(async () => {
   delete process.env.DLL_AGENT_ENABLED
-  delete process.env.DLL_AGENT_ROLE_ROSTER
   delete process.env.DLL_AGENT_EVIDENCE_FILE
   await disposeAllInstances()
 })
@@ -31,7 +30,7 @@ describe("role-tool-policy", () => {
       const policy = roleToolPolicyFor(role)
       const config = permissionConfigForRole(role)
       expect(policy.mode).toBe("writable")
-      expect(config["*"]).toBe("allow")
+      expect(config["*"]).toBeUndefined()
       expect(config.bash).toBeUndefined()
       expect(config.edit).toBeUndefined()
     }
@@ -49,7 +48,7 @@ describe("role-tool-policy", () => {
     for (const role of reviewers) {
       const config = permissionConfigForRole(role)
       expect(roleToolPolicyFor(role).mode).toBe("read_only")
-      expect(config.read).toBe("allow")
+      expect(config.read).toBeUndefined()
       expect(config.bash).toBe("deny")
       expect(config.edit).toBe("deny")
       expect(config.write).toBe("deny")
@@ -132,6 +131,9 @@ describe("role-tool-policy", () => {
         expect(evalPerm(multimodal, "bash")).toBe("deny")
         expect(evalPerm(commander, "bash")).toBe("allow")
         expect(evalPerm(commander, "edit")).toBe("allow")
+        expect(evalPerm(commander, "external_directory")).toBe("ask")
+        expect(evalPerm(commander, "doom_loop")).toBe("ask")
+        expect(Permission.evaluate("read", ".env", commander?.permission ?? []).action).toBe("ask")
       },
     })
   })

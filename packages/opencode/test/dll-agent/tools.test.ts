@@ -375,7 +375,7 @@ describe("tool-overlay", () => {
     expect(read!.tools.length).toBeGreaterThan(0)
   })
 
-  test("/tools-reload updates effective manifest", () => {
+  test("effective manifest reload updates session state", () => {
     // First build without overlay
     const manifest1 = buildGlobalEffective()
     expect(manifest1.source).toBe("global")

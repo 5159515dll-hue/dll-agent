@@ -241,7 +241,7 @@ export function toolDoctorChecks(projectDir?: string, sessionId?: string): ToolD
             message: `MCP "${state.name}" is ${state.status}: ${state.lastError ?? "unknown error"}`,
             suggestion: state.status === "failed"
               ? `Cooldown until ${state.cooldownUntil}. Review error: ${state.lastError}`
-              : `Run /mcp-health ${state.name} or /mcp-start ${state.name}`,
+              : `Run /capability-status or dll-agent doctor for current MCP health; runtime will restart on demand`,
           })
         }
       } catch { /* skip corrupted */ }
@@ -264,7 +264,7 @@ export function toolDoctorChecks(projectDir?: string, sessionId?: string): ToolD
               check: "heavy-mcp-not-auto-started",
               pass: false,
               message: "Playwright is running — it should be on-demand only",
-              suggestion: "Stop with /mcp-stop playwright if not intentionally started",
+              suggestion: "If stale, run dll-agent doctor --repair-safe or stop the process manually after verifying it is not active",
             })
           }
         } catch { /* skip */ }
