@@ -25,8 +25,8 @@ import {
 } from "./interfaces"
 import type { MessageV2 } from "@/session/message-v2"
 import { buildContinuationSubtaskPrompt } from "./continuation-gate"
-import { buildResultPacket, writeResult as writeResultLedger, type ResultPacket } from "./result-ledger"
 import { checkDeduplication } from "./deduplication-gate"
+import { writeReviewerResult } from "./reviewer-result-bridge"
 import {
   assessRisk,
   hasNonTextInput,
@@ -746,32 +746,7 @@ export function markReviewerCompleted(
     findings_count: output?.findings.length ?? 0,
   }, sessionID)
 
-  // Phase 7: Record structured reviewer output to Result Ledger
-  if (output) {
-    try {
-      const dllRole = reviewerToDllRole(reviewer)
-      const effective = resolveRoleModel(dllRole, sessionID)
-      const resultPacket = buildResultPacket({
-        sessionID,
-        executing_role: reviewer as ResultPacket["executing_role"],
-        model: effective.primary,
-        user_goal: state.metrics?.final_claim ? "completion claim" : "ongoing task",
-        subtask_goal: `Review by ${reviewer}: ${output.trigger_reason}`,
-        claimed_result: `Review verdict: ${output.verdict} | Score: ${output.score} | Evidence confidence: ${output.evidence_confidence}`,
-        completion_status: output.block_completion ? "BLOCKED" : "VERIFIED_COMPLETE",
-        evidence_refs: [`reviewer:${reviewer}`, `score:${output.score}`],
-        unresolved_items: output.findings
-          .filter((f) => f.severity === "block")
-          .map((f) => f.summary),
-        verification_results: [
-          { name: "reviewer_score", status: output.score >= 70 ? "passed" : "failed" },
-        ],
-      })
-      writeResultLedger(sessionID, resultPacket)
-    } catch {
-      // Result ledger write is best-effort; must not block completion tracking
-    }
-  }
+  writeReviewerResult({ sessionID, reviewer, output, state })
 }
 
 export function clearBlockIfResolved(sessionID: string) {

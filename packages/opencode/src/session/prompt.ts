@@ -70,6 +70,13 @@ import { ensureGoalContract } from "@/dll-agent/goal-contract"
 import { extractLatestFailure, planRecovery, buildRecoveryHint, buildBlockedRecoveryReport, writeRecoveryDecision } from "@/dll-agent/recovery-loop"
 import { renderTaskStatus } from "@/dll-agent/task-observability"
 import { buildLocalCommandResponse } from "@/dll-agent/session-adapter"
+import {
+  appendGateBlock,
+  buildCapabilityGateBlock,
+  buildDedupGateBlock,
+  capabilityGateEvidence,
+} from "@/dll-agent/session-gate-orchestrator"
+import { drainSupervisorDispatchBatch, planReviewerDispatchGroups } from "@/dll-agent/reviewer-dispatch"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -2001,14 +2008,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }, msgs)
 
                 if (dedupHardBlock) {
-                  gateResult.passed = false
-                  const block = `dedup hard-block: existing verified result ${dedupHardBlock.packetId ?? "unknown"} must be reused or redo justified`
-                  gateResult.block_reason = gateResult.block_reason
-                    ? `${gateResult.block_reason}; ${block}`
-                    : block
-                  gateResult.synthetic_hint = [gateResult.synthetic_hint, dedupHardBlock.hint]
-                    .filter(Boolean)
-                    .join("\n")
+                  Object.assign(gateResult, appendGateBlock(
+                    gateResult,
+                    buildDedupGateBlock({ packetId: dedupHardBlock.packetId, hint: dedupHardBlock.hint }),
+                  ))
                   evidenceWrite("result.dedup_blocked", {
                     role: "commander",
                     reason: dedupHardBlock.reason,
@@ -2017,26 +2020,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   }, sessionID)
                 }
 
-                if (metrics.finalClaim && capabilityRuntime) {
-                  const capabilityBlocks = [
-                    ...capabilityRuntime.unresolvedGaps.map((g) => `missing capability: ${g.tag}`),
-                    ...capabilityRuntime.blockedReasons,
-                  ]
-                  if (capabilityBlocks.length > 0) {
-                    gateResult.passed = false
-                    const block = `capability requirements unresolved: ${capabilityBlocks.slice(0, 4).join("; ")}`
-                    gateResult.block_reason = gateResult.block_reason
-                      ? `${gateResult.block_reason}; ${block}`
-                      : block
-                    gateResult.synthetic_hint = [
-                      gateResult.synthetic_hint,
-                      `<dll-agent-capability-gate>\n${block}\nResolve, verify, or explicitly disclose these capability gaps before claiming completion.\n</dll-agent-capability-gate>`,
-                    ].filter(Boolean).join("\n")
-                    evidenceWrite("gate.capability_blocked", {
-                      fingerprint: capabilityRuntime.fingerprint,
-                      blocks: capabilityBlocks,
-                    }, sessionID)
-                  }
+                const capabilityBlock = buildCapabilityGateBlock(capabilityRuntime, metrics.finalClaim)
+                if (capabilityBlock) {
+                  Object.assign(gateResult, appendGateBlock(gateResult, capabilityBlock))
+                  evidenceWrite("gate.capability_blocked", capabilityGateEvidence(capabilityRuntime), sessionID)
                 }
 
                 // Phase 4: reconciliation gate — completion 必须显式吸收 reviewer 结论
@@ -2046,13 +2033,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   state,
                 })
                 if (!reconResult.passed) {
-                  gateResult.passed = false
-                  gateResult.block_reason = gateResult.block_reason
-                    ? `${gateResult.block_reason}; ${reconResult.block_reason}`
-                    : reconResult.block_reason
-                  gateResult.synthetic_hint = [gateResult.synthetic_hint, reconResult.synthetic_hint]
-                    .filter(Boolean)
-                    .join("\n")
+                  Object.assign(gateResult, appendGateBlock(gateResult, {
+                    reason: reconResult.block_reason ?? "reconciliation required",
+                    hint: reconResult.synthetic_hint,
+                  }))
                   evidenceWrite("gate.reconciliation_blocked", {
                     reason: reconResult.block_reason,
                     completed_reviews: state.completed_reviews,
@@ -2166,15 +2150,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // 只读 reviewer 可以并行；任何可能写文件、跑命令、修复问题的 reviewer 必须串行。
           // 这样保留 GLM/Kimi/审计类读取任务的速度优势，同时避免 chief-engineer/executor 类任务写入冲突。
           if (profileEnabled() && tasks.length >= 2) {
-            const batch: MessageV2.SubtaskPart[] = []
-            while (tasks.length > 0) {
-              const tail = tasks[tasks.length - 1]
-              if (tail.type === "subtask" && tail.command === "dll-agent-supervisor") {
-                batch.push(tasks.pop() as MessageV2.SubtaskPart)
-                continue
-              }
-              break
-            }
+            const batch = drainSupervisorDispatchBatch(tasks)
             if (batch.length >= 2) {
               const completeSupervisorTask = (task: MessageV2.SubtaskPart) => {
                 try {
@@ -2229,25 +2205,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }
               })
 
-              let index = 0
-              while (index < batch.length) {
-                const current = batch[index]
-                if (isReadOnlyReviewer(current.agent)) {
-                  const readOnlyGroup: MessageV2.SubtaskPart[] = []
-                  while (index < batch.length && isReadOnlyReviewer(batch[index].agent)) {
-                    readOnlyGroup.push(batch[index])
-                    index++
-                  }
-                  if (readOnlyGroup.length >= 2) {
-                    yield* runReadOnlyGroup(readOnlyGroup)
-                  } else {
-                    yield* runSingleSupervisorTask(readOnlyGroup[0], "parallel-read")
-                  }
+              for (const group of planReviewerDispatchGroups(batch, isReadOnlyReviewer)) {
+                if (group.mode === "parallel-read" && group.tasks.length >= 2) {
+                  yield* runReadOnlyGroup(group.tasks)
                   continue
                 }
-
-                yield* runSingleSupervisorTask(current, "serial-write")
-                index++
+                yield* runSingleSupervisorTask(group.tasks[0], group.mode)
               }
               continue
             }
@@ -2627,26 +2590,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   projectDir: ctx.directory,
                 }, msgs)
 
-                if (metrics.finalClaim && capabilityRuntime) {
-                  const capabilityBlocks = [
-                    ...capabilityRuntime.unresolvedGaps.map((g) => `missing capability: ${g.tag}`),
-                    ...capabilityRuntime.blockedReasons,
-                  ]
-                  if (capabilityBlocks.length > 0) {
-                    gateResult.passed = false
-                    const block = `capability requirements unresolved: ${capabilityBlocks.slice(0, 4).join("; ")}`
-                    gateResult.block_reason = gateResult.block_reason
-                      ? `${gateResult.block_reason}; ${block}`
-                      : block
-                    gateResult.synthetic_hint = [
-                      gateResult.synthetic_hint,
-                      `<dll-agent-capability-gate>\n${block}\nResolve, verify, or explicitly disclose these capability gaps before claiming completion.\n</dll-agent-capability-gate>`,
-                    ].filter(Boolean).join("\n")
-                    evidenceWrite("gate.capability_blocked", {
-                      fingerprint: capabilityRuntime.fingerprint,
-                      blocks: capabilityBlocks,
-                    }, sessionID)
-                  }
+                const capabilityBlock = buildCapabilityGateBlock(capabilityRuntime, metrics.finalClaim)
+                if (capabilityBlock) {
+                  Object.assign(gateResult, appendGateBlock(gateResult, capabilityBlock))
+                  evidenceWrite("gate.capability_blocked", capabilityGateEvidence(capabilityRuntime), sessionID)
                 }
 
                 // Phase 4: reconciliation hard-block on second gate path too
@@ -2656,13 +2603,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   state,
                 })
                 if (!reconResult.passed) {
-                  gateResult.passed = false
-                  gateResult.block_reason = gateResult.block_reason
-                    ? `${gateResult.block_reason}; ${reconResult.block_reason}`
-                    : reconResult.block_reason
-                  gateResult.synthetic_hint = [gateResult.synthetic_hint, reconResult.synthetic_hint]
-                    .filter(Boolean)
-                    .join("\n")
+                  Object.assign(gateResult, appendGateBlock(gateResult, {
+                    reason: reconResult.block_reason ?? "reconciliation required",
+                    hint: reconResult.synthetic_hint,
+                  }))
                   evidenceWrite("gate.reconciliation_blocked", {
                     reason: reconResult.block_reason,
                     completed_reviews: state.completed_reviews,

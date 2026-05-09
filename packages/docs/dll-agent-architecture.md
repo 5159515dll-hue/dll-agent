@@ -29,6 +29,9 @@ User Goal
 | Gates | final/evidence/continuation/reconciliation decisions | model selection or tool execution |
 | Evidence / Result Ledger | redacted evidence and reusable result packets | natural-language completion claims |
 | Session Adapter | MessageV2 shaping for dll-agent local command responses | provider/model resolution or gate logic |
+| Session Gate Orchestrator | composing existing gate block reasons and synthetic hints for session loop paths | deciding gate policy or reading provider state |
+| Reviewer Dispatch Planner | grouping supervisor subtasks into read-only parallel and write-capable serial batches | executing subtasks or mutating supervisor state |
+| Reviewer Result Bridge | converting structured reviewer output into Result Ledger packets | deciding reviewer completion or final gate pass/fail |
 | Doctor / Status | read-only health and next actions | hiding failed checks or mutating secrets |
 
 ## Phase 9 Extraction
@@ -41,12 +44,20 @@ User Goal
 
 The adapter is intentionally narrow. It does not parse role model commands, validate providers, inspect gates, read evidence, or decide routing. `prompt.ts` still performs Effect orchestration and session persistence.
 
+The follow-up Phase 9.1 cut extracts three more narrow seams without changing behavior:
+
+- `session-gate-orchestrator.ts` composes already-computed gate blocks for dedup, capability, and reconciliation checks;
+- `reviewer-dispatch.ts` plans supervisor reviewer batch dispatch so read-only reviewers can still run together while write-capable reviewers remain serial;
+- `reviewer-result-bridge.ts` converts structured reviewer output into Result Ledger packets.
+
+These modules are deliberately small. They do not change TUI behavior, provider resolution, role model resolution, routing policy, default models, or gate pass/fail semantics.
+
 ## Current Partial Areas
 
 | Area | Status | Reason |
 |---|---|---|
-| prompt.ts capability/recovery/gate orchestration | partial_runtime | Still in prompt loop; should be extracted in small behavior-preserving cuts |
-| supervisor modularization | partial_runtime | Routing policy already extracted, but reviewer dispatch/result wiring remains concentrated |
+| prompt.ts capability/recovery/gate orchestration | partial_runtime | Gate block composition and reviewer dispatch planning are extracted; capability action execution, MCP connect, and recovery hint injection still run in prompt loop |
+| supervisor modularization | partial_runtime | Result Ledger bridge is extracted; reviewer prompt templates and core trigger decision remain concentrated |
 | gate decision pure functions | partial_runtime | Several gates are pure, but prompt loop still owns merge/injection behavior |
 | TUI summary adapter | partial_runtime | Status adapters exist; no TUI redesign in Phase 9 |
 
