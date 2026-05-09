@@ -66,6 +66,21 @@ dll-agent 的全局默认 tools / skills / MCP 注册与按需加载系统。
 - 不能默认接管用户真实浏览器会话
 - 需用户确认才启动
 
+## Low-risk Auto-upgrade
+
+dll-agent 的自动升级只覆盖低风险、项目内、可验证的 capability 准备工作，不等于全局安装器。
+
+当前 runtime verified 的自动准备规则：
+
+- 文档类 Python tools（`doc-docx` / `pdf` / `ppt-pptx` / `xlsx`）声明真实 Python package，而不是把 `python3` binary 当成 package。
+- resolver 只生成项目内 target install：`python3 -m pip install --target .dll-agent/tools/python <package>`。
+- action runner 只允许 argv 形式的 allowlisted 命令；无 project-local `--target` 的 pip install 会被阻断。
+- verify 子进程带 `PYTHONPATH=<project>/.dll-agent/tools/python`，用于验证 package import。
+- install 成功后写 Result Ledger；同一 session 内再次需要相同 capability 时复用 `VERIFIED_COMPLETE` packet，不重复安装，也不要求用户重复确认。
+- `brew`、global npm、`sudo`、`git/gh`、`curl/wget`、secrets/token、远程发布、破坏性操作仍不能自动执行。
+
+这条能力用于避免“每次遇到新低风险工具都人工确认”。它不会为了自动化而绕过 Phase 6 的 high-risk permission guard。
+
 ## Merge 规则
 
 优先级从高到低：
