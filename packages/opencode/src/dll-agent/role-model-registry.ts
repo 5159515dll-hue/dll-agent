@@ -11,8 +11,15 @@
 
 import fs from "fs"
 import path from "path"
-import os from "os"
 import { write as writeEvidence, redact } from "./evidence"
+import {
+  globalConfigPath,
+  loadJsoncFile,
+  loadOverridesFromConfig,
+  loadSessionOverrides,
+  projectConfigPath,
+  sessionOverridePath,
+} from "./role-model-store"
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -146,31 +153,6 @@ const BUILT_IN_DEFAULTS: Record<DllRole, Omit<RoleModelConfig, "scope">> = {
   },
 }
 
-// ─── Config file paths ──────────────────────────────────────────────────────
-
-function globalConfigPath() {
-  return path.join(configRoot(), "config", "role-models.jsonc")
-}
-
-function configRoot() {
-  return process.env.DLL_AGENT_CONFIG_ROOT || path.join(os.homedir(), ".dll-agent")
-}
-
-function projectConfigPath(projectDir?: string) {
-  if (!projectDir) return null
-  // Priority: <project>/.dll-agent/role-models.jsonc > <project>/dll-agent.role-models.jsonc
-  const a = path.join(projectDir, ".dll-agent", "role-models.jsonc")
-  const b = path.join(projectDir, "dll-agent.role-models.jsonc")
-  if (fs.existsSync(a)) return a
-  if (fs.existsSync(b)) return b
-  return null
-}
-
-function sessionOverridePath(sessionID?: string) {
-  if (!sessionID) return null
-  return path.join(configRoot(), "sessions", sessionID, "supervisor.json")
-}
-
 // ─── Config loading (sync) ─────────────────────────────────────────────────
 
 function parseModelString(model: string): { providerID: string; modelID: string } {
@@ -179,77 +161,6 @@ function parseModelString(model: string): { providerID: string; modelID: string 
   return {
     providerID: model.slice(0, slash),
     modelID: model.slice(slash + 1),
-  }
-}
-
-function loadJsoncFile(filePath: string): Record<string, unknown> | null {
-  try {
-    if (!fs.existsSync(filePath)) return null
-    const raw = fs.readFileSync(filePath, "utf8")
-    // Minimal JSONC support: strip // comments and trailing commas
-    const cleaned = raw
-      .replace(/\/\/.*$/gm, "")
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/,(?=\s*[}\]])/g, "")
-    return JSON.parse(cleaned)
-  } catch {
-    return null
-  }
-}
-
-interface FileRoleModelConfig {
-  primary?: string
-  fallback?: string[]
-  enabled?: boolean
-  onDemandOnly?: boolean
-}
-
-function loadOverridesFromConfig(
-  filePath: string | null,
-  scope: OverrideScope,
-): Partial<Record<DllRole, RoleModelConfig>> | null {
-  if (!filePath) return null
-  const data = loadJsoncFile(filePath)
-  if (!data?.roles) return null
-  const roles = data.roles as Record<string, FileRoleModelConfig>
-  const result: Partial<Record<DllRole, RoleModelConfig>> = {}
-  for (const [roleName, cfg] of Object.entries(roles)) {
-    if (!isDllRole(roleName)) continue
-    if (!cfg.primary) continue
-    result[roleName] = {
-      primary: cfg.primary,
-      fallback: cfg.fallback ?? [],
-      scope,
-      enabled: cfg.enabled ?? true,
-      onDemandOnly: cfg.onDemandOnly,
-    }
-  }
-  return result
-}
-
-function loadSessionOverrides(sessionID?: string): Partial<Record<DllRole, RoleModelConfig>> | null {
-  if (!sessionID) return null
-  const filePath = sessionOverridePath(sessionID)
-  if (!filePath) return null
-  try {
-    if (!fs.existsSync(filePath)) return null
-    const state = JSON.parse(fs.readFileSync(filePath, "utf8"))
-    const overrides = state.role_model_overrides as Record<string, { primary: string; fallback?: string[]; enabled?: boolean }> | undefined
-    if (!overrides) return null
-    const result: Partial<Record<DllRole, RoleModelConfig>> = {}
-    for (const [roleName, cfg] of Object.entries(overrides)) {
-      if (!isDllRole(roleName)) continue
-      if (!cfg.primary) continue
-      result[roleName as DllRole] = {
-        primary: cfg.primary,
-        fallback: cfg.fallback ?? [],
-        scope: "session",
-        enabled: cfg.enabled ?? true,
-      }
-    }
-    return result
-  } catch {
-    return null
   }
 }
 
@@ -301,7 +212,7 @@ export function resolveRoleModel(
   projectDir?: string,
 ): EffectiveRoleModel {
   // 1. Session override
-  const sessionOverrides = loadSessionOverrides(sessionID)
+  const sessionOverrides = loadSessionOverrides(sessionID, isDllRole)
   if (sessionOverrides?.[role]) {
     const cfg = sessionOverrides[role]!
     return buildEffective(role, cfg, "session")
@@ -309,7 +220,7 @@ export function resolveRoleModel(
 
   // 2. Project override
   const projPath = projectConfigPath(projectDir)
-  const projectOverrides = loadOverridesFromConfig(projPath, "project")
+  const projectOverrides = loadOverridesFromConfig(projPath, "project", isDllRole)
   if (projectOverrides?.[role]) {
     const cfg = projectOverrides[role]!
     return buildEffective(role, cfg, "project")
@@ -317,7 +228,7 @@ export function resolveRoleModel(
 
   // 3. Global override
   const globalPath = globalConfigPath()
-  const globalOverrides = loadOverridesFromConfig(globalPath, "global")
+  const globalOverrides = loadOverridesFromConfig(globalPath, "global", isDllRole)
   if (globalOverrides?.[role]) {
     const cfg = globalOverrides[role]!
     return buildEffective(role, cfg, "global")
