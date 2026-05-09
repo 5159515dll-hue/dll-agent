@@ -69,6 +69,7 @@ import { reconcileSessionState } from "@/dll-agent/session-reconciler"
 import { ensureGoalContract } from "@/dll-agent/goal-contract"
 import { extractLatestFailure, planRecovery, buildRecoveryHint, buildBlockedRecoveryReport, writeRecoveryDecision } from "@/dll-agent/recovery-loop"
 import { renderTaskStatus } from "@/dll-agent/task-observability"
+import { buildLocalCommandResponse } from "@/dll-agent/session-adapter"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -1481,53 +1482,29 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         provider,
         validateModel: getModel,
       })
-      const userMsg: MessageV2.User = {
-        id: input.messageID ?? MessageID.ascending(),
+      const response = buildLocalCommandResponse({
         sessionID: input.sessionID,
-        time: { created: Date.now() },
-        role: "user",
-        agent: input.agent ?? "commander",
-        model: { providerID: model.providerID, modelID: model.modelID },
-      }
-      yield* sessions.updateMessage(userMsg)
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        messageID: userMsg.id,
-        sessionID: input.sessionID,
-        type: "text",
-        text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}`,
-      } satisfies MessageV2.TextPart)
-
-      const assistant: MessageV2.Assistant = {
-        id: MessageID.ascending(),
-        sessionID: input.sessionID,
-        parentID: userMsg.id,
-        mode: "commander",
-        agent: "commander",
-        cost: 0,
-        path: { cwd: ctx.directory, root: ctx.worktree },
-        time: { created: Date.now(), completed: Date.now() },
-        role: "assistant",
-        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-        modelID: model.modelID,
+        command: input.command,
+        arguments: input.arguments,
+        agent: input.agent,
+        messageID: input.messageID,
         providerID: model.providerID,
-      }
-      yield* sessions.updateMessage(assistant)
-      const part: MessageV2.TextPart = {
-        id: PartID.ascending(),
-        messageID: assistant.id,
-        sessionID: input.sessionID,
-        type: "text",
+        modelID: model.modelID,
+        cwd: ctx.directory,
+        root: ctx.worktree,
         text,
-      }
-      yield* sessions.updatePart(part)
+      })
+      yield* sessions.updateMessage(response.user)
+      yield* sessions.updatePart(response.commandPart)
+      yield* sessions.updateMessage(response.assistant)
+      yield* sessions.updatePart(response.assistantPart)
       yield* bus.publish(Command.Event.Executed, {
         name: input.command,
         sessionID: input.sessionID,
         arguments: input.arguments,
-        messageID: assistant.id,
+        messageID: response.assistant.id,
       })
-      return { info: assistant, parts: [part] }
+      return { info: response.assistant, parts: [response.assistantPart] }
     })
 
     const handleLocalRoleModelCommand = Effect.fn("SessionPrompt.handleLocalRoleModelCommand")(function* (
