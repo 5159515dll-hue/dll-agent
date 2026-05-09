@@ -1,10 +1,15 @@
 /**
  * dll-agent permission-bridge tests
  */
-import { describe, it, expect } from "bun:test"
+import { afterEach, describe, it, expect } from "bun:test"
 import { permissionPreCheck } from "../../src/dll-agent/permission-bridge"
 
 describe("permission-bridge", () => {
+  afterEach(() => {
+    delete process.env.DLL_AGENT_ENABLED
+    delete process.env.DLL_AGENT_AUTO_ALLOW
+  })
+
   it("intercepts low-risk shell typecheck as allow", () => {
     const result = permissionPreCheck({
       permission: "shell",
@@ -28,24 +33,35 @@ describe("permission-bridge", () => {
   })
 
   it("classifies rm -rf (high risk) as ask", () => {
+    process.env.DLL_AGENT_ENABLED = "1"
     const result = permissionPreCheck({
       permission: "shell",
       patterns: ["rm", "-rf", "/tmp/test"],
     })
-    // High risk should always be intercepted with action=ask (requires confirmation)
-    if (result.intercepted) {
-      expect(result.action).toBe("ask")
-    }
+    expect(result.intercepted).toBe(true)
+    expect(result.action).toBe("ask")
   })
 
   it("classifies .env read (high secret risk) as ask", () => {
+    process.env.DLL_AGENT_ENABLED = "1"
     const result = permissionPreCheck({
       permission: "file_read",
       patterns: [".env"],
     })
-    if (result.intercepted) {
-      expect(result.action).toBe("ask")
-    }
+    expect(result.intercepted).toBe(true)
+    expect(result.action).toBe("ask")
+  })
+
+  it("denies mutating tools for read-only reviewer roles", () => {
+    process.env.DLL_AGENT_ENABLED = "1"
+    const result = permissionPreCheck({
+      permission: "bash",
+      patterns: ["git status"],
+      metadata: { dllAgentRole: "role-cross" },
+    })
+    expect(result.intercepted).toBe(true)
+    expect(result.action).toBe("deny")
+    expect(result.reason).toContain("role-cross")
   })
 
   it("handles unknown permission types gracefully", () => {

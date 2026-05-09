@@ -1,7 +1,10 @@
 /**
  * continuation-gate tests
  */
-import { describe, it, expect } from "bun:test"
+import fs from "fs"
+import os from "os"
+import path from "path"
+import { afterEach, beforeEach, describe, it, expect } from "bun:test"
 import {
   detectUnfinishedIndicators,
   classifyUnfinishedItem,
@@ -9,7 +12,26 @@ import {
   buildContinuationPacket,
   checkContinuationGate,
   isContinuationBudgetExhausted,
+  buildBudgetExhaustedReport,
+  buildContinuationDispatchPlan,
+  consumeContinuationPacket,
 } from "../../src/dll-agent/continuation-gate"
+import { ensureGoalContract, refineGoalContract, updateGoalPlan } from "../../src/dll-agent/goal-contract"
+
+let root = ""
+let originalRoot: string | undefined
+
+beforeEach(() => {
+  originalRoot = process.env.DLL_AGENT_CONFIG_ROOT
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "dll-agent-continuation-gate-"))
+  process.env.DLL_AGENT_CONFIG_ROOT = root
+})
+
+afterEach(() => {
+  if (originalRoot === undefined) delete process.env.DLL_AGENT_CONFIG_ROOT
+  else process.env.DLL_AGENT_CONFIG_ROOT = originalRoot
+  fs.rmSync(root, { recursive: true, force: true })
+})
 
 function freshState() {
   return {
@@ -160,6 +182,97 @@ describe("continuation-gate: gate function", () => {
     expect(result.passed).toBe(true)
     expect(result.has_blocking_unfinished).toBe(false)
   })
+
+  it("active plan unfinished -> continuation required", () => {
+    ensureGoalContract({ sessionID: "goal-plan", userGoal: "Finish active plan" })
+    updateGoalPlan("goal-plan", [
+      { id: "plan-1", description: "Run final smoke", status: "pending", evidence_refs: [] },
+    ])
+    const result = checkContinuationGate({
+      assistantText: "All tasks complete. Tests pass.",
+      isCompletionClaim: true,
+      state: freshState(),
+      sessionID: "goal-plan",
+    })
+
+    expect(result.passed).toBe(false)
+    expect(result.completion_status).toBe("PARTIAL_CONTINUED")
+    expect(result.continuation_packet?.blocking_unfinished[0]?.description).toBe("Run final smoke")
+  })
+
+  it("verification not_run -> continuation required when Goal Contract requires verification", () => {
+    ensureGoalContract({
+      sessionID: "goal-verification",
+      userGoal: "Finish with required checks",
+      requiredVerification: ["bun test --cwd packages/opencode test/dll-agent/"],
+    })
+    const result = checkContinuationGate({
+      assistantText: "All tasks complete.",
+      isCompletionClaim: true,
+      state: { ...freshState(), metrics: { ...freshState().metrics, real_tool_evidence: false, verification_evidence: false } },
+      sessionID: "goal-verification",
+    })
+
+    expect(result.passed).toBe(false)
+    expect(result.completion_status).toBe("PARTIAL_CONTINUED")
+    expect(result.blocking_items[0]?.description).toContain("bun test")
+  })
+
+  it("doctor failed -> continuation required", () => {
+    ensureGoalContract({ sessionID: "goal-doctor", userGoal: "Fix doctor" })
+    const state = freshState()
+    state.blocked_completion = true
+    ;(state as any).block_reason = "doctor failed"
+    const result = checkContinuationGate({
+      assistantText: "All tasks complete.",
+      isCompletionClaim: true,
+      state,
+      sessionID: "goal-doctor",
+    })
+
+    expect(result.passed).toBe(false)
+    expect(result.block_reason).toContain("Goal Contract")
+  })
+
+  it("reviewer block -> continuation required", () => {
+    ensureGoalContract({ sessionID: "goal-reviewer", userGoal: "Resolve reviewer block" })
+    const state = freshState()
+    state.blocked_completion = true
+    ;(state as any).block_reason = "reviewer chief-engineer blocked completion: missing verification"
+    const result = checkContinuationGate({
+      assistantText: "All tasks complete.",
+      isCompletionClaim: true,
+      state,
+      sessionID: "goal-reviewer",
+    })
+
+    expect(result.passed).toBe(false)
+    expect(result.continuation_packet?.reviewer_blocks.join("\n")).toContain("reviewer")
+  })
+
+  it("non-blocking follow-up does not block", () => {
+    ensureGoalContract({ sessionID: "goal-followup", userGoal: "Finish core task" })
+    refineGoalContract("goal-followup", {
+      successCriteriaStatus: [{
+        id: "criterion-1",
+        description: "Core behavior verified",
+        status: "satisfied",
+        evidence_refs: ["cmd:test"],
+      }],
+    })
+    updateGoalPlan("goal-followup", [
+      { id: "plan-1", description: "Optional docs cleanup", status: "non_blocking", evidence_refs: [] },
+    ])
+    const result = checkContinuationGate({
+      assistantText: "All tasks complete. Tests pass.",
+      isCompletionClaim: true,
+      state: { ...freshState(), metrics: { ...freshState().metrics, real_tool_evidence: true, verification_evidence: true } },
+      sessionID: "goal-followup",
+    })
+
+    expect(result.passed).toBe(true)
+    expect(result.has_non_blocking).toBe(false)
+  })
 })
 
 describe("continuation-gate: packet builder", () => {
@@ -238,5 +351,104 @@ describe("continuation-gate: budget", () => {
       blockingItems: items,
     })
     expect(result.exhausted).toBe(true)
+  })
+
+  it("budget exhausted outputs blocked report, not complete", () => {
+    const packet = buildContinuationPacket({
+      sessionID: "budget-session",
+      userGoal: "finish task",
+      currentPhase: "phase-2",
+      completionClaim: "done",
+      items: [{
+        id: "item_1",
+        kind: "blocking_unfinished",
+        description: "wire continuation dispatch",
+        evidence_refs: ["gate:continuation"],
+        required_action: "dispatch continuation",
+        recommended_role: "chief-engineer",
+        verification_required: ["bun test"],
+        risk_level: "high",
+      }],
+      state: freshState(),
+    })
+    const report = buildBudgetExhaustedReport({
+      sessionID: "budget-session",
+      userGoal: "finish task",
+      reason: "Maximum continuation count reached",
+      packet,
+    })
+
+    expect(report.completion_status).toBe("BLOCKED_BUDGET_EXHAUSTED")
+    expect(report.report).toContain("Do not claim VERIFIED_COMPLETE")
+    expect(report.report).toContain("wire continuation dispatch")
+  })
+})
+
+describe("continuation-gate: dispatch", () => {
+  it("continuation packet can dispatch commander, chief-engineer, and requirements-inspector", () => {
+    const packet = buildContinuationPacket({
+      sessionID: "dispatch-session",
+      userGoal: "continue task",
+      currentPhase: "phase-2",
+      completionClaim: "partial",
+      items: [
+        {
+          id: "low",
+          kind: "blocking_unfinished",
+          description: "finish low-risk local edit",
+          evidence_refs: ["goal"],
+          required_action: "finish local edit",
+          recommended_role: "chief-engineer",
+          verification_required: ["unit test"],
+          risk_level: "low",
+        },
+        {
+          id: "high",
+          kind: "blocking_unfinished",
+          description: "repair failed gate",
+          evidence_refs: ["gate"],
+          required_action: "repair gate",
+          recommended_role: "chief-engineer",
+          verification_required: ["typecheck"],
+          risk_level: "high",
+        },
+      ],
+      state: freshState(),
+    })
+    packet.next_execution_plan.push({
+      step: 3,
+      role: "requirements-inspector",
+      action: "recheck user correction",
+      verification: "requirements match evidence",
+    })
+    const actions = buildContinuationDispatchPlan(packet)
+
+    expect(actions.map((item) => item.role)).toEqual(["commander", "chief-engineer", "requirements-inspector"])
+    expect(actions.every((item) => item.dispatch_reason.length > 0)).toBe(true)
+  })
+
+  it("consumeContinuationPacket returns dispatcher-ready action evidence refs", () => {
+    const packet = buildContinuationPacket({
+      sessionID: "consume-session",
+      userGoal: "continue task",
+      currentPhase: "phase-2",
+      completionClaim: "partial",
+      items: [{
+        id: "item_1",
+        kind: "blocking_unfinished",
+        description: "repair failed gate",
+        evidence_refs: ["gate:block"],
+        required_action: "repair gate",
+        recommended_role: "chief-engineer",
+        verification_required: ["typecheck"],
+        risk_level: "high",
+      }],
+      state: freshState(),
+    })
+    const consumed = consumeContinuationPacket(packet)
+
+    expect(consumed.shouldContinue).toBe(true)
+    expect(consumed.actionItems[0]?.role).toBe("chief-engineer")
+    expect(consumed.actionItems[0]?.evidence_refs).toContain("gate:block")
   })
 })

@@ -407,6 +407,18 @@ export type EvidenceRecordType =
   | "agent.profile.enabled"
   | "agent.get"
   | "system.environment"
+  // Goal Contract evidence types
+  | "goal_contract.created"
+  | "goal_contract.updated"
+  | "goal_contract.refined"
+  | "goal_contract.evaluated"
+  | "continuation_gate.blocked"
+  | "continuation_gate.consumed"
+  | "continuation_gate.dispatched"
+  | "continuation_gate.budget_exhausted"
+  | "recovery.decision"
+  | "recovery.prompt_injected"
+  | "recovery.blocked"
   // Phase 7: Result Ledger evidence types
   | "result.produced"
   | "result.reused"

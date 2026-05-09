@@ -23,6 +23,8 @@ import { scanArtifactLedger } from "./artifact-ledger"
 import { buildEvidenceSnapshot } from "./evidence-normalizer"
 import { evaluateCompletionReadiness } from "./completion-readiness"
 import { doctorCheck as roleModelDoctorCheck } from "./role-model-registry"
+import { doctorCheckRoleToolPolicy } from "./role-tool-policy"
+import { doctorCheckGoalContracts } from "./goal-contract"
 import type { RiskLevel } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
 import { execSync } from "child_process"
@@ -106,6 +108,32 @@ function checkPermissionPolicy(): DoctorCheck[] {
   })
 
   return checks
+}
+
+function checkRoleToolPolicy(): DoctorCheck[] {
+  const result = doctorCheckRoleToolPolicy()
+  return [{
+    name: "role-tool-policy",
+    severity: result.ok ? "PASS" : "FAIL",
+    message: result.ok
+      ? "Role tool policies validate correctly: writable roles can write, reviewers are read-only, high-risk tools require confirmation"
+      : `Role tool policy issues detected: ${result.issues.join("; ")}`,
+    nextAction: result.ok ? null : "Review role-tool-policy.ts and agent permission wiring",
+    evidence: result.ok ? "role-tool-policy smoke test passed" : result.issues.join("; "),
+  }]
+}
+
+function checkGoalContractHealth(): DoctorCheck[] {
+  const result = doctorCheckGoalContracts()
+  return [{
+    name: "goal-contract",
+    severity: result.ok ? "PASS" : "FAIL",
+    message: result.ok
+      ? `Goal Contract storage validates correctly (${result.checked} contract(s) checked)`
+      : `Goal Contract issues detected: ${result.issues.slice(0, 3).join("; ")}`,
+    nextAction: result.ok ? null : "Repair or remove corrupted ~/.dll-agent/sessions/*/goal-contract.json files",
+    evidence: result.ok ? "goal-contract doctor check passed" : result.issues.join("; "),
+  }]
 }
 
 function checkLspStrategy(projectRoot: string): DoctorCheck[] {
@@ -902,6 +930,8 @@ export function runDoctor(projectRoot?: string): DoctorReport {
 
   // Permission checks
   allChecks.push(...checkPermissionPolicy())
+  allChecks.push(...checkRoleToolPolicy())
+  allChecks.push(...checkGoalContractHealth())
 
   // LSP checks
   allChecks.push(...checkLspStrategy(root))

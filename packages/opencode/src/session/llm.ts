@@ -313,7 +313,7 @@ const live: Layer.Layer<
                 sessionID: SessionID.make(input.sessionID),
                 permission: "workflow_tool_approval",
                 patterns: uniquePatterns,
-                metadata: { tools: approvalTools },
+                metadata: { tools: approvalTools, dllAgentRole: input.agent.name },
                 always: uniquePatterns,
                 ruleset,
               }),

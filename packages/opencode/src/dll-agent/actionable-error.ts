@@ -23,6 +23,8 @@ export type FailureCategory =
   | "model_error"
   | "file_not_found"
   | "dependency_missing"
+  | "config_error"
+  | "provider_normalization_error"
   | "git_conflict"
   | "network_error"
   | "timeout"
@@ -49,6 +51,8 @@ function classifyFromOutput(stderr: string): FailureCategory {
   if (/test.*fail|assert.*fail|expect.*not|✗|✘|fail\b/i.test(lower)) return "test_failure"
   if (/permission denied|access denied|eacces|not allowed/i.test(lower)) return "permission_denied"
   if (/cannot find module|module not found|cannot resolve/i.test(lower)) return "dependency_missing"
+  if (/provider.*reasoning_effort|reasoning_effort|max.*low.*medium.*high|literal_error/i.test(lower)) return "provider_normalization_error"
+  if (/config.*invalid|json.*parse|yaml.*parse|toml.*parse|unexpected token.*json/i.test(lower)) return "config_error"
   if (/enoent|no such file|file not found/i.test(lower)) return "file_not_found"
   if (/merge conflict|conflict|automerge failed/i.test(lower)) return "git_conflict"
   if (/network|connection refused|econnrefused|dns|timeout|etimedout/i.test(lower)) return "network_error"
@@ -120,6 +124,16 @@ const RECOVERY_STRATEGIES: Record<FailureCategory, {
   dependency_missing: {
     automaticAction: "Run the appropriate package manager install command within the project directory.",
     userAction: "If the dependency requires system-level installation, run: brew install <package> or equivalent.",
+    userActionRequired: false,
+  },
+  config_error: {
+    automaticAction: "Read the config parse/validation error, apply the minimal local config fix, rerun the failed command.",
+    userAction: null,
+    userActionRequired: false,
+  },
+  provider_normalization_error: {
+    automaticAction: "Normalize provider request options at the final request boundary, add a regression test, rerun provider mock/smoke.",
+    userAction: null,
     userActionRequired: false,
   },
   git_conflict: {

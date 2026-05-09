@@ -56,11 +56,13 @@ import { buildGlobalEffective, buildEffectiveManifest, loadProjectOverlay } from
 import { GLOBAL_DEFAULT_TOOLS, DEFAULT_MANIFEST } from "@/dll-agent/tool-catalog"
 import { buildPromptIndex } from "@/dll-agent/tool-prompt"
 import { buildActionableError, formatActionableError } from "@/dll-agent/actionable-error"
-import { checkContinuationGate, isContinuationBudgetExhausted, parseKimiContinuationOutput, consumeContinuationPacket } from "@/dll-agent/continuation-gate"
+import { checkContinuationGate, isContinuationBudgetExhausted, parseKimiContinuationOutput, consumeContinuationPacket, buildBudgetExhaustedReport } from "@/dll-agent/continuation-gate"
 import { checkDeduplication, buildDedupContextSummary } from "@/dll-agent/deduplication-gate"
 import { orchestrateCapabilities, type CapabilityOrchestrationResult } from "@/dll-agent/capability-orchestrator"
 import { runCapabilityActions } from "@/dll-agent/capability-action-runner"
 import { reconcileSessionState } from "@/dll-agent/session-reconciler"
+import { ensureGoalContract } from "@/dll-agent/goal-contract"
+import { extractLatestFailure, planRecovery, buildRecoveryHint, buildBlockedRecoveryReport, writeRecoveryDecision } from "@/dll-agent/recovery-loop"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -432,6 +434,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           permission
             .ask({
               ...req,
+              metadata: { ...(req.metadata ?? {}), dllAgentRole: input.agent.name },
               sessionID: input.session.id,
               tool: { messageID: input.processor.message.id, callID: options.toolCallId },
               ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
@@ -1008,6 +1011,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           provider,
           validateModel: getModel,
         })
+      }
+      if (profileEnabled() && role === "commander") {
+        const goalText = input.parts
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("\n")
+          .trim()
+        if (goalText) {
+          ensureGoalContract({
+            sessionID: input.sessionID,
+            userGoal: goalText,
+            evidenceRefs: [`message:${input.messageID ?? "pending"}`],
+          })
+        }
       }
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
@@ -1636,6 +1653,49 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 state: updatedState,
               }).state
 
+              // Phase 3 — Autonomous Recovery Loop:
+              // normal recoverable tool/test/typecheck/provider failures should
+              // produce a concrete automatic recovery action instead of stopping.
+              try {
+                const failure = extractLatestFailure(msgs)
+                if (failure) {
+                  updatedState.repair_counts ??= {}
+                  const recovery = planRecovery({
+                    failure,
+                    repairCounts: updatedState.repair_counts,
+                    maxRecoveryAttempts: 5,
+                  })
+                  updatedState.repair_counts[recovery.fingerprint] = recovery.recoveryAttempts + 1
+                  supervisorSaveState(sessionID, updatedState)
+                  writeRecoveryDecision(sessionID, recovery)
+                  if (recovery.userActionRequired || !recovery.shouldContinue) {
+                    gatePendingHints.push(buildBlockedRecoveryReport(recovery))
+                    evidenceWrite("recovery.blocked", {
+                      status: recovery.status,
+                      category: recovery.category,
+                      fingerprint: recovery.fingerprint,
+                      reason: recovery.reason,
+                    }, sessionID)
+                  } else {
+                    gatePendingHints.push(buildRecoveryHint(recovery))
+                    evidenceWrite("recovery.prompt_injected", {
+                      category: recovery.category,
+                      fingerprint: recovery.fingerprint,
+                      reviewer: recovery.reviewer,
+                    }, sessionID)
+                    if (recovery.reviewer && !decision.reviewers.includes(recovery.reviewer)) {
+                      decision.reviewers.push(recovery.reviewer)
+                      decision.reasons[recovery.reviewer] = `autonomous recovery: ${recovery.reason}`
+                      decision.fingerprints ??= {}
+                      decision.fingerprints[recovery.reviewer] = `recovery:${recovery.fingerprint}`
+                      decision.should_review = true
+                    }
+                  }
+                }
+              } catch (recoveryErr) {
+                yield* slog.error("autonomous recovery loop error", { error: String(recoveryErr) })
+              }
+
               // 2a. Capability orchestration — bridge the declarative capability
               // registry into the live session loop. This is intentionally before
               // skill activation and before tool resolution so selected skills/MCPs
@@ -1898,9 +1958,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       reason: budgetCheck.reason,
                       continuation_count: state.continuation_count ?? 0,
                     })
-                    gatePendingHints.push(
-                      `<dll-agent-continuation-gate>\nContinuation budget exhausted: ${budgetCheck.reason}\nManual user intervention required.\n</dll-agent-continuation-gate>`
-                    )
+                    const blockedReport = buildBudgetExhaustedReport({
+                      sessionID,
+                      userGoal: lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : "",
+                      reason: budgetCheck.reason ?? "continuation budget exhausted",
+                      packet: continuationResult.continuation_packet,
+                    })
+                    gatePendingHints.push(blockedReport.report)
                   }
                 }
 
@@ -2193,11 +2257,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                             ``,
                             `Action items:`,
                             ...consumed.actionItems.map((a, i) =>
-                              `${i + 1}. [${a.role}] ${a.action} (verify: ${a.verification})`
+                              `${i + 1}. [${a.role}] ${a.action} (verify: ${a.verification}; reason: ${a.dispatch_reason})`
                             ),
                             `</dll-agent-continuation-result>`,
                           ].join("\n")
                           gatePendingHints.push(contHint)
+                          for (const action of consumed.actionItems) {
+                            if (action.role === "commander") continue
+                            tasks.push({
+                              type: "subtask",
+                              id: PartID.ascending(),
+                              messageID: MessageID.ascending(),
+                              sessionID,
+                              agent: action.role,
+                              description: `Continuation: ${action.description}`,
+                              command: "dll-agent-supervisor",
+                              prompt: [
+                                `[dll-agent continuation dispatch]`,
+                                `Role: ${action.role}`,
+                                `Reason: ${action.dispatch_reason}`,
+                                `Action: ${action.action}`,
+                                `Verification: ${action.verification}`,
+                                `Evidence refs: ${action.evidence_refs.join(", ") || "none"}`,
+                                ``,
+                                `Return structured reviewer output. If this is repairable without user input, provide concrete next actions and required verification.`,
+                              ].join("\n"),
+                            })
+                          }
                         }
                       }
                     }

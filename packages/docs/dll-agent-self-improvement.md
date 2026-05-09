@@ -25,8 +25,17 @@ triggers.ts ──→ supervisor.ts ──→ gates.ts ──→ final completio
 **代码模式**: ✅ flat exports (P0-1: 已移除 self-reexport, 改为 flat named exports)。
 
 ### gates.ts
-Evidence gate、reconciliation gate、final completion gate 的判定标准。所有 gate 判断基于代码，部分需要模型辅助时通过 reviewer 完成。
+Evidence gate、reconciliation gate、Goal Contract gate、final completion gate 的判定标准。所有 gate 判断基于代码，部分需要模型辅助时通过 reviewer 完成。
 **代码模式**: ✅ flat exports (P0-1: 已移除 self-reexport, 改为 flat named exports)。
+
+### goal-contract.ts (Phase 1.1)
+最小 Goal Contract runtime：持久化 user goal、success criteria、success criteria status、non-goals、constraints、required verification、active plan，并提供 `assessGoalCompletion()` 给 task-state、final gate、continuation gate 使用。
+- 原始 `user_goal` 创建后不覆盖；后续只允许 append/refine criteria、non-goals、constraints、required verification。
+- `pending` / `blocked` success criteria 和 active plan 会阻断 final PASS。
+- `non_blocking` follow-up 不阻断 verified complete。
+- 缺 required verification 时只能是 `UNVERIFIED_PARTIAL` 或继续执行，不能写 verified complete。
+- 创建、更新、refine、评估均写入脱敏 evidence。
+**状态**: implemented_runtime_verified（Phase 1.1）。
 
 ### evidence.ts
 Evidence 日志系统：自动脱敏、写入 evidence file。
@@ -78,10 +87,18 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 
 ### actionable-error.ts (NEW — Phase 3)
 可执行错误构建器：将 raw error 转换为分类后的可执行建议。
-- 自动分类 14 种错误类型（typecheck_error、test_failure、permission_denied 等）
+- 自动分类 16 种错误类型（typecheck_error、test_failure、permission_denied、config_error、provider_normalization_error 等）
 - 输出包含：what failed、why likely、next automatic action、user action if required
 - 生成 failure fingerprint 用于去重
 **代码模式**: ✅ flat exports。
+
+### recovery-loop.ts (Phase 3)
+Autonomous Recovery Loop 最小 runtime policy：从真实 tool failure 中提取失败、分类、生成 fingerprint、检查 recovery budget，并决定 commander 自动继续、升级 reviewer、还是输出 blocked report。
+- 普通 typecheck/test/import/path/config/provider normalization 错误默认自动继续。
+- 同一 failure fingerprint 第二次升级 `chief-engineer`，第三次升级 `role-cross`。
+- permission denied、secrets/token/login、破坏性命令、push/release/upload、全局系统修改、高成本/预算阻断输出 `BLOCKED_USER_REQUIRED` 或 `BLOCKED_BUDGET_EXHAUSTED`。
+- prompt supervisor loop 已接入：写 `recovery.decision` evidence，自动恢复 hint 注入 commander，必要 reviewer 进入 subtask 队列。
+**状态**: implemented_runtime_verified（Phase 3 最小闭环）。
 
 ### cross-review.ts (NEW — Phase 5)
 多模型对抗交叉审查系统（Cross-Review Council）。
@@ -171,6 +188,9 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 | **Tool prompt 注入 (NEW)** | `prompt.ts` | buildPromptIndex() 注入 system prompt array，≤1200 chars |
 | **Actionable error 接入 (NEW)** | `prompt.ts` | buildActionableError() 在 gate block 时注入 recovery suggestion |
 | **Continuation Gate (NEW)** | `continuation-gate.ts` + `prompt.ts` | Kimi task-completion-archivist 检查 blocking unfinished items；continuation packet 生成；budget 控制；在 evidence gate 前运行 |
+| **Goal Contract Gate (Phase 1.1)** | `goal-contract.ts` + `task-state.ts` + `gates.ts` + `continuation-gate.ts` + `prompt.ts` | commander 首轮创建 Goal Contract；task-state 暴露 goal_status；final gate/continuation gate 读取 contract，未满足 success criteria、active plan 或 verification 时不允许 final PASS |
+| **Completion / Continuation Closure (Phase 2)** | `continuation-gate.ts` + `prompt.ts` | final report 前运行 continuation check；active plan、verification not_run、doctor failed、reviewer block 会生成 continuation packet；packet 可形成 commander/chief-engineer/requirements-inspector dispatcher action；budget exhausted 输出 BLOCKED report |
+| **Autonomous Recovery Loop (Phase 3)** | `recovery-loop.ts` + `actionable-error.ts` + `prompt.ts` | 从 tool failure 生成恢复决策；普通错误自动继续；repeated fingerprint 升级 chief-engineer/role-cross；权限/secrets/破坏性/发布/预算问题输出 blocked report |
 | **Tool-prompt project overlay (NEW)** | `prompt.ts` | loadProjectOverlay() + buildEffectiveManifest() 替换 buildGlobalEffective()，项目级工具配置生效 |
 | **UX state TUI 接入 (NEW)** | `dll-agent-panel.tsx` | uxLine() memo 驱动 buildCompactSummary()，TUI 面板实时显示 task/supervisor/cost 状态 |
 | **Capability Runtime Orchestrator (NEW)** | `capability-orchestrator.ts` + `capability-action-runner.ts` + `prompt.ts` | 用户目标 → registry merge → capability plan → resolver → low-risk action runner / skill intents / MCP requests / gate context；在 `resolveTools()` 前通过 OpenCode `MCP.Service.add()` 接入可自动连接 MCP |
@@ -183,6 +203,50 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 | **Session Gate Reconciler (NEW)** | `session-reconciler.ts` + `prompt.ts` | resumed/long session 中旧的 no-evidence gate block 会在发现 artifact/result evidence 后清理或重分类，避免历史状态导致无限卡住 |
 | **Artifact Result Backfill (NEW)** | `artifact-result-ledger.ts` + `evidence-normalizer.ts` | artifact report/screenshots/scripts 自动补写 Result Ledger，避免 live task 有报告但 `results.jsonl` 为空 |
 | **Task Artifact State TUI (NEW)** | `task-state.ts` + `capability-status.ts` + `sidebar/capability.tsx` | sidebar 显示由 artifact/result/supervisor 推导出的 task verified/partial/blocked 状态，抵消模型 Todo 过期问题 |
+
+### Phase 1.1 Goal Contract 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| Goal Contract 持久化 user goal | implemented_runtime_verified | `ensureGoalContract()` 在 commander prompt path 创建；已测试不覆盖原始目标 |
+| append/refine criteria/non-goals/constraints/verification | implemented_runtime_verified | `refineGoalContract()` 只追加/更新结构化字段，不替换 `user_goal` |
+| success criteria status 驱动 gate | implemented_runtime_verified | `pending` / `blocked` criteria 使 `assessGoalCompletion()` 返回 `CONTINUATION_REQUIRED` |
+| active plan tracking | implemented_runtime_verified | `updateGoalPlan()` + task-state + continuation gate 读取 active plan |
+| Final Gate 读取 Goal Contract | implemented_runtime_verified | `finalGate()` 写入 `goal_contract.evaluated` evidence，未满足 contract 时阻断 PASS |
+| Continuation Gate 读取 Goal Contract | implemented_runtime_verified | final report 文本无 unfinished marker 时，contract 中 pending plan 仍会生成 continuation packet |
+| non-blocking follow-up | implemented_runtime_verified | `non_blocking` plan/criteria 不阻断 verified complete |
+| required verification 缺失 | implemented_runtime_verified | `assessGoalCompletion()` 返回 `UNVERIFIED_PARTIAL`，不能 claim verified complete |
+| 自动 continuation dispatch | implemented_runtime_verified | Continuation packet 被转换为 dispatcher-ready action；commander action 作为 synthetic hint，chief-engineer/requirements-inspector action 会进入 reviewer subtask 队列 |
+| Goal Contract doctor check | implemented_runtime_verified | doctor 检查 schema/必需字段；warn/failed 语义不伪装 |
+
+### Phase 2 Completion / Continuation Gate 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| Final report 前 continuation check | implemented_runtime_verified | `prompt.ts` 在 evidence gate 前调用 `checkContinuationGate()` |
+| active plan 未完成阻断 PASS | implemented_runtime_verified | Goal Contract pending plan 生成 `PARTIAL_CONTINUED` packet |
+| required verification not_run 阻断 verified complete | implemented_runtime_verified | 有 Goal Contract required verification 且无真实验证证据时生成 continuation packet |
+| doctor failed 阻断 PASS | implemented_runtime_verified | `blocked_completion + block_reason` 进入 continuation assessment |
+| reviewer block 阻断 PASS | implemented_runtime_verified | reviewer block reason 进入 continuation packet 的 reviewer_blocks |
+| final report 状态表 false positive | implemented_runtime_verified | Markdown 状态表中的 PASS/PARTIAL/FAIL 不会单独触发 blocking unfinished |
+| non-blocking follow-up | implemented_runtime_verified | 有验证证据时 non-blocking plan/follow-up 不阻断完成 |
+| continuation packet dispatcher action | implemented_runtime_verified | `buildContinuationDispatchPlan()` 支持 commander、chief-engineer、requirements-inspector |
+| budget exhausted blocked report | implemented_runtime_verified | `buildBudgetExhaustedReport()` 输出 `BLOCKED_BUDGET_EXHAUSTED`，明确禁止 claim `VERIFIED_COMPLETE` |
+| full autonomous recovery loop | partial_runtime | Phase 3 已完成最小 runtime recovery policy；完整工具执行闭环仍依赖 commander/reviewer 后续执行与验证 |
+
+### Phase 3 Autonomous Recovery Loop 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| failure classifier | implemented_runtime_verified | `actionable-error.ts` 分类 typecheck/test/permission/gate/reviewer/dependency/path/config/provider normalization 等错误 |
+| failure fingerprint | implemented_runtime_verified | `buildFailureFingerprint()` 归一化路径和数字；`recovery-loop.ts` 用 fingerprint 追踪 repair budget |
+| recovery budget | implemented_runtime_verified | `repair_counts` 按 fingerprint 计数；超限输出 `BLOCKED_BUDGET_EXHAUSTED` |
+| automatic repair loop policy | implemented_runtime_verified | recoverable failure 注入 `dll-agent-recovery-loop` hint，要求 commander 继续修复并验证 |
+| verification loop guidance | implemented_runtime_verified | recovery decision 带 `verification` 列表，如 rerun typecheck/tests/provider smoke |
+| repeated failure escalation | implemented_runtime_verified | 同 fingerprint 第二次 -> chief-engineer，第三次 -> role-cross |
+| blocked with evidence | implemented_runtime_verified | permission/secrets/destructive/push/global/budget 阻断写 `recovery.blocked` evidence |
+| no-stop-on-normal-error policy | implemented_runtime_verified | 普通 typecheck/test/config/provider normalization 错误不要求用户介入 |
+| actual code patch execution | partial_runtime | Phase 3 负责 runtime policy 和 prompt/subtask dispatch；具体修复仍由 commander/reviewer tool loop 执行并受权限策略约束 |
 
 ### ⚠️ 只是配置层实现（需要环境变量）
 
