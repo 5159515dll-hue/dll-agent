@@ -1,18 +1,62 @@
 /**
  * dll-agent cross-review tests
  */
-import { describe, it, expect } from "bun:test"
+import fs from "fs"
+import os from "os"
+import path from "path"
+import { afterEach, describe, it, expect } from "bun:test"
 import {
   shouldConveneCouncil,
   composeCouncil,
   validateCouncilPacket,
   arbitrateConflict,
   checkReviewIndependence,
+  summarizeCouncilResultLedger,
   buildCouncilSummary,
 } from "../../src/dll-agent/cross-review"
 import { checkCrossReviewTrigger } from "../../src/dll-agent/cross-review-bridge"
+import { buildResultPacket, writeResult } from "../../src/dll-agent/result-ledger"
 import type { CouncilPacket, CouncilReviewResult, CouncilStatus } from "../../src/dll-agent/cross-review"
 import type { SupervisorState } from "../../src/dll-agent/interfaces"
+
+const cleanupSessions: string[] = []
+
+afterEach(() => {
+  for (const sessionID of cleanupSessions.splice(0)) {
+    fs.rmSync(path.join(os.homedir(), ".dll-agent", "sessions", sessionID), { recursive: true, force: true })
+  }
+})
+
+function emptyResultLedger() {
+  return summarizeCouncilResultLedger([])
+}
+
+function state(overrides: Partial<SupervisorState> = {}): SupervisorState {
+  return {
+    version: 1,
+    phase: "default",
+    risk: "medium",
+    required_reviews: [],
+    completed_reviews: [],
+    blocked_completion: false,
+    block_reason: null,
+    reviewer_conflict: false,
+    metrics: {
+      tool_failures: 0,
+      permission_denied: 0,
+      user_corrections: 0,
+      context_percent: 0,
+      context_tokens: 0,
+      final_claim: false,
+      verification_evidence: false,
+      reviewer_conflict_signal: false,
+      repeated_tool_failure: false,
+      real_tool_evidence: false,
+    },
+    updated_at: new Date().toISOString(),
+    ...overrides,
+  }
+}
 
 describe("cross-review", () => {
   describe("shouldConveneCouncil", () => {
@@ -107,33 +151,6 @@ describe("cross-review", () => {
   })
 
   describe("checkCrossReviewTrigger", () => {
-    function state(overrides: Partial<SupervisorState> = {}): SupervisorState {
-      return {
-        version: 1,
-        phase: "default",
-        risk: "medium",
-        required_reviews: [],
-        completed_reviews: [],
-        blocked_completion: false,
-        block_reason: null,
-        reviewer_conflict: false,
-        metrics: {
-          tool_failures: 0,
-          permission_denied: 0,
-          user_corrections: 0,
-          context_percent: 0,
-          context_tokens: 0,
-          final_claim: false,
-          verification_evidence: false,
-          reviewer_conflict_signal: false,
-          repeated_tool_failure: false,
-          real_tool_evidence: false,
-        },
-        updated_at: new Date().toISOString(),
-        ...overrides,
-      }
-    }
-
     it("does not reconvene role-cross after role-cross completed a reviewer conflict", () => {
       const result = checkCrossReviewTrigger({
         state: state({ completed_reviews: ["role-cross"], reviewer_conflict: true }),
@@ -184,6 +201,7 @@ describe("cross-review", () => {
         filesChanged: [],
         commandsRun: [],
         verificationResults: [],
+        resultLedger: emptyResultLedger(),
         failures: [{ type: "test", fingerprint: "fp1", attempts: 2 }],
         recoveryAttempts: 1,
         reviewerHistory: [],
@@ -217,6 +235,7 @@ describe("cross-review", () => {
         filesChanged: [],
         commandsRun: [],
         verificationResults: [],
+        resultLedger: emptyResultLedger(),
         failures: [{ type: "test", fingerprint: "fp1", attempts: 2 }],
         recoveryAttempts: 1,
         reviewerHistory: [],
@@ -234,6 +253,77 @@ describe("cross-review", () => {
       const result = validateCouncilPacket(packet)
       expect(result.valid).toBe(true)
       expect(result.missingFields).toEqual([])
+    })
+
+    it("summarizes Result Ledger into council packet evidence", () => {
+      const snapshot = summarizeCouncilResultLedger([
+        buildResultPacket({
+          sessionID: "snapshot",
+          executing_role: "commander",
+          model: "deepseek/deepseek-v4-pro",
+          user_goal: "Fix routing",
+          subtask_goal: "Fix routing",
+          claimed_result: "Done",
+          completion_status: "VERIFIED_COMPLETE",
+          files_changed: [{ filePath: "src/routing.ts", changeSummary: "patched" }],
+          verification_results: [{ name: "typecheck", status: "passed", evidenceRef: "cmd:typecheck" }],
+          evidence_refs: ["cmd:typecheck"],
+        }),
+        buildResultPacket({
+          sessionID: "snapshot",
+          executing_role: "chief-engineer",
+          model: "deepseek/deepseek-v4-pro",
+          user_goal: "Fix routing",
+          subtask_goal: "Investigate remaining failure",
+          claimed_result: "Partial",
+          completion_status: "PARTIAL",
+          unresolved_items: ["rerun doctor"],
+          evidence_refs: ["review:chief"],
+        }),
+      ])
+
+      expect(snapshot.verifiedResults[0]?.packetId).toBeTruthy()
+      expect(snapshot.partialResults[0]?.unresolvedItems).toContain("rerun doctor")
+      expect(snapshot.reusablePacketIds.length).toBe(1)
+      expect(snapshot.evidenceRefs).toContain("cmd:typecheck")
+      expect(snapshot.summary).toContain("verified=1")
+    })
+  })
+
+  describe("cross-review bridge result-ledger integration", () => {
+    it("includes Result Ledger snapshot and evidence refs in council packet", () => {
+      const sid = `ses_cross_review_ledger_${Date.now()}_${Math.random().toString(16).slice(2)}`
+      cleanupSessions.push(sid)
+      writeResult(sid, buildResultPacket({
+        sessionID: sid,
+        executing_role: "commander",
+        model: "deepseek/deepseek-v4-pro",
+        user_goal: "Fix repeated provider routing failure",
+        subtask_goal: "Fix repeated provider routing failure",
+        claimed_result: "Provider routing partially verified",
+        completion_status: "VERIFIED_COMPLETE",
+        files_changed: [{ filePath: "packages/opencode/src/session/llm.ts", changeSummary: "normalize provider options" }],
+        verification_results: [{ name: "typecheck", status: "passed", evidenceRef: "cmd:typecheck" }],
+        evidence_refs: ["cmd:typecheck"],
+      }))
+
+      const result = checkCrossReviewTrigger({
+        state: state({ metrics: { ...state().metrics, repeated_tool_failure: true, tool_failures: 3 } }),
+        repeatedFailureCount: 3,
+        reviewerConflict: false,
+        isHighRiskCompletion: false,
+        hasInsufficientEvidence: false,
+        userCorrectionCount: 0,
+        scopeExpanded: false,
+        recoveryAttempts: 2,
+        sessionId: sid,
+        userGoal: "Fix repeated provider routing failure",
+      })
+
+      expect(result.shouldConvene).toBe(true)
+      expect(result.packet?.resultLedger.verifiedResults.length).toBe(1)
+      expect(result.packet?.evidenceRefs).toContain("cmd:typecheck")
+      expect(result.packetValid).toBe(true)
     })
   })
 

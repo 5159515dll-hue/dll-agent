@@ -13,6 +13,7 @@
 import {
   shouldConveneCouncil,
   composeCouncil,
+  summarizeCouncilResultLedger,
   validateCouncilPacket,
   type CouncilPacket,
   type CouncilTriggerReason,
@@ -20,6 +21,7 @@ import {
 } from "./cross-review"
 import type { ReviewerRole, SupervisorState } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
+import { loadResults } from "./result-ledger"
 
 export interface CrossReviewBridgeResult {
   /** Whether a council should be convened */
@@ -132,7 +134,10 @@ export function checkCrossReviewTrigger(params: {
     }
   }
 
-  // Build minimal council packet for dispatch
+  const resultLedger = loadCouncilResults(params.sessionId)
+
+  // Build minimal council packet for dispatch. The Result Ledger snapshot is
+  // included so all council reviewers reason from the same already-known work.
   const packet: CouncilPacket = {
     id: `council_${Date.now()}`,
     sessionId: params.sessionId ?? "",
@@ -143,9 +148,10 @@ export function checkCrossReviewTrigger(params: {
     scope: [],
     nonGoals: [],
     constraints: [],
-    filesChanged: params.filesChanged ?? [],
+    filesChanged: [...new Set([...(params.filesChanged ?? []), ...resultLedger.filesChanged])].slice(0, 20),
     commandsRun: [],
     verificationResults: [],
+    resultLedger,
     failures: [{
       type: "repeated_failure",
       fingerprint: `council_${Date.now()}`,
@@ -157,8 +163,11 @@ export function checkCrossReviewTrigger(params: {
       verdict: "pending" as const,
       completed: params.state.completed_reviews.includes(r),
     })),
-    unresolvedBlockers: params.state.block_reason ? [params.state.block_reason] : [],
-    evidenceRefs: [],
+    unresolvedBlockers: [...new Set([
+      ...(params.state.block_reason ? [params.state.block_reason] : []),
+      ...resultLedger.unresolvedItems,
+    ])],
+    evidenceRefs: resultLedger.evidenceRefs,
     riskNotes: [],
     costState: { totalUsd: 0, capUsd: 5, exceeded: false },
     allowedActions: [],
@@ -175,6 +184,7 @@ export function checkCrossReviewTrigger(params: {
     reviewers,
     packetId: packet.id,
     packetValid: validation.valid,
+    result_ledger: resultLedger,
   })
 
   return {
@@ -184,5 +194,13 @@ export function checkCrossReviewTrigger(params: {
     packet,
     packetValid: validation.valid,
     packetMissingFields: validation.missingFields,
+  }
+}
+
+function loadCouncilResults(sessionId?: string) {
+  try {
+    return summarizeCouncilResultLedger(sessionId ? loadResults(sessionId) : [])
+  } catch {
+    return summarizeCouncilResultLedger([])
   }
 }

@@ -81,7 +81,7 @@ Every completed subtask produces a `ResultPacket`:
 | Feature | Notes |
 |---------|-------|
 | Cross-session baseline comparison | Kimi cannot yet compare results across sessions |
-| Council result integration | Cross-review council does not yet consume result ledger |
+| Council result integration | Cross-review council packet consumes session Result Ledger snapshot; arbitration still does not do cross-session result comparison |
 
 ## Deduplication Gate Rules
 
