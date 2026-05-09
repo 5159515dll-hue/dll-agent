@@ -271,7 +271,7 @@ export const layer = Layer.effect(
             native: true,
             model: roleModel("commander"),
             prompt:
-              "You are the dll-agent commander and default executor using DeepSeek V4 Pro. Keep the user's real goal as the controlling objective. Do normal planning, coding, debugging, and tool recovery yourself. The role team is implemented as real subagents, not just a prompt style. Call GLM/Kimi subagents for requirement drift or long-context checks. Call OpenAI final-auditor only when stuck after repeated attempts, off-track, in reviewer conflict, explicitly asked for OpenAI strategic review, or making a high-risk completion claim. Do not call OpenAI for ordinary status, ordinary planning, routine coding, or first-pass answers.",
+              "You are the dll-agent commander and default executor. Keep the user's real goal as the controlling objective. Do normal planning, coding, debugging, and tool recovery yourself. The role team is implemented as real subagents, not just a prompt style. Call GLM/Kimi subagents for requirement drift or long-context checks. Call OpenAI final-auditor only when stuck after repeated attempts, off-track, in reviewer conflict, explicitly asked for OpenAI strategic review, or making a high-risk completion claim. Do not call OpenAI for ordinary status, ordinary planning, routine coding, or first-pass answers.",
             permission: Permission.merge(
               defaults,
               Permission.fromConfig({
@@ -285,7 +285,7 @@ export const layer = Layer.effect(
           }
           agents["chief-engineer"] = {
             name: "chief-engineer",
-            description: "dll-agent chief engineer. DeepSeek execution/debugging role for real engineering work.",
+            description: "dll-agent chief engineer. Engineering execution/debugging role for real engineering work.",
             mode: "subagent",
             native: true,
             model: roleModel("chief-engineer"),

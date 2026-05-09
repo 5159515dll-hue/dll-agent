@@ -36,6 +36,7 @@ import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { enabled as profileEnabled, autoAllowAll as profileAutoAllow, quality as profileQuality, verify as profileVerify, roleRoster as profileRoleRoster, roleCommands as profileRoleCommands, systemPrompt as profileSystemPrompt, writeEvidence as profileWriteEvidence } from "@/dll-agent/profile"
+import { resolveMainModel } from "@/dll-agent/role-model-registry"
 import { decide as supervisorDecide, updateState as supervisorUpdateState, loadState as supervisorLoadState, saveState as supervisorSaveState, isCooldown as supervisorIsCooldown, recordReviewerCall, generateSubtasks, buildVerifierSubtask, buildTaskCompletionSubtask, markReviewerCompleted, setQueuedReviewers, setRunningReviewers, isReadOnlyReviewer, reviewerRuntimeMs as getReviewerRuntimeMs, modelContextLimit } from "@/dll-agent/supervisor"
 import { checkEvidenceGate, checkReconciliationGate, isGateRetryExhausted, buildGateBlockSummary } from "@/dll-agent/gates"
 import { checkCap as checkCostCap, trackLastCall } from "@/dll-agent/cost-cap"
@@ -785,7 +786,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
               throw error
             }
-            const model = input.model ?? agent.model ?? (yield* lastModel(input.sessionID))
+            let model = input.model ?? agent.model ?? (yield* lastModel(input.sessionID))
+            // When dll-agent is enabled, the role-model registry is the single source of truth
+            if (profileEnabled()) {
+              const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
+              model = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+            }
             const userMsg: MessageV2.User = {
               id: input.messageID ?? MessageID.ascending(),
               sessionID: input.sessionID,
@@ -946,6 +952,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const lastModel = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
+      // When dll-agent is enabled, commander role-model is the single source of truth
+      if (profileEnabled()) {
+        const ctx = yield* InstanceState.context
+        const cmdr = resolveMainModel(sessionID, ctx.worktree)
+        return { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+      }
       return yield* provider.defaultModel()
     })
 
@@ -960,7 +972,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         throw error
       }
 
-      const model = input.model ?? ag.model ?? (yield* lastModel(input.sessionID))
+      let model = input.model ?? ag.model ?? (yield* lastModel(input.sessionID))
+      // When dll-agent is enabled, the role-model registry is the single source of truth
+      // for model selection — the commander's model overrides all automatic paths
+      if (profileEnabled()) {
+        const ctx = yield* InstanceState.context
+        const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
+        model = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+      }
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
         !input.variant && ag.variant && same
@@ -2515,8 +2534,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         if (input.model) return Provider.parseModel(input.model)
         return yield* lastModel(input.sessionID)
       })
+      // When dll-agent is enabled, the role-model registry is the single source of truth
+      let resolvedModel = taskModel
+      if (profileEnabled()) {
+        const ctx = yield* InstanceState.context
+        const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
+        resolvedModel = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+      }
 
-      yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
+      yield* getModel(resolvedModel.providerID, resolvedModel.modelID, input.sessionID)
 
       const agent = yield* agents.get(agentName)
       if (!agent) {

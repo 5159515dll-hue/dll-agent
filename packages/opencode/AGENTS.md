@@ -70,7 +70,7 @@ evaluate every sibling, which defeats tree-shaking and slows module load.
 
 Use these rules when writing or migrating Effect code.
 
-See `specs/effect/migration.md` for the compact pattern reference and examples.
+See below for the compact pattern reference and examples.
 
 ## Core
 

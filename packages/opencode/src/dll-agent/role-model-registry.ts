@@ -653,6 +653,24 @@ export function resolveAvailableModel(
   return { model: effective.primary, usedFallback: false }
 }
 
+// ─── Main model resolution ──────────────────────────────────────────────────
+
+/**
+ * Resolve the main conversation model from the dll-agent commander role.
+ *
+ * dll-agent's role-model-registry is the single source of truth for all role
+ * model assignments, including the commander (main conversation model).
+ * All session/prompt model lookups delegate here when dll-agent is enabled
+ * — there is no fallback to any external provider system's defaultModel().
+ */
+export function resolveMainModel(
+  sessionID?: string,
+  projectDir?: string,
+): { providerID: string; modelID: string } {
+  const effective = resolveRoleModel("commander", sessionID, projectDir)
+  return effective.parsed
+}
+
 // ─── Doctor helpers ─────────────────────────────────────────────────────────
 
 export interface RoleModelDoctorIssue {
