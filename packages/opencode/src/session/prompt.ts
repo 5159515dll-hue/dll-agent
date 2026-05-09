@@ -68,6 +68,7 @@ import { runCapabilityActions } from "@/dll-agent/capability-action-runner"
 import { reconcileSessionState } from "@/dll-agent/session-reconciler"
 import { ensureGoalContract } from "@/dll-agent/goal-contract"
 import { extractLatestFailure, planRecovery, buildRecoveryHint, buildBlockedRecoveryReport, writeRecoveryDecision } from "@/dll-agent/recovery-loop"
+import { renderTaskStatus } from "@/dll-agent/task-observability"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -1558,6 +1559,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       )
     })
 
+    const handleLocalDllStatusCommand = Effect.fn("SessionPrompt.handleLocalDllStatusCommand")(function* (
+      input: CommandInput,
+    ) {
+      if (input.command !== "task-status") return undefined
+      const ctx = yield* InstanceState.context
+      return yield* roleModelCommandResponse(
+        input,
+        renderTaskStatus({
+          sessionID: input.sessionID,
+          projectDir: ctx.worktree,
+        }),
+      )
+    })
+
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -2729,6 +2744,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       yield* elog.info("command", { sessionID: input.sessionID, command: input.command, agent: input.agent })
       if (profileEnabled() && (input.command === "role-models" || input.command === "role-model-set")) {
         const local = yield* handleLocalRoleModelCommand(input)
+        if (local) return local
+      }
+      if (profileEnabled() && input.command === "task-status") {
+        const local = yield* handleLocalDllStatusCommand(input)
         if (local) return local
       }
       const cmd = yield* commands.get(input.command)

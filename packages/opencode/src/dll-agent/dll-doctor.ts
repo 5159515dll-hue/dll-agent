@@ -25,6 +25,7 @@ import { evaluateCompletionReadiness } from "./completion-readiness"
 import { doctorCheck as roleModelDoctorCheck } from "./role-model-registry"
 import { doctorCheckRoleToolPolicy } from "./role-tool-policy"
 import { doctorCheckGoalContracts } from "./goal-contract"
+import { buildTaskObservabilityReport } from "./task-observability"
 import type { RiskLevel } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
 import { execSync } from "child_process"
@@ -184,7 +185,7 @@ function checkEvidenceHealth(): DoctorCheck[] {
       name: "evidence-session-count",
       severity: "WARN",
       message: `${stats.sessionCount} session directories (max 100) — nearing limit`,
-      nextAction: "Run evidence rotation to clean old sessions",
+      nextAction: "Run: dll-agent doctor --repair-safe",
       evidence: `${stats.sessionsDir} (${stats.totalEvidenceFiles} files, ${(stats.totalSizeBytes / 1024).toFixed(1)} KB)`,
     })
   } else {
@@ -212,7 +213,7 @@ function checkEvidenceHealth(): DoctorCheck[] {
       name: "evidence-rotation-needed",
       severity: "WARN",
       message: "Evidence rotation recommended (session count or file count high)",
-      nextAction: "Run: evidence rotation script or dll-agent doctor --rotate",
+      nextAction: "Run: dll-agent doctor --repair-safe",
       evidence: null,
     })
   }
@@ -880,6 +881,33 @@ function checkCapabilityHealth(projectRoot?: string): DoctorCheck[] {
   return checks
 }
 
+function checkObservabilityHealth(projectRoot: string): DoctorCheck[] {
+  const checks: DoctorCheck[] = []
+  try {
+    const report = buildTaskObservabilityReport({
+      sessionID: "doctor-observability-smoke",
+      projectDir: projectRoot,
+      maxEvents: 2,
+    })
+    checks.push({
+      name: "task-observability",
+      severity: "PASS",
+      message: `Task status/trajectory renderer is available (evidence sessions=${report.cleanup.evidence_sessions})`,
+      nextAction: report.cleanup.repair_safe_recommended ? report.cleanup.recommendation : null,
+      evidence: `routing_decisions=${report.routing.decisions}, evidence_events=${report.evidence.total}`,
+    })
+  } catch (error) {
+    checks.push({
+      name: "task-observability",
+      severity: "FAIL",
+      message: "Task status/trajectory renderer failed",
+      nextAction: "Inspect task-observability.ts and /task-status command wiring",
+      evidence: String(error),
+    })
+  }
+  return checks
+}
+
 // ─── Role Model Health Check ─────────────────────────────────────────────────
 
 function checkRoleModelHealth(projectRoot: string): DoctorCheck[] {
@@ -951,6 +979,9 @@ export function runDoctor(projectRoot?: string): DoctorReport {
 
   // Capability system checks
   allChecks.push(...checkCapabilityHealth(root))
+
+  // UX / observability checks
+  allChecks.push(...checkObservabilityHealth(root))
 
   const passCount = allChecks.filter((c) => c.severity === "PASS").length
   const warnCount = allChecks.filter((c) => c.severity === "WARN").length
