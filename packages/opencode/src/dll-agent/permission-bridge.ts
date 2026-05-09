@@ -67,6 +67,21 @@ export function permissionPreCheck(params: {
     cwd: params.cwd,
   })
 
+  if (
+    roleDecision.action === "allow" &&
+    classification.risk === "medium" &&
+    isProjectWritePermission(params.permission) &&
+    !classification.secretRisk &&
+    !classification.destructive &&
+    !classification.outOfProject
+  ) {
+    return {
+      intercepted: true,
+      action: "allow",
+      reason: `role=${role ?? "unknown"} writable project file operation: ${classification.reason}`,
+    }
+  }
+
   const action = permissionActionForRisk(classification.risk, params.alreadyConfirmed ?? false)
 
   if (action === "allow") {
@@ -90,4 +105,8 @@ export function permissionPreCheck(params: {
     action: "ask",
     reason: `risk=${classification.risk}: ${classification.reason} — requires user confirmation`,
   }
+}
+
+function isProjectWritePermission(permission: string) {
+  return permission === "file_write" || permission === "write" || permission === "edit"
 }

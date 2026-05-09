@@ -59,6 +59,41 @@ describe("role-tool-policy", () => {
     }
   })
 
+  it("blocks reviewer and final-auditor write attempts at role policy level", () => {
+    const reviewer = classifyRoleToolRequest({
+      role: "requirements-inspector",
+      permission: "edit",
+      patterns: ["/project/src/app.ts"],
+      writeEvidence: false,
+    })
+    const finalAuditor = classifyRoleToolRequest({
+      role: "final-auditor",
+      permission: "write",
+      patterns: ["/project/src/app.ts"],
+      writeEvidence: false,
+    })
+    expect(reviewer.action).toBe("deny")
+    expect(finalAuditor.action).toBe("deny")
+  })
+
+  it("allows commander ordinary project writes but asks for high-risk commands", () => {
+    const write = classifyRoleToolRequest({
+      role: "commander",
+      permission: "file_write",
+      patterns: ["/project/src/app.ts"],
+      projectRoot: "/project",
+      writeEvidence: false,
+    })
+    const highRisk = classifyRoleToolRequest({
+      role: "commander",
+      permission: "bash",
+      patterns: ["git push origin dev"],
+      writeEvidence: false,
+    })
+    expect(write.action).toBe("allow")
+    expect(highRisk.action).toBe("ask")
+  })
+
   it("requires confirmation for high-risk tools and writes routing evidence", () => {
     const evidenceFile = path.join(os.tmpdir(), `dll-agent-role-tool-policy-${Date.now()}.jsonl`)
     process.env.DLL_AGENT_EVIDENCE_FILE = evidenceFile

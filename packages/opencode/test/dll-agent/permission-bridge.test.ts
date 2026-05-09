@@ -2,12 +2,14 @@
  * dll-agent permission-bridge tests
  */
 import { afterEach, describe, it, expect } from "bun:test"
+import fs from "fs"
 import { permissionPreCheck } from "../../src/dll-agent/permission-bridge"
 
 describe("permission-bridge", () => {
   afterEach(() => {
     delete process.env.DLL_AGENT_ENABLED
     delete process.env.DLL_AGENT_AUTO_ALLOW
+    delete process.env.DLL_AGENT_EVIDENCE_FILE
   })
 
   it("intercepts low-risk shell typecheck as allow", () => {
@@ -34,12 +36,72 @@ describe("permission-bridge", () => {
 
   it("classifies rm -rf (high risk) as ask", () => {
     process.env.DLL_AGENT_ENABLED = "1"
+    process.env.DLL_AGENT_AUTO_ALLOW = "1"
     const result = permissionPreCheck({
       permission: "shell",
       patterns: ["rm", "-rf", "/tmp/test"],
     })
     expect(result.intercepted).toBe(true)
     expect(result.action).toBe("ask")
+  })
+
+  it("DLL_AGENT_AUTO_ALLOW does not bypass git push, sudo, or secret access", () => {
+    process.env.DLL_AGENT_ENABLED = "1"
+    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    const gitPush = permissionPreCheck({
+      permission: "shell",
+      patterns: ["git", "push", "origin", "dev"],
+    })
+    const sudo = permissionPreCheck({
+      permission: "shell",
+      patterns: ["sudo", "systemctl", "restart", "nginx"],
+    })
+    const secret = permissionPreCheck({
+      permission: "file_read",
+      patterns: ["/project/.env"],
+      projectRoot: "/project",
+    })
+    expect(gitPush.action).toBe("ask")
+    expect(sudo.action).toBe("ask")
+    expect(secret.action).toBe("ask")
+  })
+
+  it("allows commander project-local file writes without allowing high-risk shell commands", () => {
+    process.env.DLL_AGENT_ENABLED = "1"
+    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    const write = permissionPreCheck({
+      permission: "file_write",
+      patterns: ["/project/src/app.ts"],
+      projectRoot: "/project",
+      metadata: { dllAgentRole: "commander" },
+    })
+    const unknownShell = permissionPreCheck({
+      permission: "shell",
+      patterns: ["custom-dangerous-tool", "--mutate"],
+      projectRoot: "/project",
+      metadata: { dllAgentRole: "commander" },
+    })
+    expect(write.intercepted).toBe(true)
+    expect(write.action).toBe("allow")
+    expect(unknownShell.action).toBe("ask")
+  })
+
+  it("records role-tool policy evidence for permission decisions", () => {
+    const evidenceFile = `/tmp/dll-agent-permission-bridge-${Date.now()}.jsonl`
+    process.env.DLL_AGENT_ENABLED = "1"
+    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    process.env.DLL_AGENT_EVIDENCE_FILE = evidenceFile
+    permissionPreCheck({
+      permission: "file_write",
+      patterns: ["/project/src/app.ts"],
+      projectRoot: "/project",
+      metadata: { dllAgentRole: "commander" },
+      sessionID: "permission-bridge-evidence",
+    })
+    const evidence = fs.readFileSync(evidenceFile, "utf8")
+    expect(evidence).toContain("role_tool_policy.decision")
+    expect(evidence).toContain("commander")
+    fs.rmSync(evidenceFile, { force: true })
   })
 
   it("classifies .env read (high secret risk) as ask", () => {
@@ -62,6 +124,19 @@ describe("permission-bridge", () => {
     expect(result.intercepted).toBe(true)
     expect(result.action).toBe("deny")
     expect(result.reason).toContain("role-cross")
+  })
+
+  it("denies final-auditor write tools", () => {
+    process.env.DLL_AGENT_ENABLED = "1"
+    process.env.DLL_AGENT_AUTO_ALLOW = "1"
+    const result = permissionPreCheck({
+      permission: "edit",
+      patterns: ["/project/src/app.ts"],
+      metadata: { dllAgentRole: "final-auditor" },
+    })
+    expect(result.intercepted).toBe(true)
+    expect(result.action).toBe("deny")
+    expect(result.reason).toContain("final-auditor")
   })
 
   it("handles unknown permission types gracefully", () => {
