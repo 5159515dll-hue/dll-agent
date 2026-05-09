@@ -17,6 +17,7 @@
 import fs from "fs"
 import path from "path"
 import os from "os"
+import crypto from "crypto"
 import { write as writeEvidence, redact } from "./evidence"
 import type { SupervisorState, ReviewerRole, RiskLevel } from "./interfaces"
 
@@ -35,6 +36,8 @@ export interface ResultFileChange {
   filePath: string
   changeSummary: string
   hashAfter?: string
+  mtimeMsAfter?: number
+  sizeAfter?: number
 }
 
 export interface ResultArtifact {
@@ -93,6 +96,20 @@ export interface ResultPacket {
   invalidation_reason?: string
   /** If result was reused, reference to the original packet_id */
   reused_from?: string
+  /** Context handoff packet used to produce this reviewer result */
+  context_packet_id?: string | null
+  /** True when a reviewer result was recorded without a context handoff packet */
+  missing_context_packet?: boolean
+  /** Runtime role-run envelope used to isolate same-model multi-role decisions */
+  role_run_id?: string | null
+  role_instance_id?: string | null
+  action_fingerprint?: string | null
+  /** Reviewer output normalization metadata */
+  structured_output_missing?: boolean
+  confidence?: "low" | "medium" | "high"
+  raw_summary_ref?: string | null
+  redacted_summary?: string | null
+  source_kind?: "structured_reviewer_output" | "fallback_reviewer_output" | "dedup_reuse"
   /** Redaction status — always "redacted" after write */
   redaction_status: "redacted"
 }
@@ -122,6 +139,14 @@ export function writeResult(sessionID: string, packet: ResultPacket) {
       completion_status: packet.completion_status,
       files_changed: packet.files_changed.length,
       artifacts: packet.artifacts_produced.length,
+      context_packet_id: packet.context_packet_id ?? null,
+      missing_context_packet: packet.missing_context_packet ?? false,
+      role_run_id: packet.role_run_id ?? null,
+      action_fingerprint: packet.action_fingerprint ?? null,
+      structured_output_missing: packet.structured_output_missing ?? false,
+      confidence: packet.confidence ?? null,
+      source_kind: packet.source_kind ?? null,
+      raw_summary_ref: packet.raw_summary_ref ?? null,
     }, sessionID)
   } catch {
     // Result ledger is diagnostic and must not block the session
@@ -265,6 +290,28 @@ export function computeResultHash(packet: Omit<ResultPacket, "result_hash" | "pa
   return `res_${Math.abs(hash).toString(16).slice(0, 8)}`
 }
 
+export function snapshotFileChange(file: ResultFileChange, projectDir?: string): ResultFileChange {
+  if (file.hashAfter && typeof file.mtimeMsAfter === "number" && typeof file.sizeAfter === "number") return file
+  const fullPath = path.isAbsolute(file.filePath) ? file.filePath : path.join(projectDir ?? process.cwd(), file.filePath)
+  try {
+    if (!fs.existsSync(fullPath)) return file
+    const stat = fs.statSync(fullPath)
+    const hashAfter = file.hashAfter ?? crypto.createHash("sha256").update(fs.readFileSync(fullPath)).digest("hex")
+    return {
+      ...file,
+      hashAfter,
+      mtimeMsAfter: file.mtimeMsAfter ?? stat.mtimeMs,
+      sizeAfter: file.sizeAfter ?? stat.size,
+    }
+  } catch {
+    return file
+  }
+}
+
+export function snapshotFileChanges(files: ResultFileChange[], projectDir?: string) {
+  return files.map((file) => snapshotFileChange(file, projectDir))
+}
+
 /**
  * Build a summary of all completed results for injection into reviewer context.
  * Returns a condensed text block suitable for buildReviewerContext().
@@ -321,7 +368,20 @@ export function buildResultPacket(params: {
   unresolved_items?: string[]
   known_risks?: string[]
   result_hash?: string
+  reused_from?: string
+  context_packet_id?: string | null
+  missing_context_packet?: boolean
+  role_run_id?: string | null
+  role_instance_id?: string | null
+  action_fingerprint?: string | null
+  structured_output_missing?: boolean
+  confidence?: "low" | "medium" | "high"
+  raw_summary_ref?: string | null
+  redacted_summary?: string | null
+  source_kind?: "structured_reviewer_output" | "fallback_reviewer_output" | "dedup_reuse"
+  projectDir?: string
 }): ResultPacket {
+  const filesChanged = snapshotFileChanges(params.files_changed ?? [], params.projectDir)
   const packet: ResultPacket = {
     packet_type: "result_packet",
     packet_id: `res_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
@@ -331,13 +391,23 @@ export function buildResultPacket(params: {
     subtask_goal: params.subtask_goal.slice(0, 500),
     claimed_result: params.claimed_result.slice(0, 500),
     completion_status: params.completion_status,
-    files_changed: params.files_changed ?? [],
+    files_changed: filesChanged,
     artifacts_produced: params.artifacts_produced ?? [],
     commands_run: params.commands_run ?? [],
     verification_results: params.verification_results ?? [],
     evidence_refs: params.evidence_refs ?? [],
     unresolved_items: params.unresolved_items ?? [],
     known_risks: params.known_risks ?? [],
+    context_packet_id: params.context_packet_id,
+    missing_context_packet: params.missing_context_packet,
+    role_run_id: params.role_run_id,
+    role_instance_id: params.role_instance_id,
+    action_fingerprint: params.action_fingerprint,
+    structured_output_missing: params.structured_output_missing,
+    confidence: params.confidence,
+    raw_summary_ref: params.raw_summary_ref,
+    redacted_summary: params.redacted_summary,
+    source_kind: params.source_kind,
     reusable: params.completion_status === "VERIFIED_COMPLETE",
     stale: false,
     result_hash: params.result_hash ?? computeResultHash({
@@ -348,18 +418,29 @@ export function buildResultPacket(params: {
       subtask_goal: params.subtask_goal,
       claimed_result: params.claimed_result,
       completion_status: params.completion_status,
-      files_changed: params.files_changed ?? [],
+      files_changed: filesChanged,
       artifacts_produced: params.artifacts_produced ?? [],
       commands_run: params.commands_run ?? [],
       verification_results: params.verification_results ?? [],
       evidence_refs: params.evidence_refs ?? [],
       unresolved_items: params.unresolved_items ?? [],
       known_risks: params.known_risks ?? [],
+      context_packet_id: params.context_packet_id,
+      missing_context_packet: params.missing_context_packet,
+      role_run_id: params.role_run_id,
+      role_instance_id: params.role_instance_id,
+      action_fingerprint: params.action_fingerprint,
+      structured_output_missing: params.structured_output_missing,
+      confidence: params.confidence,
+      raw_summary_ref: params.raw_summary_ref,
+      redacted_summary: params.redacted_summary,
+      source_kind: params.source_kind,
       reusable: params.completion_status === "VERIFIED_COMPLETE",
       stale: false,
       redaction_status: "redacted",
     }),
     created_at: new Date().toISOString(),
+    reused_from: params.reused_from,
     redaction_status: "redacted",
   }
   return packet

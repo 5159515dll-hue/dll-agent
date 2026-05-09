@@ -24,10 +24,20 @@ import path from "path"
 import os from "os"
 import type { CapabilityEntry, CapabilityStatus, Platform } from "./capability-schema"
 import { validateCapabilityEntry, type SchemaValidationResult } from "./capability-schema"
+import { write as writeEvidence } from "./evidence"
 
 // ─── Registry Types ────────────────────────────────────────────────────────────
 
-export type RegistryLayer = "builtin" | "global" | "discovered" | "project"
+export type RegistryLayer = "builtin" | "global" | "discovered" | "project" | "session"
+export type EffectiveCapabilityStatus =
+  | "registered"
+  | "active"
+  | "running"
+  | "unavailable"
+  | "blocked"
+  | "requires_key"
+  | "requires_install"
+  | "on_demand"
 
 export interface RegistrySnapshot {
   /** 合并后的全量条目 */
@@ -49,14 +59,31 @@ export interface RegistryMergeResult {
   entries: CapabilityEntry[]
   /** 各层条目数 */
   layer_counts: Record<RegistryLayer, number>
+  /** 每个条目的最终来源层 */
+  layer: Record<string, RegistryLayer>
   /** 被覆盖的条目 ID */
   overridden: string[]
   /** 被移除的条目 ID */
   removed: string[]
+  /** 安全策略保护、不能被 manifest remove 的条目 */
+  protected_removals?: string[]
   /** 被去重的条目 ID */
   deduplicated: string[]
   /** 时间戳 */
   timestamp: string
+}
+
+export interface EffectiveCapabilityManifest {
+  version: 1
+  entries: CapabilityEntry[]
+  layer: Record<string, RegistryLayer>
+  effective_status: Record<string, EffectiveCapabilityStatus>
+  by_kind: Record<string, number>
+  by_status: Record<EffectiveCapabilityStatus, number>
+  layer_counts: Record<RegistryLayer, number>
+  removed: string[]
+  protected_removals: string[]
+  merged_at: string
 }
 
 export interface RegistryFilter {
@@ -87,6 +114,10 @@ function discoveredRegistryPath(): string {
 
 function projectRegistryPath(projectDir: string): string {
   return path.join(projectDir, ".dll-agent", "capabilities.json")
+}
+
+function sessionRegistryPath(sessionID: string): string {
+  return path.join(DLL_DIR, "sessions", sessionID, "capabilities.json")
 }
 
 function ensureDir(dir: string) {
@@ -154,6 +185,26 @@ export function saveProjectRegistry(projectDir: string, entries: CapabilityEntry
   })
 }
 
+export function loadSessionRegistry(sessionID: string): CapabilityEntry[] {
+  const data = readJsonFile<{ entries?: CapabilityEntry[]; removed?: string[] }>(
+    sessionRegistryPath(sessionID),
+    {},
+  )
+  return Array.isArray(data.entries) ? data.entries : []
+}
+
+export function saveSessionRegistry(sessionID: string, entries: CapabilityEntry[]) {
+  writeJsonFile(sessionRegistryPath(sessionID), {
+    entries,
+    updated_at: new Date().toISOString(),
+  })
+}
+
+export function loadSessionRemovals(sessionID: string): string[] {
+  const data = readJsonFile<{ removed?: string[] }>(sessionRegistryPath(sessionID), {})
+  return Array.isArray(data.removed) ? data.removed : []
+}
+
 // ─── Merge Logic ────────────────────────────────────────────────────────────────
 
 /**
@@ -171,16 +222,20 @@ export function mergeLayers(
   discovered: CapabilityEntry[],
   project: CapabilityEntry[],
   projectRemovals?: string[],
+  session: CapabilityEntry[] = [],
+  sessionRemovals?: string[],
 ): RegistryMergeResult {
   const map = new Map<string, { entry: CapabilityEntry; layer: RegistryLayer }>()
   const overridden: string[] = []
-  const removed = new Set(projectRemovals ?? [])
+  const removals = new Set([...(projectRemovals ?? []), ...(sessionRemovals ?? [])])
+  const protectedIds = new Set(["security-redaction", "test-gate"])
+  const protectedRemovals = [...removals].filter((id) => protectedIds.has(id))
+  const removed = new Set([...removals].filter((id) => !protectedIds.has(id)))
   const deduplicated: string[] = []
 
   function insert(entries: CapabilityEntry[], layer: RegistryLayer) {
     for (const entry of entries) {
-      if (removed.has(entry.id)) {
-        removed.delete(entry.id)
+      if (removed.has(entry.id) && layer !== "project" && layer !== "session") {
         continue
       }
       const existing = map.get(entry.id)
@@ -191,6 +246,7 @@ export function mergeLayers(
           global: 1,
           discovered: 2,
           project: 3,
+          session: 4,
         }
         if (layerOrder[layer] > layerOrder[existing.layer]) {
           map.set(entry.id, { entry, layer })
@@ -206,20 +262,24 @@ export function mergeLayers(
   insert(global, "global")
   insert(discovered, "discovered")
   insert(project, "project")
+  insert(session, "session")
 
   const entries = Array.from(map.values()).map((v) => ({
     ...v.entry,
     // Enrich with layer metadata (not persisted)
   }))
 
-  const layer_counts: Record<RegistryLayer, number> = { builtin: 0, global: 0, discovered: 0, project: 0 }
+  const layer_counts: Record<RegistryLayer, number> = { builtin: 0, global: 0, discovered: 0, project: 0, session: 0 }
   for (const [, v] of map) layer_counts[v.layer]++
+  const layer = Object.fromEntries(Array.from(map.entries()).map(([id, value]) => [id, value.layer])) as Record<string, RegistryLayer>
 
   return {
     entries,
     layer_counts,
+    layer,
     overridden,
-    removed: [...projectRemovals ?? []],
+    removed: [...removed],
+    protected_removals: protectedRemovals,
     deduplicated,
     timestamp: new Date().toISOString(),
   }
@@ -231,6 +291,7 @@ export function mergeLayers(
 export function getFullRegistry(
   builtin: CapabilityEntry[],
   projectDir?: string,
+  sessionID?: string,
 ): RegistryMergeResult {
   const global = loadGlobalRegistry()
   const discovered = loadDiscoveredRegistry()
@@ -238,8 +299,88 @@ export function getFullRegistry(
   const projectRemovals = projectDir
     ? readJsonFile<{ removed?: string[] }>(projectRegistryPath(projectDir), {}).removed
     : undefined
+  const session = sessionID ? loadSessionRegistry(sessionID) : []
+  const sessionRemovals = sessionID ? loadSessionRemovals(sessionID) : undefined
 
-  return mergeLayers(builtin, global, discovered, project, projectRemovals)
+  return mergeLayers(builtin, global, discovered, project, projectRemovals, session, sessionRemovals)
+}
+
+function hasBinary(binary: string): boolean {
+  return (process.env.PATH ?? "").split(path.delimiter).some((dir) => {
+    try {
+      return fs.existsSync(path.join(dir, binary))
+    } catch {
+      return false
+    }
+  })
+}
+
+export function deriveEffectiveCapabilityStatus(entry: CapabilityEntry): EffectiveCapabilityStatus {
+  if (entry.status === "running") return "running"
+  if (entry.status === "active" || entry.status === "available") return "active"
+  if (entry.status === "blocked" || entry.status === "failed") return "blocked"
+  if (entry.status === "requires_key" || (entry.requires_token && (entry.dependencies?.tokens ?? []).some((key) => !process.env[key]))) {
+    return "requires_key"
+  }
+  if (entry.status === "requires_install" || entry.status === "missing_dependency") return "requires_install"
+  if ((entry.dependencies?.binaries ?? []).some((binary) => !hasBinary(binary) && binary !== "npx")) return "requires_install"
+  if (entry.status === "unavailable" || entry.status === "degraded") return "unavailable"
+  if (entry.start_policy === "on_demand" || entry.kind === "mcp" || entry.kind === "lsp" || entry.kind === "multimodal") {
+    return "on_demand"
+  }
+  return "registered"
+}
+
+export function buildEffectiveCapabilityManifest(input: {
+  builtin: CapabilityEntry[]
+  projectDir?: string
+  sessionID?: string
+  recordEvidence?: boolean
+}): EffectiveCapabilityManifest {
+  const merged = getFullRegistry(input.builtin, input.projectDir, input.sessionID)
+  const effective_status = Object.fromEntries(
+    merged.entries.map((entry) => [entry.id, deriveEffectiveCapabilityStatus(entry)]),
+  ) as Record<string, EffectiveCapabilityStatus>
+  const by_kind: Record<string, number> = {}
+  const by_status: Record<EffectiveCapabilityStatus, number> = {
+    registered: 0,
+    active: 0,
+    running: 0,
+    unavailable: 0,
+    blocked: 0,
+    requires_key: 0,
+    requires_install: 0,
+    on_demand: 0,
+  }
+  for (const entry of merged.entries) {
+    by_kind[entry.kind] = (by_kind[entry.kind] ?? 0) + 1
+    const status = effective_status[entry.id]
+    by_status[status] = (by_status[status] ?? 0) + 1
+  }
+  const manifest: EffectiveCapabilityManifest = {
+    version: 1,
+    entries: merged.entries,
+    layer: merged.layer,
+    effective_status,
+    by_kind,
+    by_status,
+    layer_counts: merged.layer_counts,
+    removed: merged.removed,
+    protected_removals: merged.protected_removals ?? [],
+    merged_at: merged.timestamp,
+  }
+  if (input.recordEvidence !== false) {
+    writeEvidence("capability.manifest_effective", {
+      total: manifest.entries.length,
+      by_kind: manifest.by_kind,
+      by_status: manifest.by_status,
+      layer_counts: manifest.layer_counts,
+      removed: manifest.removed,
+      protected_removals: manifest.protected_removals,
+      ids: manifest.entries.map((entry) => entry.id).slice(0, 40),
+    }, input.sessionID)
+  }
+  return manifest
 }
 
 // ─── Discovery Promotion ────────────────────────────────────────────────────────
@@ -440,7 +581,7 @@ export function snapshot(entries: CapabilityEntry[]): RegistrySnapshot {
 
   return {
     entries,
-    layer: {}, // filled by mergeLayers
+    layer: {},
     total: entries.length,
     by_status: by_status as Record<CapabilityStatus, number>,
     by_kind,

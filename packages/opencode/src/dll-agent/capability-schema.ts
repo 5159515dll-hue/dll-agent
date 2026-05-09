@@ -15,7 +15,7 @@
 // ─── Core Types ────────────────────────────────────────────────────────────────
 
 /** 能力类型 */
-export type CapabilityKind = "skill" | "mcp" | "tool" | "software" | "model"
+export type CapabilityKind = "skill" | "mcp" | "tool" | "software" | "model" | "lsp" | "multimodal"
 
 /** 风险等级 */
 export type CapabilityRiskLevel = "low" | "medium" | "high"
@@ -37,8 +37,13 @@ export type CapabilitySourceType =
 /** 运行时状态 */
 export type CapabilityStatus =
   | "registered"         // schema 完整，已注册
+  | "active"             // 已被当前任务/会话激活
   | "available"          // 依赖就绪，可用
+  | "unavailable"        // 当前不可用（泛化状态，用于 manifest/doctor 展示）
   | "missing_dependency" // 缺少依赖（binary/token/package）
+  | "requires_key"       // 缺少 token/env key
+  | "requires_install"   // 缺少本地 binary/package
+  | "on_demand"          // 注册但按需启动/加载
   | "degraded"           // 降级可用
   | "blocked"            // 被安全/权限策略阻止
   | "running"            // MCP/service 正在运行
@@ -243,6 +248,8 @@ const REQUIRED_FIELDS: Record<CapabilityKind, (keyof CapabilityEntry)[]> = {
   tool: ["id", "kind", "name", "description", "capabilities", "source", "source_type", "status", "platforms", "project_scope"],
   software: ["id", "kind", "name", "description", "capabilities", "dependencies", "source", "source_type", "status", "platforms", "project_scope"],
   model: ["id", "kind", "name", "description", "capabilities", "risk_level", "cost_level", "source", "source_type", "status", "platforms", "project_scope"],
+  lsp: ["id", "kind", "name", "description", "capabilities", "source", "source_type", "status", "platforms", "project_scope"],
+  multimodal: ["id", "kind", "name", "description", "capabilities", "source", "source_type", "status", "platforms", "project_scope"],
 }
 
 /** 验证单条 capability entry 的完整性 */

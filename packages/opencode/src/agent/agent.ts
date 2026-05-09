@@ -24,9 +24,10 @@ import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { zod } from "@/util/effect-zod"
 import { withStatics, type DeepMutable } from "@/util/schema"
-import { enabled as dllEnabled, autoAllowAll as dllAutoAllow, writeEvidence as dllLogEvidence, roleRoster as dllRoleRoster } from "@/dll-agent/profile"
-import { resolveRoleModel, type DllRole } from "@/dll-agent/role-model-registry"
-import { isReadOnlyRole, permissionConfigForRole } from "@/dll-agent/role-tool-policy"
+import { enabled as dllEnabled, writeEvidence as dllLogEvidence, roleRoster as dllRoleRoster } from "@/dll-agent/profile"
+import { isDllRole, type DllRole } from "@/dll-agent/role-model-registry"
+import { resolveRoleProviderModel } from "@/dll-agent/role-provider-bridge"
+import { permissionConfigForRole } from "@/dll-agent/role-tool-policy"
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -110,20 +111,6 @@ export const layer = Layer.effect(
         })
 
         const user = Permission.fromConfig(cfg.permission ?? {})
-
-        // Phase 5: dll-agent 全权放行 ruleset。在 merge 末尾追加，因 evaluate 用 findLast，
-        // 最末规则胜出，从而覆盖 defaults 中 ask/deny 的项目（如 external_directory:*、doom_loop）。
-        // 仅在 dllAutoAllow() 为 true 时生效；用户可 DLL_AGENT_AUTO_ALLOW=0 关闭。
-        const dllAllowAll: Permission.Ruleset = dllAutoAllow()
-          ? Permission.fromConfig({
-              "*": "allow",
-              external_directory: { "*": "allow" },
-              doom_loop: "allow",
-              question: "allow",
-              plan_enter: "allow",
-              plan_exit: "allow",
-            })
-          : []
 
         const agents: Record<string, Info> = {
           build: {
@@ -253,25 +240,28 @@ export const layer = Layer.effect(
         }
 
         if (dllEnabled()) {
-          // Resolve role models from Role Model Registry
-          // Uses project and global config overrides via resolveRoleModel().
+          // Resolve role models through Role Provider Bridge so registry
+          // selections are validated by OpenCode Provider.Service.
           // Session overrides are not available at agent registration time;
           // they take effect via supervisor.ts auto-triggers and command execution.
-          const roleModel = (role: DllRole) => {
-            const effective = resolveRoleModel(role, undefined, ctx.directory)
-            return Provider.parseModel(effective.primary)
-          }
+          const roleModel = Effect.fnUntraced(function* (role: DllRole) {
+            return yield* resolveRoleProviderModel({
+              role,
+              projectDir: ctx.directory,
+              triggerReason: "agent registration effective role model",
+              provider,
+            })
+          })
           const rolePermission = (role: DllRole) => Permission.fromConfig(permissionConfigForRole(role))
 
-          // Phase 5 fix: dll-agent 自动放行所有权限 —— dllAllowAll 必须放在 user 之后，
-          // 因为 Permission.evaluate 用 findLast，最末规则胜出。否则 defaults 中的
-          // external_directory:* / question:ask / plan_enter:deny / *.env:ask 仍会触发弹权限。
+          // Permission mode is enforced dynamically by permissionPreCheck().
+          // Agent registration keeps static role permissions such as reviewer read-only.
           agents.commander = {
             name: "commander",
             description: "dll-agent commander. DeepSeek default executor/router; OpenAI is on-demand strategic audit only.",
             mode: "primary",
             native: true,
-            model: roleModel("commander"),
+            model: yield* roleModel("commander"),
             prompt:
               "You are the dll-agent commander and default executor. Keep the user's real goal as the controlling objective. Do normal planning, coding, debugging, and tool recovery yourself. The role team is implemented as real subagents, not just a prompt style. Call GLM/Kimi subagents for requirement drift or long-context checks. Call OpenAI final-auditor only when stuck after repeated attempts, off-track, in reviewer conflict, explicitly asked for OpenAI strategic review, or making a high-risk completion claim. Do not call OpenAI for ordinary status, ordinary planning, routine coding, or first-pass answers.",
             permission: Permission.merge(
@@ -281,7 +271,6 @@ export const layer = Layer.effect(
                 plan_enter: "allow",
               }),
               user,
-              dllAllowAll,
               rolePermission("commander"),
             ),
             options: {},
@@ -291,10 +280,10 @@ export const layer = Layer.effect(
             description: "dll-agent chief engineer. Engineering execution/debugging role for real engineering work.",
             mode: "subagent",
             native: true,
-            model: roleModel("chief-engineer"),
+            model: yield* roleModel("chief-engineer"),
             prompt:
               "You are the dll-agent chief engineer subagent. Execute concrete engineering work, diagnose failures, use tools, install project-local dependencies when needed, and verify with real commands. Every claim must cite evidence.",
-            permission: Permission.merge(defaults, user, dllAllowAll, rolePermission("chief-engineer")),
+            permission: Permission.merge(defaults, user, rolePermission("chief-engineer")),
             options: {},
           }
           agents["requirements-inspector"] = {
@@ -302,15 +291,14 @@ export const layer = Layer.effect(
             description: "dll-agent requirements inspector. GLM Chinese intent, rule, and logic checker.",
             mode: "subagent",
             native: true,
-            model: roleModel("requirements-inspector"),
+            model: yield* roleModel("requirements-inspector"),
             steps: 6,
             prompt:
               "You are the requirements inspector. Check Chinese user intent, contradictions, rule adherence, phase drift, and whether the work still serves the real user goal. Use the compact reviewer context first. Read only listed relevant files when needed. Do NOT run bash/typecheck/build/test/git or create subtasks. Emit the required JSON verdict.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({ edit: "deny", read: "allow" }),
+              Permission.fromConfig({ edit: "deny" }),
               user,
-              dllAllowAll,
               rolePermission("requirements-inspector"),
             ),
             options: {},
@@ -320,15 +308,14 @@ export const layer = Layer.effect(
             description: "dll-agent long-context archivist. Kimi logs, documents, baselines, and memory consistency checker.",
             mode: "subagent",
             native: true,
-            model: roleModel("long-context-archivist"),
+            model: yield* roleModel("long-context-archivist"),
             steps: 6,
             prompt:
               "You are the long-context archivist. Check logs, documents, baselines, phase history, memory drift, and missing evidence. Use the compact reviewer context first. Read only listed relevant files/logs when needed. Do NOT run bash/typecheck/build/test/git or create subtasks. Emit the required JSON verdict.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({ edit: "deny", read: "allow" }),
+              Permission.fromConfig({ edit: "deny" }),
               user,
-              dllAllowAll,
               rolePermission("long-context-archivist"),
             ),
             options: {},
@@ -338,15 +325,14 @@ export const layer = Layer.effect(
             description: "dll-agent on-demand strategic/final auditor. GPT-5.5 Pro evidence and engineering reliability checker.",
             mode: "subagent",
             native: true,
-            model: roleModel("final-auditor"),
+            model: yield* roleModel("final-auditor"),
             steps: 8,
             prompt:
               "You are the on-demand strategic/final auditor. Check evidence sufficiency, validation quality, strategic direction, engineering risk, and overclaiming before high-risk completion. This is a read-only audit role: do not run bash, edit files, patch files, spawn subtasks, or make changes.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({ webfetch: "allow", websearch: "allow", read: "allow" }),
+              Permission.fromConfig({ webfetch: "allow", websearch: "allow" }),
               user,
-              dllAllowAll,
               rolePermission("final-auditor"),
             ),
             options: {},
@@ -357,14 +343,13 @@ export const layer = Layer.effect(
               "dll-agent temporary role crossing agent. Use only for recovery, reviewer conflict, weak evidence, or long-context drift.",
             mode: "subagent",
             native: true,
-            model: roleModel("role-cross"),
+            model: yield* roleModel("role-cross"),
             prompt:
               "Temporarily inspect the task from another role's viewpoint. This is not a permanent role change. Gather missing information, find blind spots, propose actionable fixes, and then return control to the normal role roster.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({ webfetch: "allow", websearch: "allow", read: "allow" }),
+              Permission.fromConfig({ webfetch: "allow", websearch: "allow" }),
               user,
-              dllAllowAll,
               rolePermission("role-cross"),
             ),
             options: {},
@@ -378,19 +363,17 @@ export const layer = Layer.effect(
             description: "dll-agent multimodal context interpreter. Converts non-text inputs into structured context packets.",
             mode: "subagent",
             native: true,
-            model: roleModel("multimodal-context-interpreter"),
+            model: yield* roleModel("multimodal-context-interpreter"),
             steps: 4,
             prompt:
               "You are the dll-agent multimodal context interpreter. Your role is to analyze non-text inputs (screenshots, images, webpage visuals, PPT figures, flowcharts, charts, video, audio) and produce structured multimodal_context_packet outputs. You are read-only: do not modify files, run bash commands, or edit code. Your output feeds into the commander and reviewers for downstream decisions. Always include confidence levels and uncertainties — never claim absolute certainty from visual analysis.",
             permission: Permission.merge(
               defaults,
               Permission.fromConfig({
-                read: "allow",
                 webfetch: "allow",
                 websearch: "allow",
               }),
               user,
-              dllAllowAll,
               rolePermission("multimodal-context-interpreter"),
             ),
             options: {},
@@ -402,14 +385,13 @@ export const layer = Layer.effect(
               "dll-agent verifier/executor. Runs typecheck/test/doctor on demand and pastes raw stdout as evidence.",
             mode: "subagent",
             native: true,
-            model: roleModel("executor"),
+            model: yield* roleModel("executor"),
             prompt:
               "You are the dll-agent verifier/executor. Use the bash tool to run requested verification commands (typecheck, test, doctor, build). Paste raw stdout verbatim — never paraphrase, never claim success without showing the exit code. Return a concise pass/fail summary at the end.",
             permission: Permission.merge(
               defaults,
               Permission.fromConfig({ question: "allow", plan_enter: "allow" }),
               user,
-              dllAllowAll,
               rolePermission("executor"),
             ),
             options: {},
@@ -447,25 +429,6 @@ export const layer = Layer.effect(
           item.steps = value.steps ?? item.steps
           item.options = mergeDeep(item.options, value.options ?? {})
           item.permission = Permission.merge(item.permission, Permission.fromConfig(value.permission ?? {}))
-        }
-
-        // Phase 5: dll-agent 全权放行兜底 —— 在所有 agent（含 build/general/config 自定义）
-        // 的 permission 末尾追加 dllAllowAll。Permission.evaluate 用 findLast，最末规则胜出，
-        // 因此这一步会覆盖 defaults / user / agent-specific 中残留的 ask/deny。
-        // 例外：title/summary/compaction/explore/plan 是功能性角色（本身要 *:deny 限制工具），
-        // 不能放行；它们也不直接接收用户任务，永远不会触发"用户授权弹窗"，跳过即可。
-        if (dllAutoAllow()) {
-          const skip = new Set([
-            "title",
-            "summary",
-            "compaction",
-            "explore",
-            "plan",
-          ])
-          for (const name in agents) {
-            if (skip.has(name) || isReadOnlyRole(name)) continue
-            agents[name].permission = Permission.merge(agents[name].permission, dllAllowAll)
-          }
         }
 
         // Ensure Truncate.GLOB is allowed unless explicitly configured
@@ -531,18 +494,34 @@ export const layer = Layer.effect(
       }),
     )
 
+    const withEffectiveRoleModel = Effect.fnUntraced(function* (agent: Info) {
+      if (!dllEnabled() || !isDllRole(agent.name)) return agent
+      const ctx = yield* InstanceState.context
+      return {
+        ...agent,
+        model: yield* resolveRoleProviderModel({
+          role: agent.name,
+          projectDir: ctx.worktree,
+          triggerReason: "agent get/list effective role model",
+          provider,
+        }),
+      }
+    })
+
     return Service.of({
       get: Effect.fn("Agent.get")(function* (agent: string) {
         const result = yield* InstanceState.useEffect(state, (s) => s.get(agent))
+        const effective = result ? yield* withEffectiveRoleModel(result) : result
         dllLogEvidence("agent.get", {
           agent,
-          resolved: result?.name,
-          model: result?.model ? `${result.model.providerID}/${result.model.modelID}` : undefined,
+          resolved: effective?.name,
+          model: effective?.model ? `${effective.model.providerID}/${effective.model.modelID}` : undefined,
         })
-        return result
+        return effective
       }),
       list: Effect.fn("Agent.list")(function* () {
-        return yield* InstanceState.useEffect(state, (s) => s.list())
+        const result = yield* InstanceState.useEffect(state, (s) => s.list())
+        return yield* Effect.forEach(result, withEffectiveRoleModel)
       }),
       defaultAgent: Effect.fn("Agent.defaultAgent")(function* () {
         return yield* InstanceState.useEffect(state, (s) => s.defaultAgent())

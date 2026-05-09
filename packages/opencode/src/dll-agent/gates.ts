@@ -6,7 +6,7 @@
  */
 
 import { verifiedToolEvidence } from "./triggers"
-import { write as writeEvidence } from "./evidence"
+import { readEntries as readEvidenceEntries, write as writeEvidence } from "./evidence"
 import {
   type EvidenceGateInput,
   type EvidenceGateResult,
@@ -15,10 +15,11 @@ import {
 } from "./interfaces"
 import type { MessageV2 } from "@/session/message-v2"
 import { loadResults } from "./result-ledger"
-import { checkResultSufficiency } from "./result-sufficiency-gate"
+import { artifactReuseDecision, checkResultSufficiency } from "./result-sufficiency-gate"
 import { buildEvidenceSnapshot } from "./evidence-normalizer"
 import { evaluateCompletionReadiness } from "./completion-readiness"
 import { assessGoalCompletion, loadGoalContract } from "./goal-contract"
+import { findSameModelResultRisks } from "./role-run-envelope"
 
 /** 同一 block reason 在同一 session 中最多允许自动重试次数 */
 export const GATE_MAX_RETRIES = 2
@@ -247,16 +248,41 @@ export function checkReconciliationGate(input: {
   isCompletionClaim: boolean
   assistantText: string
   state: SupervisorState
-}): { passed: boolean; block_reason: string | null; synthetic_hint: string | null } {
+  sessionID?: string
+}): {
+  passed: boolean
+  block_reason: string | null
+  synthetic_hint: string | null
+  context_packet_refs: string[]
+  audit_risks: string[]
+} {
+  const completedReviews = new Set(input.state.completed_reviews.map(String))
+  const reviewerResults = input.sessionID ? loadResults(input.sessionID).filter((result) =>
+    completedReviews.has(String(result.executing_role))
+  ) : []
+  const contextPacketRefs = [...new Set(reviewerResults.flatMap((result) =>
+    result.context_packet_id ? [result.context_packet_id] : result.evidence_refs
+      .filter((ref) => ref.startsWith("context_handoff:"))
+      .map((ref) => ref.slice("context_handoff:".length))
+  ))]
+  const auditRisks = reviewerResults
+    .flatMap((result) => [
+      ...(result.missing_context_packet || result.known_risks.includes("missing_context_packet")
+        ? [`${result.executing_role}:${result.packet_id}:missing_context_packet`]
+        : []),
+      ...(result.structured_output_missing || result.known_risks.includes("structured_output_missing")
+        ? [`${result.executing_role}:${result.packet_id}:structured_output_missing`]
+        : []),
+    ])
   if (!input.isCompletionClaim) {
-    return { passed: true, block_reason: null, synthetic_hint: null }
+    return { passed: true, block_reason: null, synthetic_hint: null, context_packet_refs: contextPacketRefs, audit_risks: auditRisks }
   }
   if (!input.state.completed_reviews || input.state.completed_reviews.length === 0) {
-    return { passed: true, block_reason: null, synthetic_hint: null }
+    return { passed: true, block_reason: null, synthetic_hint: null, context_packet_refs: contextPacketRefs, audit_risks: auditRisks }
   }
   const hasAbsorption = RECONCILIATION_ABSORPTION_PATTERNS.some((re) => re.test(input.assistantText))
   if (hasAbsorption) {
-    return { passed: true, block_reason: null, synthetic_hint: null }
+    return { passed: true, block_reason: null, synthetic_hint: null, context_packet_refs: contextPacketRefs, audit_risks: auditRisks }
   }
   return {
     passed: false,
@@ -265,8 +291,12 @@ export function checkReconciliationGate(input: {
 Reviewers ran in this session but the completion claim does not reference them.
 Required: explicitly state how each reviewer's findings were absorbed, fixed, or evidence-rejected.
 Reviewers completed: ${input.state.completed_reviews.join(", ")}.
+Context packets: ${contextPacketRefs.length ? contextPacketRefs.join(", ") : "missing or not recorded"}.
+Audit risks: ${auditRisks.length ? auditRisks.join("; ") : "none"}.
 Acknowledge with phrasing such as "已采纳 reviewer 的 X 建议", "按 reviewer 修正 Y", or "evidence-rejected reviewer claim Z because ...".
 </dll-agent-reconciliation-gate>`,
+    context_packet_refs: contextPacketRefs,
+    audit_risks: auditRisks,
   }
 }
 
@@ -334,6 +364,71 @@ export function finalGate(params: {
       if (unverified.length > 0) {
         reasons.push(
           `result ledger has ${unverified.length} unverified subtask(s) — verification needed before final PASS`,
+        )
+      }
+      const staleResults = results.filter((r) =>
+        r.stale ||
+        r.completion_status === "STALE" ||
+        r.completion_status === "INVALIDATED" ||
+        artifactReuseDecision(r, params.projectDir).staleReasons.length > 0
+      )
+      if (staleResults.length > 0) {
+        reasons.push(
+          `result ledger has ${staleResults.length} stale/invalidated result(s): ` +
+          staleResults.map((r) => `${r.packet_id}`).join(", "),
+        )
+      }
+      const missingEvidence = results.filter((r) =>
+        r.completion_status === "VERIFIED_COMPLETE" &&
+        (r.evidence_refs.length === 0 || !r.verification_results.some((verification) => verification.status === "passed"))
+      )
+      if (missingEvidence.length > 0) {
+        reasons.push(
+          `result ledger has ${missingEvidence.length} verified result(s) missing reusable evidence`,
+        )
+      }
+      const lowConfidenceFallbackComplete = results.filter((r) =>
+        r.completion_status === "VERIFIED_COMPLETE" &&
+        (r.structured_output_missing || r.confidence === "low")
+      )
+      if (lowConfidenceFallbackComplete.length > 0) {
+        reasons.push(
+          `low-confidence fallback reviewer output cannot count as VERIFIED_COMPLETE: ` +
+          lowConfidenceFallbackComplete.map((r) => `${r.executing_role}:${r.packet_id}`).join(", "),
+        )
+      }
+      const reviewerRoles = new Set(["requirements-inspector", "long-context-archivist", "task-completion-archivist", "chief-engineer", "final-auditor", "role-cross", "multimodal-context-interpreter"])
+      const blockingReviewerMissingContext = results.filter((r) =>
+        reviewerRoles.has(String(r.executing_role)) &&
+        r.completion_status === "BLOCKED" &&
+        (!r.context_packet_id || r.missing_context_packet || r.known_risks.includes("missing_context_packet"))
+      )
+      if (blockingReviewerMissingContext.length > 0) {
+        reasons.push(
+          `blocking reviewer result missing context_handoff packet_id: ` +
+          blockingReviewerMissingContext.map((r) => `${r.executing_role}:${r.packet_id}`).join(", "),
+        )
+      }
+      const sameModelRisks = findSameModelResultRisks(results)
+      if (sameModelRisks.length > 0) {
+        reasons.push(`same-model multi-role isolation audit risk: ${sameModelRisks.join("; ")}`)
+      }
+      const unresolvedRoutingRisks = readEvidenceEntries()
+        .filter((entry) => entry.sessionID === params.sessionID && entry.type === "model.routing_decision")
+        .flatMap((entry) => {
+          const payload = entry.payload as Record<string, unknown> | null
+          if (!payload?.unresolved_routing_risk) return []
+          const skipped = Array.isArray(payload.skipped_reviewer_details)
+            ? payload.skipped_reviewer_details.map((item) => {
+                const detail = item as Record<string, unknown>
+                return `${String(detail.role ?? payload.role ?? "unknown")}:${String(detail.skip_reason ?? payload.skip_reason ?? "unknown")}`
+              })
+            : [String(payload.role ?? "unknown")]
+          return skipped.map((skip) => `${skip} (${String(payload.correctness_reason ?? "missing correctness reason")})`)
+        })
+      if (unresolvedRoutingRisks.length > 0) {
+        reasons.push(
+          `correctness-required reviewer skipped without completion: ${unresolvedRoutingRisks.slice(-5).join("; ")}`,
         )
       }
     } catch {

@@ -14,18 +14,20 @@
 import type { MessageV2 } from "@/session/message-v2"
 import type {
   CompletionStatus,
-  UnfinishedItem,
   ContinuationPacket,
+  UnfinishedItem,
   ContinuationGateResult,
   ReviewerRole,
   RiskLevel,
   SupervisorState,
 } from "./interfaces"
 import { CONTINUATION_BUDGET } from "./interfaces"
-import { write as writeEvidence } from "./evidence"
+import { redact, write as writeEvidence } from "./evidence"
 import { loadResults } from "./result-ledger"
 import { detectUnfinishedIndicators, extractUnfinishedItems } from "./continuation-parser"
-import { assessGoalCompletion, loadGoalContract } from "./goal-contract"
+import { assessGoalCompletion, loadGoalContract, type GoalFinalStatus } from "./goal-contract"
+import { buildEvidenceSnapshot } from "./evidence-normalizer"
+import { checkResultSufficiency } from "./result-sufficiency-gate"
 
 export { classifyUnfinishedItem, detectUnfinishedIndicators, extractUnfinishedItems } from "./continuation-parser"
 
@@ -34,6 +36,140 @@ export interface BlockedContinuationReport {
   reason: string
   report: string
   evidence_refs: string[]
+}
+
+const REVIEWER_ROLES = new Set<string>([
+  "requirements-inspector",
+  "long-context-archivist",
+  "task-completion-archivist",
+  "chief-engineer",
+  "final-auditor",
+  "role-cross",
+  "multimodal-context-interpreter",
+])
+
+function unique(items: string[]) {
+  return [...new Set(items.map((item) => String(redact(item)).trim()).filter(Boolean))]
+}
+
+function goalStatusFromCompletionStatus(status: CompletionStatus): GoalFinalStatus {
+  if (status === "VERIFIED_COMPLETE") return "VERIFIED_COMPLETE"
+  if (status === "BLOCKED_USER_REQUIRED") return "BLOCKED_USER_REQUIRED"
+  if (status === "BLOCKED_BUDGET_EXHAUSTED") return "BLOCKED_BUDGET_EXHAUSTED"
+  if (status === "FAILED") return "FAILED"
+  if (status === "UNVERIFIED_COMPLETE") return "UNVERIFIED_PARTIAL"
+  return "CONTINUATION_REQUIRED"
+}
+
+export interface ContinuationInputs {
+  goal_contract_ref: string | null
+  verification_results: { name: string; status: "passed" | "failed" | "not_run"; evidenceRef?: string }[]
+  result_statuses: string[]
+  blockers: string[]
+  doctor_failed: boolean
+  requires_user_input: string[]
+  missing_verification: string[]
+  blocking_reviewer_findings: string[]
+  missing_result_refs: string[]
+  required_actions: string[]
+  evidence_refs: string[]
+  context_packet_refs: string[]
+  recommended_next_role: ReviewerRole | "commander" | null
+}
+
+export function collectContinuationInputs(params: {
+  sessionID: string
+  projectDir?: string
+  state: SupervisorState
+  userGoal?: string
+}): ContinuationInputs {
+  const contract = loadGoalContract(params.sessionID)
+  const results = loadResults(params.sessionID)
+  const snapshot = buildEvidenceSnapshot({
+    sessionID: params.sessionID,
+    projectDir: params.projectDir,
+    toolEvidence: params.state.metrics.real_tool_evidence || params.state.metrics.verification_evidence,
+  })
+  const evidenceRefs = unique([
+    ...snapshot.evidence_refs,
+    ...(contract?.evidence_refs ?? []),
+    ...results.flatMap((result) => result.evidence_refs),
+  ])
+  const contextPacketRefs = unique(results.flatMap((result) => [
+    ...(result.context_packet_id ? [`context_handoff:${result.context_packet_id}`] : []),
+    ...result.evidence_refs.filter((ref) => ref.startsWith("context_handoff:")),
+  ]))
+  const requiredVerification = contract?.required_verification ?? []
+  const verificationResults = requiredVerification.map((required) => {
+    const lower = required.toLowerCase()
+    const matching = results.flatMap((result) => result.verification_results)
+      .find((verification) => {
+        const name = verification.name.toLowerCase()
+        return lower.includes(name) || name.includes(lower)
+      })
+    if (matching) return { name: required, status: matching.status, evidenceRef: matching.evidenceRef }
+    if ((params.state.metrics.real_tool_evidence || params.state.metrics.verification_evidence) && requiredVerification.length === 1) {
+      return { name: required, status: "passed" as const, evidenceRef: "gate:observed_verification" }
+    }
+    return { name: required, status: "not_run" as const }
+  })
+  const missingVerification = verificationResults
+    .filter((verification) => verification.status === "not_run")
+    .map((verification) => verification.name)
+  const reviewerBlocks = results
+    .filter((result) => REVIEWER_ROLES.has(String(result.executing_role)) && result.completion_status === "BLOCKED")
+    .flatMap((result) => result.unresolved_items.length
+      ? result.unresolved_items.map((item) => `${result.executing_role}: ${item}`)
+      : [`${result.executing_role}: ${result.claimed_result}`])
+  const blockingResults = results
+    .filter((result) =>
+      result.completion_status === "BLOCKED" ||
+      result.completion_status === "FAILED" ||
+      (result.completion_status === "PARTIAL" && result.unresolved_items.length > 0)
+    )
+    .map((result) => `${result.executing_role}: ${result.subtask_goal}`)
+  const doctorFailed = results.some((result) =>
+    result.verification_results.some((verification) =>
+      verification.name.toLowerCase().includes("doctor") && verification.status === "failed"
+    )
+  ) || snapshot.blockers.some((blocker) => /doctor.*(failed|失败)/i.test(blocker))
+  const sufficiency = contract ? checkResultSufficiency(params.sessionID, contract.user_goal || params.userGoal || "", {
+    requiredVerifications: contract.required_verification,
+    projectDir: params.projectDir,
+  }) : null
+  const missingResultRefs = sufficiency && sufficiency.verdict !== "sufficient" && results.length > 0
+    ? [`result_sufficiency:${sufficiency.verdict}:${sufficiency.neededActions.join("; ")}`]
+    : []
+  const blockers = unique([
+    ...(params.state.blocked_completion && params.state.block_reason ? [params.state.block_reason] : []),
+    ...snapshot.blockers,
+    ...reviewerBlocks,
+    ...blockingResults,
+    ...missingResultRefs,
+  ])
+  const requiresUserInput = blockers.filter((blocker) =>
+    /(token|api key|登录|credential|凭据|push|release|发布|破坏性|destructive|授权|确认|approve|互斥|budget|预算)/i.test(blocker)
+  )
+  return {
+    goal_contract_ref: contract ? `goal_contract:${contract.task_id}` : null,
+    verification_results: verificationResults,
+    result_statuses: results.map((result) => result.completion_status),
+    blockers,
+    doctor_failed: doctorFailed,
+    requires_user_input: unique(requiresUserInput),
+    missing_verification: unique(missingVerification),
+    blocking_reviewer_findings: unique(reviewerBlocks),
+    missing_result_refs: unique(missingResultRefs),
+    required_actions: unique([
+      ...missingVerification.map((item) => `run required verification: ${item}`),
+      ...reviewerBlocks.map((item) => `reconcile reviewer blocking finding: ${item}`),
+      ...missingResultRefs.map((item) => `produce or reuse sufficient verified result: ${item}`),
+      ...blockingResults.map((item) => `resolve result blocker: ${item}`),
+    ]),
+    evidence_refs: evidenceRefs,
+    context_packet_refs: contextPacketRefs,
+    recommended_next_role: reviewerBlocks.length > 0 ? "commander" : missingVerification.length > 0 ? "commander" : null,
+  }
 }
 
 function itemsFromAssessment(params: {
@@ -68,6 +204,8 @@ export function buildContinuationPacket(params: {
   completionClaim: string
   items: UnfinishedItem[]
   state: SupervisorState
+  inputs?: ContinuationInputs
+  finalStatus?: GoalFinalStatus
 }): ContinuationPacket {
   const blocking = params.items.filter((i) => i.kind === "blocking_unfinished")
   const nonBlocking = params.items.filter((i) => i.kind === "non_blocking_followup")
@@ -117,12 +255,27 @@ export function buildContinuationPacket(params: {
     packet_id: `cont_${Date.now()}`,
     session_id: params.sessionID,
     user_goal: params.userGoal.slice(0, 500),
+    goal_contract_ref: params.inputs?.goal_contract_ref ?? null,
     current_phase: params.currentPhase,
     completion_claim: params.completionClaim.slice(0, 300),
     completion_status: completionStatus,
+    final_status: params.finalStatus ?? goalStatusFromCompletionStatus(completionStatus),
     blocking_unfinished: blocking,
     non_blocking_followup: nonBlocking,
     requires_user_input: userInput,
+    missing_verification: params.inputs?.missing_verification ?? [],
+    blocking_reviewer_findings: params.inputs?.blocking_reviewer_findings ?? [],
+    missing_result_refs: params.inputs?.missing_result_refs ?? [],
+    required_actions: params.inputs?.required_actions ?? unique(blocking.map((item) => item.required_action)),
+    recommended_next_role: params.inputs?.recommended_next_role ?? nextPlan[0]?.role ?? null,
+    verification_required: unique(blocking.flatMap((item) => item.verification_required)),
+    evidence_refs: params.inputs?.evidence_refs ?? unique(params.items.flatMap((item) => item.evidence_refs)),
+    context_packet_refs: params.inputs?.context_packet_refs ?? [],
+    budget_state: {
+      continuation_count: params.state.continuation_count ?? 0,
+      max_continuations: CONTINUATION_BUDGET.max_continuations,
+      max_repairs_per_item: CONTINUATION_BUDGET.max_repairs_per_item,
+    },
     already_completed: alreadyCompleted,
     files_involved: filesInvolved.slice(0, 20),
     commands_run: commandsRun.slice(0, 20),
@@ -155,6 +308,7 @@ export function checkContinuationGate(params: {
   state: SupervisorState
   sessionID: string
   userGoal?: string
+  projectDir?: string
 }): ContinuationGateResult {
   // Not a completion claim → pass
   if (!params.isCompletionClaim) {
@@ -171,19 +325,27 @@ export function checkContinuationGate(params: {
     }
   }
 
+  const inputs = collectContinuationInputs({
+    sessionID: params.sessionID,
+    projectDir: params.projectDir,
+    state: params.state,
+    userGoal: params.userGoal,
+  })
   const contract = loadGoalContract(params.sessionID)
   if (contract) {
     const assessment = assessGoalCompletion({
       contract,
-      verificationResults: (params.state.metrics.real_tool_evidence || params.state.metrics.verification_evidence)
-        ? [{ name: "observed_verification", status: "passed", evidenceRef: "gate:continuation" }]
-        : [],
-      blockers: params.state.blocked_completion && params.state.block_reason ? [params.state.block_reason] : [],
+      verificationResults: inputs.verification_results,
+      resultStatuses: inputs.result_statuses,
+      blockers: inputs.blockers,
+      doctorFailed: inputs.doctor_failed,
+      requiresUserInput: inputs.requires_user_input,
     })
     if (
       assessment.final_status === "CONTINUATION_REQUIRED" ||
       assessment.final_status === "BLOCKED_USER_REQUIRED" ||
-      assessment.final_status === "UNVERIFIED_PARTIAL"
+      assessment.final_status === "UNVERIFIED_PARTIAL" ||
+      assessment.final_status === "FAILED"
     ) {
       const items = itemsFromAssessment({
         blockingItems: assessment.final_status === "UNVERIFIED_PARTIAL"
@@ -193,7 +355,7 @@ export function checkContinuationGate(params: {
           ? assessment.required_next_actions
           : ["run required verification before claiming verified completion"],
         requiredVerification: contract.required_verification,
-        status: assessment.final_status,
+        status: assessment.final_status === "FAILED" ? "CONTINUATION_REQUIRED" : assessment.final_status,
         risk: params.state.risk,
       })
       const packet = buildContinuationPacket({
@@ -203,6 +365,8 @@ export function checkContinuationGate(params: {
         completionClaim: params.assistantText,
         items,
         state: params.state,
+        inputs,
+        finalStatus: assessment.final_status,
       })
       const blockReason = `Goal Contract requires continuation: ${assessment.blocking_items.join("; ")}`
       const syntheticHint = `<dll-agent-continuation-gate>
@@ -216,6 +380,10 @@ Continuation required. The final report cannot claim completion until the Goal C
         source: "goal_contract",
         task_id: contract.task_id,
         blocking_count: assessment.blocking_items.length,
+        missing_verification: inputs.missing_verification,
+        missing_result_refs: inputs.missing_result_refs,
+        context_packet_refs: inputs.context_packet_refs,
+        evidence_refs: inputs.evidence_refs,
       }, params.sessionID)
       return {
         passed: false,
@@ -228,6 +396,61 @@ Continuation required. The final report cannot claim completion until the Goal C
         synthetic_hint: syntheticHint,
         block_reason: blockReason,
       }
+    }
+  }
+
+  if (inputs.blockers.length > 0 || inputs.missing_verification.length > 0 || inputs.missing_result_refs.length > 0) {
+    const sourceItems = [
+      ...inputs.blockers,
+      ...inputs.missing_verification.map((item) => `required verification not_run: ${item}`),
+      ...inputs.missing_result_refs.map((item) => `missing required result: ${item}`),
+    ]
+    const items: UnfinishedItem[] = unique(sourceItems).map((description, index) => ({
+      id: `continuation_input_${index + 1}`,
+      kind: inputs.requires_user_input.includes(description) ? "requires_user_input" : "blocking_unfinished",
+      description,
+      why_blocking: "Continuation inputs indicate unresolved completion blocker",
+      evidence_refs: inputs.evidence_refs,
+      required_action: inputs.required_actions[index] ?? `resolve: ${description}`,
+      recommended_role: inputs.recommended_next_role === "commander" ? "chief-engineer" : inputs.recommended_next_role ?? "chief-engineer",
+      verification_required: inputs.missing_verification,
+      risk_level: params.state.risk,
+    }))
+    const packet = buildContinuationPacket({
+      sessionID: params.sessionID,
+      userGoal: params.userGoal ?? "Not available",
+      currentPhase: params.state.phase,
+      completionClaim: params.assistantText,
+      items,
+      state: params.state,
+      inputs,
+      finalStatus: inputs.requires_user_input.length > 0 ? "BLOCKED_USER_REQUIRED" : "CONTINUATION_REQUIRED",
+    })
+    const blockReason = `Continuation inputs require more work: ${sourceItems.slice(0, 5).join("; ")}`
+    writeEvidence("continuation_gate.blocked", {
+      block_reason: blockReason,
+      source: "continuation_inputs",
+      blocking_count: items.length,
+      missing_verification: inputs.missing_verification,
+      missing_result_refs: inputs.missing_result_refs,
+      context_packet_refs: inputs.context_packet_refs,
+      evidence_refs: inputs.evidence_refs,
+    }, params.sessionID)
+    return {
+      passed: false,
+      completion_status: inputs.requires_user_input.length > 0 ? "BLOCKED_USER_REQUIRED" : "PARTIAL_CONTINUED",
+      has_blocking_unfinished: inputs.requires_user_input.length === 0,
+      has_user_input_required: inputs.requires_user_input.length > 0,
+      has_non_blocking: false,
+      blocking_items: items.filter((item) => item.kind === "blocking_unfinished"),
+      continuation_packet: packet,
+      synthetic_hint: `<dll-agent-continuation-gate>
+Task NOT complete. Structured completion inputs show unresolved blocker(s):
+${sourceItems.slice(0, 8).map((item, index) => `${index + 1}. ${item}`).join("\n")}
+
+Continuation required. Do not claim VERIFIED_COMPLETE until these blockers are resolved with evidence.
+</dll-agent-continuation-gate>`,
+      block_reason: blockReason,
     }
   }
 
@@ -275,6 +498,7 @@ Continuation required. The final report cannot claim completion until the Goal C
     completionClaim: params.assistantText,
     items,
     state: params.state,
+    inputs,
   })
 
   let blockReason: string
@@ -408,12 +632,27 @@ export function buildContinuationSubtaskPrompt(params: {
     packet_id: "cont_TODO",
     session_id: "",
     user_goal: params.userGoal.slice(0, 500),
+    goal_contract_ref: null,
     current_phase: params.state.phase,
     completion_claim: params.completionClaim.slice(0, 300),
     completion_status: "UNVERIFIED_COMPLETE",
+    final_status: "UNVERIFIED_PARTIAL",
     blocking_unfinished: [],
     non_blocking_followup: [],
     requires_user_input: [],
+    missing_verification: [],
+    blocking_reviewer_findings: [],
+    missing_result_refs: [],
+    required_actions: [],
+    recommended_next_role: null,
+    verification_required: [],
+    evidence_refs: [],
+    context_packet_refs: [],
+    budget_state: {
+      continuation_count: params.state.continuation_count ?? 0,
+      max_continuations: CONTINUATION_BUDGET.max_continuations,
+      max_repairs_per_item: CONTINUATION_BUDGET.max_repairs_per_item,
+    },
     already_completed: [],
     files_involved: [],
     commands_run: [],
@@ -492,12 +731,27 @@ export function parseKimiContinuationOutput(text: string): {
         packet_id: `cont_${Date.now()}`,
         session_id: "",
         user_goal: "",
+        goal_contract_ref: null,
         current_phase: "default",
         completion_claim: "",
         completion_status: parsed.completion_status ?? "UNVERIFIED_COMPLETE",
+        final_status: goalStatusFromCompletionStatus(parsed.completion_status ?? "UNVERIFIED_COMPLETE"),
         blocking_unfinished: parsed.blocking_unfinished ?? [],
         non_blocking_followup: parsed.non_blocking_followup ?? [],
         requires_user_input: parsed.requires_user_input ?? [],
+        missing_verification: parsed.missing_verification ?? [],
+        blocking_reviewer_findings: parsed.blocking_reviewer_findings ?? [],
+        missing_result_refs: parsed.missing_result_refs ?? [],
+        required_actions: parsed.required_actions ?? [],
+        recommended_next_role: parsed.recommended_next_role ?? null,
+        verification_required: parsed.verification_required ?? [],
+        evidence_refs: parsed.evidence_refs ?? [],
+        context_packet_refs: parsed.context_packet_refs ?? [],
+        budget_state: parsed.budget_state ?? {
+          continuation_count: 0,
+          max_continuations: CONTINUATION_BUDGET.max_continuations,
+          max_repairs_per_item: CONTINUATION_BUDGET.max_repairs_per_item,
+        },
         already_completed: parsed.already_completed ?? [],
         files_involved: [],
         commands_run: [],

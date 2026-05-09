@@ -8,11 +8,12 @@
 import { GLOBAL_DEFAULT_TOOLS } from "./tool-catalog"
 import { SKILL_REGISTRY } from "./skill-registry"
 import { mapAllBuiltins } from "./capability-mapping"
-import { getFullRegistry, snapshot } from "./capability-registry"
+import { buildEffectiveCapabilityManifest, getFullRegistry, snapshot, type EffectiveCapabilityManifest } from "./capability-registry"
 import { resolveAll } from "./capability-resolver"
 import { runtimeSummary } from "./capability-lifecycle"
 import { orchestrateCapabilities } from "./capability-orchestrator"
 import { buildTaskSidebarLines } from "./task-state"
+import { buildLspPrewarmTargets, computeLspBridgePlan } from "./lsp-bridge"
 
 export interface CapabilityStatusReport {
   generated_at: string
@@ -26,6 +27,14 @@ export interface CapabilityStatusReport {
   blocked: string[]
   pending_permission: string[]
   runtime_states: Record<string, string>
+  effective_status: EffectiveCapabilityManifest["effective_status"]
+  effective_by_status: Record<string, number>
+  lsp: {
+    main_language: string
+    prewarm_count: number
+    lazy_count: number
+    target_count: number
+  }
 }
 
 export interface CapabilitySidebarStatus {
@@ -46,9 +55,12 @@ function ids(entries: { id: string }[], max = 12): string[] {
 export function buildCapabilityStatusReport(projectDir: string): CapabilityStatusReport {
   const builtins = mapAllBuiltins(GLOBAL_DEFAULT_TOOLS, SKILL_REGISTRY)
   const registry = getFullRegistry(builtins, projectDir)
+  const manifest = buildEffectiveCapabilityManifest({ builtin: builtins, projectDir, recordEvidence: false })
   const snap = snapshot(registry.entries)
   const resolver = resolveAll(registry.entries)
   const runtime = runtimeSummary(registry.entries)
+  const lspPlan = computeLspBridgePlan(projectDir)
+  const lspTargets = buildLspPrewarmTargets(lspPlan)
   const runtimeStates = Object.fromEntries(
     Object.entries(runtime)
       .filter(([, state]) => state.status !== "idle")
@@ -70,7 +82,27 @@ export function buildCapabilityStatusReport(projectDir: string): CapabilityStatu
       .map((decision) => decision.entry_id)
       .slice(0, 12),
     runtime_states: runtimeStates,
+    effective_status: manifest.effective_status,
+    effective_by_status: manifest.by_status,
+    lsp: {
+      main_language: lspPlan.mainLanguage,
+      prewarm_count: lspPlan.prewarm.length,
+      lazy_count: lspPlan.lazy.length,
+      target_count: lspTargets.length,
+    },
   }
+}
+
+export function buildCapabilityPromptIndex(
+  manifest: Pick<EffectiveCapabilityManifest, "entries" | "effective_status">,
+  maxChars = 1_200,
+): string {
+  const rows = manifest.entries
+    .map((entry) => `${entry.id}:${entry.kind}:${manifest.effective_status[entry.id] ?? entry.status}`)
+    .slice(0, 40)
+  const text = `[dll-agent capabilities ${rows.join(", ")}]`
+  if (text.length <= maxChars) return text
+  return `${text.slice(0, Math.max(0, maxChars - 3))}...`
 }
 
 function countLine(label: string, counts: Record<string, number>): string {
@@ -170,11 +202,13 @@ export function renderCapabilityStatus(projectDir: string): string {
     `total: ${report.total}`,
     countLine("by kind", report.by_kind),
     countLine("by status", report.by_status),
+    countLine("effective status", report.effective_by_status),
     `available: ${report.available.join(", ") || "none"}`,
     `running: ${report.running.join(", ") || "none"}`,
     `missing: ${report.missing.join(", ") || "none"}`,
     `blocked: ${report.blocked.join(", ") || "none"}`,
     `needs permission: ${report.pending_permission.join(", ") || "none"}`,
+    `lsp: main=${report.lsp.main_language} prewarm=${report.lsp.prewarm_count} lazy=${report.lsp.lazy_count} targets=${report.lsp.target_count}`,
   ]
   const runtime = Object.entries(report.runtime_states)
   if (runtime.length > 0) {

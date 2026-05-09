@@ -17,6 +17,8 @@ explicit session override
 
 Role Model Registry is the unified entry point for dll-agent role model selection. It does not replace the OpenCode Provider system. Every effective role model must still be validated by `Provider.Service.getModel()` before use.
 
+`role-provider-bridge.ts` is the runtime boundary that enforces this rule. The registry returns an `EffectiveRoleModel`; the bridge validates candidates through OpenCode Provider, records provider metadata, applies fallback/default decisions, and writes a provider-validated session snapshot for TUI/doctor/status surfaces.
+
 ### Three-tier override resolution
 
 | Tier | Path | Scope |
@@ -59,17 +61,15 @@ Role Model Registry is the unified entry point for dll-agent role model selectio
 /role-model-set role-cross openai/gpt-5.5-pro --scope session
 ```
 
-### `/role-model-reset <role> [--scope session|project|global|all]`
-重置角色模型覆盖，回退到下一层默认配置。默认 scope 为 `session`。
+### Removed prompt-only commands
+以下命令曾作为 prompt-only 模板存在，但没有本地 runtime handler，容易让用户误以为配置已经被可靠修改。本轮已从注册命令中移除：
 
-### `/role-model-test <role>`
-对指定角色的当前模型进行轻量冒烟测试。
+- `/role-model-reset`
+- `/role-model-test`
+- `/role-model-fallback-add`
+- `/role-model-fallback-remove`
 
-### `/role-model-fallback-add <role> <provider/model> [--scope session|project|global]`
-为指定角色添加备选模型。
-
-### `/role-model-fallback-remove <role> <provider/model> [--scope session|project|global]`
-移除指定角色的备选模型。
+当前 runtime-verified 入口只保留 `/role-models` 和 `/role-model-set`。
 
 ## Configuration Files
 
@@ -123,28 +123,37 @@ The registry must not bypass `Provider.Service` or provider-specific request nor
 
 ## Runtime Integration
 
+### Role Provider Bridge (`role-provider-bridge.ts`)
+- `resolveRoleProvider()` resolves a role through the registry, validates primary/fallback candidates with `Provider.Service.getModel()`, and falls back to `Provider.Service.defaultModel()` only when all role candidates fail.
+- `resolveRoleProviderModel()` is the small runtime adapter used by prompt/session and agent registration paths.
+- `resolveRoleProviderHint()` is sync and hint-only; it is allowed for supervisor subtask metadata before the real runtime execution path provider-validates the model.
+- `readRoleProviderSnapshot()` lets TUI/doctor display the latest provider-validated runtime model instead of independently deciding a different model.
+- `role-model-runtime.ts` remains as a compatibility wrapper; new runtime code should call the bridge directly.
+
 ### Profile (`profile.ts`)
 - `roleRoster()`: reads effective models from registry (no hardcoded models)
 - `roleCommands()`: model fields intentionally omitted — runtime resolves from agent config via registry
 - `systemPrompt()`: references effective models
 
 ### Supervisor (`supervisor.ts`)
-- `buildSubtask()`: resolves model from registry per reviewer role, with session override support
-- `buildTaskCompletionSubtask()`: resolves model from registry
-- `markReviewerCompleted()`: uses registry model for result ledger
+- `buildSubtask()`: records a bridge hint for reviewer model metadata; actual execution is resolved by prompt/session through Provider validation
+- `buildTaskCompletionSubtask()`: records a bridge hint for metadata
+- `markReviewerCompleted()`: uses bridge hint for Result Ledger model attribution
 
 ### Session prompt (`prompt.ts`)
 - TUI model picker selections for commander are converted into commander global overrides by default.
 - `/role-model-set` writes into the same override chain; explicit `--scope session` remains available for temporary experiments.
 - Prompt execution uses the effective role model resolver; it does not manually stitch together separate `input.model`, agent model, and registry paths.
 - The resolved model is provider-validated before the user message is persisted.
+- Runtime role model resolution now calls Role Provider Bridge.
 
 ### Agent (`agent.ts`)
-- Agent defaults resolved from registry at startup via `resolveRoleModel()`
+- Agent defaults resolved through Role Provider Bridge and `Provider.Service.getModel()`
 - Config overrides still work via existing `cfg.agent[key].model` mechanism
 
 ### Doctor (`dll-doctor.ts`)
 - `checkRoleModelHealth()`: validates all role models, checks provider keys, flags voice/TTS models on coding roles, detects config conflicts
+- `role-provider-bridge`: checks the active session provider-validated model snapshot when a session is active
 
 ## Safety Rules
 
@@ -189,9 +198,9 @@ To add a new model provider:
 | Three-tier override (session > project > global) | ✅ Implemented |
 | `/role-models` slash command | ✅ Implemented as local status command, no LLM call |
 | `/role-model-set` with scope support | ✅ Implemented as local mutation command, no LLM call |
-| `/role-model-reset` with scope support | ✅ Implemented |
-| `/role-model-test` smoke test template | ✅ Implemented |
-| `/role-model-fallback-add/remove` | ✅ Implemented |
+| `/role-model-reset` with scope support | removed_prompt_only |
+| `/role-model-test` smoke test template | removed_prompt_only |
+| `/role-model-fallback-add/remove` | removed_prompt_only |
 | `profile.ts` uses registry (no hardcoded models) | ✅ Implemented |
 | `roleCommands()` uses registry | ✅ Implemented (model field removed for runtime resolution) |
 | `agent.ts` uses registry for defaults | ✅ Implemented |
@@ -203,6 +212,7 @@ To add a new model provider:
 | Evidence written on model changes | ✅ Implemented |
 | Fallback chain resolution | ✅ Implemented |
 | Provider availability checking | ✅ Provider.Service is final authority; registry hint only |
+| Role Provider Bridge | ✅ Implemented runtime boundary and provider-validated snapshot |
 | Voice/TTS model guard | ✅ Implemented |
 | Config conflict detection (global+project overlap) | ✅ Implemented |
 | Tests (37 tests, all pass) | ✅ Implemented |

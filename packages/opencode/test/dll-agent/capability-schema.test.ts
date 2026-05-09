@@ -244,7 +244,17 @@ describe("skillToCapabilityEntry", () => {
 describe("mapAllBuiltins", () => {
   test("returns correct total count", () => {
     const all = mapAllBuiltins(GLOBAL_DEFAULT_TOOLS, SKILL_REGISTRY)
-    expect(all.length).toBe(GLOBAL_DEFAULT_TOOLS.length + SKILL_REGISTRY.length)
+    expect(all.length).toBe(GLOBAL_DEFAULT_TOOLS.length + SKILL_REGISTRY.length + 2)
+  })
+
+  test("built-ins include skill/tool/MCP/LSP/multimodal capability kinds", () => {
+    const all = mapAllBuiltins(GLOBAL_DEFAULT_TOOLS, SKILL_REGISTRY)
+    const kinds = new Set(all.map((entry) => entry.kind))
+    expect(kinds.has("skill")).toBe(true)
+    expect(kinds.has("tool")).toBe(true)
+    expect(kinds.has("mcp")).toBe(true)
+    expect(kinds.has("lsp")).toBe(true)
+    expect(kinds.has("multimodal")).toBe(true)
   })
 
   test("no duplicate IDs between tools and skills (shared IDs like repo-doctor exist in both registries)", () => {

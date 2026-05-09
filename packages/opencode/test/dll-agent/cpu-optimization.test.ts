@@ -188,7 +188,7 @@ describe("quotaAgeLine no-file-read optimization", () => {
     // The key optimization: the function signature changed from () to (value: any)
     // This is verified by reading the source signature
 
-    const sourcePath = path.join(import.meta.dir, "../../src/cli/cmd/tui/component/dll-agent-panel.tsx")
+    const sourcePath = path.join(import.meta.dir, "../../src/dll-agent/tui-status-adapter.ts")
     const source = fs.readFileSync(sourcePath, "utf8")
 
     // quotaAgeLine should take a parameter, not call readQuotaFile()

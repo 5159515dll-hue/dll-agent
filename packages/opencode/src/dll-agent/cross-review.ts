@@ -36,6 +36,8 @@ export interface CouncilPacket {
   id: string
   sessionId: string
   createdAt: string
+  issue: string
+  participants: ReviewerRole[]
   userGoal: string
   currentPhase: string
   currentPlan: string | null
@@ -56,6 +58,11 @@ export interface CouncilPacket {
   allowedActions: string[]
   forbiddenActions: string[]
   decisionNeeded: string
+  competingFindings: string[]
+  arbitration: string | null
+  recommendedSolution: string | null
+  requiredVerification: string[]
+  commanderActionRequired: string
   triggerReason: CouncilTriggerReason
   riskLevel: RiskLevel
 }
@@ -250,6 +257,9 @@ export function validateCouncilPacket(packet: CouncilPacket): {
   }
   if (!packet.resultLedger) missing.push("result_ledger")
   if (!packet.decisionNeeded) missing.push("decision_needed")
+  if (!packet.issue) missing.push("issue")
+  if (!packet.participants || packet.participants.length === 0) missing.push("participants")
+  if (!packet.commanderActionRequired) missing.push("commander_action_required")
   if (
     packet.evidenceRefs.length === 0 &&
     (packet.resultLedger?.evidenceRefs.length ?? 0) === 0 &&
@@ -342,6 +352,40 @@ export function checkReviewIndependence(
     }
   }
   return true
+}
+
+export function validateCouncilReviewSet(reviews: CouncilReviewResult[]): {
+  valid: boolean
+  risks: string[]
+  requiredAction: string | null
+} {
+  const risks: string[] = []
+  if (reviews.length === 0) {
+    return {
+      valid: false,
+      risks: ["no_council_reviews"],
+      requiredAction: "collect at least one structured council review",
+    }
+  }
+  const packetIDs = [...new Set(reviews.map((review) => review.packetId).filter(Boolean))]
+  if (packetIDs.length !== 1) risks.push(`council_reviews_do_not_share_one_packet:${packetIDs.join(",") || "missing"}`)
+  const insufficient = reviews.filter((review) => !review.contextSufficient)
+  if (insufficient.length > 0) {
+    risks.push(`context_insufficient:${insufficient.map((review) => `${review.reviewer}(${review.missingContext.join("|")})`).join(",")}`)
+  }
+  const contaminated = reviews.filter((review) => !checkReviewIndependence(review, reviews))
+  if (contaminated.length > 0) risks.push(`review_contamination:${contaminated.map((review) => review.reviewer).join(",")}`)
+  const missingEvidence = reviews.filter((review) =>
+    review.evidenceRefs.length === 0 && review.findings.some((finding) => finding.severity === "blocker")
+  )
+  if (missingEvidence.length > 0) risks.push(`blocking_review_missing_evidence:${missingEvidence.map((review) => review.reviewer).join(",")}`)
+  return {
+    valid: risks.length === 0,
+    risks,
+    requiredAction: risks.length > 0
+      ? "rebuild a shared context packet, re-run only the invalid council reviews, then arbitrate with evidence refs"
+      : null,
+  }
 }
 
 // ─── Conflict Arbitration ───────────────────────────────────────────────────

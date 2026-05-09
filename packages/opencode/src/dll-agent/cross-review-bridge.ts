@@ -142,6 +142,8 @@ export function checkCrossReviewTrigger(params: {
     id: `council_${Date.now()}`,
     sessionId: params.sessionId ?? "",
     createdAt: new Date().toISOString(),
+    issue: `Resolve ${result.reason} with evidence-backed arbitration`,
+    participants: reviewers,
     userGoal: params.userGoal ?? "",
     currentPhase: params.state.phase,
     currentPlan: params.currentPlan ?? null,
@@ -173,6 +175,16 @@ export function checkCrossReviewTrigger(params: {
     allowedActions: [],
     forbiddenActions: [],
     decisionNeeded: `Resolve: ${result.reason}`,
+    competingFindings: [
+      ...(params.state.block_reason ? [params.state.block_reason] : []),
+      ...resultLedger.unresolvedItems,
+    ].slice(0, 10),
+    arbitration: null,
+    recommendedSolution: null,
+    requiredVerification: result.reason === "high_risk_completion"
+      ? ["run required verification before final PASS"]
+      : ["verify the commander action after reconciliation"],
+    commanderActionRequired: "reconcile council findings, implement only evidence-backed fixes, then rerun required verification",
     triggerReason: result.reason,
     riskLevel: params.state.risk,
   }

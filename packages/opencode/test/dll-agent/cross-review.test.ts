@@ -11,6 +11,7 @@ import {
   validateCouncilPacket,
   arbitrateConflict,
   checkReviewIndependence,
+  validateCouncilReviewSet,
   summarizeCouncilResultLedger,
   buildCouncilSummary,
 } from "../../src/dll-agent/cross-review"
@@ -167,6 +168,41 @@ describe("cross-review", () => {
       expect(result.shouldConvene).toBe(false)
       expect(result.reviewers).toEqual([])
     })
+
+    it("builds minimal council packet with arbitration fields and Result Ledger snapshot", () => {
+      const sid = `ses_cross_review_packet_${Date.now()}_${Math.random().toString(16).slice(2)}`
+      cleanupSessions.push(sid)
+      writeResult(sid, buildResultPacket({
+        sessionID: sid,
+        executing_role: "chief-engineer",
+        model: "deepseek/deepseek-v4-pro",
+        user_goal: "fix repeated failure",
+        subtask_goal: "diagnose failure",
+        claimed_result: "partial diagnosis",
+        completion_status: "PARTIAL",
+        unresolved_items: ["missing verification"],
+        evidence_refs: ["tool:test"],
+      }))
+      const result = checkCrossReviewTrigger({
+        state: state({ risk: "high", block_reason: "commander completion conflicts with reviewer" }),
+        repeatedFailureCount: 2,
+        reviewerConflict: false,
+        isHighRiskCompletion: false,
+        hasInsufficientEvidence: false,
+        userCorrectionCount: 0,
+        scopeExpanded: false,
+        recoveryAttempts: 2,
+        sessionId: sid,
+        userGoal: "fix repeated failure",
+      })
+      expect(result.shouldConvene).toBe(true)
+      expect(result.packet?.issue).toContain("Resolve")
+      expect(result.packet?.participants).toContain("chief-engineer")
+      expect(result.packet?.competingFindings).toContain("commander completion conflicts with reviewer")
+      expect(result.packet?.requiredVerification.length).toBeGreaterThan(0)
+      expect(result.packet?.commanderActionRequired).toContain("reconcile")
+      expect(result.packet?.resultLedger.partialResults.length).toBe(1)
+    })
   })
 
   describe("composeCouncil", () => {
@@ -192,6 +228,8 @@ describe("cross-review", () => {
         id: "pkt_1",
         sessionId: "ses_1",
         createdAt: new Date().toISOString(),
+        issue: "Resolve repeated failure",
+        participants: ["chief-engineer"],
         userGoal: "",
         currentPhase: "implementation",
         currentPlan: null,
@@ -212,6 +250,11 @@ describe("cross-review", () => {
         allowedActions: [],
         forbiddenActions: [],
         decisionNeeded: "Should we proceed?",
+        competingFindings: ["test failure"],
+        arbitration: null,
+        recommendedSolution: null,
+        requiredVerification: ["bun test"],
+        commanderActionRequired: "reconcile findings and verify",
         triggerReason: "repeated_failure",
         riskLevel: "medium",
       } as CouncilPacket
@@ -226,6 +269,8 @@ describe("cross-review", () => {
         id: "pkt_1",
         sessionId: "ses_1",
         createdAt: new Date().toISOString(),
+        issue: "Resolve repeated failure",
+        participants: ["chief-engineer"],
         userGoal: "Fix type errors",
         currentPhase: "implementation",
         currentPlan: null,
@@ -246,6 +291,11 @@ describe("cross-review", () => {
         allowedActions: [],
         forbiddenActions: [],
         decisionNeeded: "Should we proceed?",
+        competingFindings: ["test failure"],
+        arbitration: null,
+        recommendedSolution: null,
+        requiredVerification: ["bun test"],
+        commanderActionRequired: "reconcile findings and verify",
         triggerReason: "repeated_failure",
         riskLevel: "medium",
       }
@@ -423,6 +473,39 @@ describe("cross-review", () => {
         }],
       })
       expect(checkReviewIndependence(b, [a])).toBe(true)
+    })
+
+    it("validates council efficiency protocol: shared packet, independent reviews, evidence refs", () => {
+      const a = makeReview({
+        reviewer: "chief-engineer",
+        packetId: "pkt_shared",
+        evidenceRefs: ["ev:failure"],
+        findings: [{
+          severity: "blocker",
+          type: "failure",
+          description: "typecheck failed",
+          evidenceRefs: ["ev:failure"],
+          requiredAction: "fix typecheck",
+        }],
+      })
+      const b = makeReview({
+        reviewer: "requirements-inspector",
+        packetId: "pkt_other",
+        evidenceRefs: [],
+        findings: [{
+          severity: "warning",
+          type: "contamination",
+          description: "chief-engineer already said typecheck failed",
+          evidenceRefs: [],
+          requiredAction: null,
+        }],
+      })
+
+      const result = validateCouncilReviewSet([a, b])
+      expect(result.valid).toBe(false)
+      expect(result.risks.some((risk) => risk.includes("council_reviews_do_not_share_one_packet"))).toBe(true)
+      expect(result.risks.some((risk) => risk.includes("review_contamination"))).toBe(true)
+      expect(result.requiredAction).toContain("re-run only the invalid council reviews")
     })
   })
 

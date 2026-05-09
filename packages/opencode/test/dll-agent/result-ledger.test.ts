@@ -13,12 +13,13 @@ import {
   computeResultHash,
   type ResultPacket,
 } from "../../src/dll-agent/result-ledger"
-import { checkResultSufficiency, isResultStale } from "../../src/dll-agent/result-sufficiency-gate"
+import { artifactReuseDecision, checkResultSufficiency, isResultStale } from "../../src/dll-agent/result-sufficiency-gate"
 import {
   buildDedupDispatchDecision,
   checkDeduplication,
   isDedupReuseAcknowledged,
 } from "../../src/dll-agent/deduplication-gate"
+import { finalGate } from "../../src/dll-agent/gates"
 
 const cleanupSessions: string[] = []
 
@@ -191,6 +192,7 @@ describe("ResultSufficiencyGate", () => {
     }))
     const result = checkResultSufficiency(sid, "fix bug X")
     expect(result.verdict).toBe("sufficient")
+    expect(result.action).toBe("reuse_existing")
     expect(result.canReuse).toBe(true)
   })
 
@@ -204,6 +206,7 @@ describe("ResultSufficiencyGate", () => {
     }))
     const result = checkResultSufficiency(sid, "fix missing evidence")
     expect(result.verdict).toBe("sufficient_but_unverified")
+    expect(result.action).toBe("blocked_missing_evidence")
     expect(result.canReuse).toBe(true)
   })
 
@@ -216,6 +219,7 @@ describe("ResultSufficiencyGate", () => {
     }))
     const result = checkResultSufficiency(sid, "implement feature Y")
     expect(result.verdict).toBe("partial")
+    expect(result.action).toBe("continue_from_existing")
     expect(result.canReuse).toBe(true)
   })
 
@@ -227,6 +231,7 @@ describe("ResultSufficiencyGate", () => {
     }))
     const result = checkResultSufficiency(sid, "complex task")
     expect(result.verdict).toBe("failed_with_diagnosis")
+    expect(result.action).toBe("repair_existing")
     expect(result.canReuse).toBe(false)
   })
 
@@ -268,9 +273,73 @@ describe("ResultSufficiencyGate", () => {
         files_changed: [{ filePath: "src.ts", changeSummary: "write file", hashAfter: hashBefore }],
       }))
       fs.writeFileSync(file, "after")
-      const result = checkResultSufficiency(sid, "hash guarded task", { projectDir: project })
+    const result = checkResultSufficiency(sid, "hash guarded task", { projectDir: project })
+    expect(result.verdict).toBe("stale")
+    expect(result.action).toBe("blocked_stale")
+    expect(result.staleReasons?.join("\n")).toContain("hash changed")
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true })
+    }
+  })
+
+  test("file hash unchanged -> not stale", () => {
+    const sid = sessionID("suf_hash_unchanged")
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "dll-agent-result-hash-"))
+    try {
+      const file = path.join(project, "src.ts")
+      fs.writeFileSync(file, "same")
+      const hash = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")
+      writeResult(sid, makePacket({
+        subtask_goal: "hash unchanged task",
+        files_changed: [{ filePath: "src.ts", changeSummary: "write file", hashAfter: hash }],
+      }))
+      const result = checkResultSufficiency(sid, "hash unchanged task", { projectDir: project })
+      expect(result.verdict).toBe("sufficient")
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true })
+    }
+  })
+
+  test("file deleted -> stale", () => {
+    const sid = sessionID("suf_file_deleted")
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "dll-agent-result-delete-"))
+    try {
+      const file = path.join(project, "src.ts")
+      fs.writeFileSync(file, "before")
+      const hash = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")
+      writeResult(sid, makePacket({
+        subtask_goal: "deleted file task",
+        files_changed: [{ filePath: "src.ts", changeSummary: "write file", hashAfter: hash }],
+      }))
+      fs.rmSync(file)
+      const result = checkResultSufficiency(sid, "deleted file task", { projectDir: project })
       expect(result.verdict).toBe("stale")
-      expect(result.staleReasons?.join("\n")).toContain("hash changed")
+      expect(result.staleReasons?.join("\n")).toContain("missing current file")
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true })
+    }
+  })
+
+  test("mtime fallback detects changed file when hash is unavailable", () => {
+    const sid = sessionID("suf_mtime_changed")
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "dll-agent-result-mtime-"))
+    try {
+      const file = path.join(project, "src.ts")
+      fs.writeFileSync(file, "before")
+      const stat = fs.statSync(file)
+      writeResult(sid, makePacket({
+        subtask_goal: "mtime guarded task",
+        files_changed: [{
+          filePath: "src.ts",
+          changeSummary: "write file",
+          mtimeMsAfter: stat.mtimeMs,
+          sizeAfter: stat.size,
+        }],
+      }))
+      fs.writeFileSync(file, "after after")
+      const result = checkResultSufficiency(sid, "mtime guarded task", { projectDir: project })
+      expect(result.verdict).toBe("stale")
+      expect(result.staleReasons?.join("\n")).toContain("mtime/size changed")
     } finally {
       fs.rmSync(project, { recursive: true, force: true })
     }
@@ -404,7 +473,7 @@ describe("DeduplicationGate evidence refs", () => {
       reusable: true,
     }))
     const result = checkDeduplication(sid, "no evidence")
-    expect(result.recommendedAction).toBe("verify_existing")
+    expect(result.recommendedAction).toBe("blocked_missing_evidence")
     expect(result.syntheticHint).toContain("UNVERIFIED")
   })
 })
@@ -493,6 +562,73 @@ describe("DeduplicationGate.edgeCases", () => {
     }))
     const result = checkDeduplication(sid, "ancient task", { maxAgeMinutes: 60 })
     expect(result.isRedundant).toBe(false)
-    expect(result.recommendedAction).toBe("redo_allowed")
+    expect(result.recommendedAction).toBe("blocked_stale")
+  })
+})
+
+describe("FinalGate Result Ledger integration", () => {
+  const evidenceGate = {
+    passed: true,
+    needs_evidence: false,
+    needs_review: false,
+    block_reason: null,
+    synthetic_hint: null,
+  }
+  const state = {
+    blocked_completion: false,
+    block_reason: null,
+    required_reviews: [],
+    completed_reviews: [],
+    reviewer_conflict: false,
+  } as any
+
+  test("finalGate stale result -> block", () => {
+    const sid = sessionID("final_stale")
+    writeResult(sid, makePacket({
+      subtask_goal: "stale final task",
+      completion_status: "STALE",
+      stale: true,
+      reusable: false,
+    }))
+    const result = finalGate({ evidenceGate, supervisorState: state, reconciliationConflicts: [], costExceeded: false, sessionID: sid })
+    expect(result.allowed).toBe(false)
+    expect(result.reasons.join("\n")).toContain("stale")
+  })
+
+  test("finalGate verified non-stale result -> allow", () => {
+    const sid = sessionID("final_verified")
+    writeResult(sid, makePacket({
+      subtask_goal: "verified final task",
+      completion_status: "VERIFIED_COMPLETE",
+      stale: false,
+      reusable: true,
+    }))
+    const result = finalGate({ evidenceGate, supervisorState: state, reconciliationConflicts: [], costExceeded: false, sessionID: sid })
+    expect(result.allowed).toBe(true)
+  })
+
+  test("structured_output_missing low-confidence cannot count as verified", () => {
+    const sid = sessionID("final_low_confidence")
+    writeResult(sid, makePacket({
+      subtask_goal: "fallback final task",
+      completion_status: "VERIFIED_COMPLETE",
+      structured_output_missing: true,
+      confidence: "low",
+    }))
+    const result = finalGate({ evidenceGate, supervisorState: state, reconciliationConflicts: [], costExceeded: false, sessionID: sid })
+    expect(result.allowed).toBe(false)
+    expect(result.reasons.join("\n")).toContain("low-confidence fallback")
+  })
+
+  test("artifact reuse policy covers document, spreadsheet, code, and log artifacts", () => {
+    const packet = makePacket({
+      artifacts_produced: [
+        { filePath: "report.docx", artifactType: "doc", purpose: "doc output" },
+        { filePath: "metrics.xlsx", artifactType: "doc", purpose: "spreadsheet output" },
+        { filePath: "src/app.ts", artifactType: "code", purpose: "code output" },
+        { filePath: "run.log", artifactType: "log", purpose: "log evidence" },
+      ],
+    })
+    expect(artifactReuseDecision(packet).reusable).toBe(true)
   })
 })

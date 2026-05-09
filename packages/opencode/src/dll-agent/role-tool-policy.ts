@@ -23,7 +23,19 @@ export interface RoleToolDecision {
   reason: string
 }
 
-const MUTATING_TOOLS = ["bash", "edit", "write", "patch", "task", "todowrite", "workflow_tool_approval"]
+export const MUTATING_TOOLS = [
+  "bash",
+  "shell",
+  "edit",
+  "write",
+  "file_write",
+  "file_delete",
+  "delete",
+  "patch",
+  "task",
+  "todowrite",
+  "workflow_tool_approval",
+]
 const READ_ONLY_TOOLS = ["read", "grep", "glob", "list"]
 const NETWORK_READ_TOOLS = ["webfetch", "websearch"]
 const WRITABLE_ROLES = new Set<DllRole>(["commander", "chief-engineer", "executor"])
@@ -74,7 +86,9 @@ export function isReadOnlyRole(role: string) {
 export function permissionConfigForRole(role: DllRole): Record<string, "allow" | "deny"> {
   const policy = roleToolPolicyFor(role)
   const config: Record<string, "allow" | "deny"> = {}
-  for (const tool of policy.allow) config[tool] = "allow"
+  // Static OpenCode agent permissions should only hard-deny role boundaries.
+  // Positive allows are decided dynamically by permissionPreCheck(), otherwise
+  // /permissions default could still be bypassed by a stale "*: allow" rule.
   for (const tool of policy.deny) config[tool] = "deny"
   return config
 }
@@ -143,7 +157,7 @@ export function doctorCheckRoleToolPolicy(): { ok: boolean; issues: string[] } {
   for (const [role, policy] of Object.entries(ROLE_POLICIES) as [DllRole, RoleToolPolicy][]) {
     if (WRITABLE_ROLES.has(role)) {
       if (policy.mode !== "writable") issues.push(`${role} should be writable`)
-      if (policy.deny.some((tool) => ["bash", "edit", "write", "patch"].includes(tool))) {
+      if (policy.deny.some((tool) => ["bash", "shell", "edit", "write", "file_write", "patch"].includes(tool))) {
         issues.push(`${role} should not deny core write tools`)
       }
       continue

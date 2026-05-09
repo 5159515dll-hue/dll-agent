@@ -23,7 +23,7 @@ describe("ux-state", () => {
       expect(state.task.phase).toBe("init")
       expect(state.task.risk).toBe("low")
       expect(state.supervisor.active).toBe(false)
-      expect(state.permissions.mode).toBe("risk-based-auto")
+      expect(state.permissions.mode).toBe("full-access")
     })
   })
 

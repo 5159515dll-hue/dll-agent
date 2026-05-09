@@ -17,6 +17,7 @@ import {
   consumeContinuationPacket,
 } from "../../src/dll-agent/continuation-gate"
 import { ensureGoalContract, refineGoalContract, updateGoalPlan } from "../../src/dll-agent/goal-contract"
+import { buildResultPacket, writeResult } from "../../src/dll-agent/result-ledger"
 
 let root = ""
 let originalRoot: string | undefined
@@ -248,6 +249,64 @@ describe("continuation-gate: gate function", () => {
 
     expect(result.passed).toBe(false)
     expect(result.continuation_packet?.reviewer_blocks.join("\n")).toContain("reviewer")
+  })
+
+  it("reviewer blocking ResultPacket -> continuation required with context refs", () => {
+    ensureGoalContract({ sessionID: "goal-reviewer-ledger", userGoal: "Resolve reviewer ledger block" })
+    writeResult("goal-reviewer-ledger", buildResultPacket({
+      sessionID: "goal-reviewer-ledger",
+      executing_role: "chief-engineer",
+      model: "mimo/mimo-v2.5-pro",
+      user_goal: "Resolve reviewer ledger block",
+      subtask_goal: "review final completion",
+      claimed_result: "blocked: verification missing",
+      completion_status: "BLOCKED",
+      evidence_refs: ["context_handoff:ctx_1", "reviewer:chief-engineer"],
+      unresolved_items: ["verification missing"],
+      context_packet_id: "ctx_1",
+    }))
+    const result = checkContinuationGate({
+      assistantText: "All tasks complete.",
+      isCompletionClaim: true,
+      state: freshState(),
+      sessionID: "goal-reviewer-ledger",
+    })
+
+    expect(result.passed).toBe(false)
+    expect(result.continuation_packet?.blocking_reviewer_findings.join("\n")).toContain("verification missing")
+    expect(result.continuation_packet?.context_packet_refs).toContain("context_handoff:ctx_1")
+  })
+
+  it("continuation packet includes missing verification, result refs, evidence refs, and redacted blockers", () => {
+    ensureGoalContract({
+      sessionID: "goal-packet-fields",
+      userGoal: "Finish packet fields",
+      requiredVerification: ["dll-agent doctor"],
+    })
+    writeResult("goal-packet-fields", buildResultPacket({
+      sessionID: "goal-packet-fields",
+      executing_role: "commander",
+      model: "deepseek/deepseek-v4-pro",
+      user_goal: "Finish packet fields",
+      subtask_goal: "partial result",
+      claimed_result: "partial",
+      completion_status: "PARTIAL",
+      evidence_refs: ["result:e1"],
+      unresolved_items: ["secret token=abc123 should be hidden"],
+    }))
+    const result = checkContinuationGate({
+      assistantText: "All tasks complete.",
+      isCompletionClaim: true,
+      state: freshState(),
+      sessionID: "goal-packet-fields",
+    })
+
+    expect(result.passed).toBe(false)
+    expect(result.continuation_packet?.missing_verification).toContain("dll-agent doctor")
+    expect(result.continuation_packet?.missing_result_refs.join("\n")).toContain("result_sufficiency")
+    expect(result.continuation_packet?.evidence_refs).toContain("result:e1")
+    expect(JSON.stringify(result.continuation_packet)).not.toContain("abc123")
+    expect(JSON.stringify(result.continuation_packet)).toContain("REDACTED")
   })
 
   it("non-blocking follow-up does not block", () => {

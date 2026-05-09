@@ -89,7 +89,7 @@ const PathParameterSchemas = {
 
 const LegacyComponentDescriptions = {
   LogLevel: "Log level",
-  ServerConfig: "Server configuration for opencode serve and web commands",
+  ServerConfig: "Server configuration for dll-agent serve and web commands",
   LayoutConfig: "@deprecated Always uses stretch layout.",
 } satisfies Record<string, string>
 
@@ -537,9 +537,9 @@ function pathParameterSchema(route: string, name: string) {
 
 export const PublicApi = OpenCodeHttpApi.annotateMerge(
   OpenApi.annotations({
-    title: "opencode",
+    title: "dll-agent",
     version: "1.0.0",
-    description: "opencode api",
+    description: "dll-agent api",
     transform: matchLegacyOpenApi,
   }),
 )

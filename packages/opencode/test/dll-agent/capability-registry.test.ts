@@ -22,6 +22,9 @@ import {
   saveDiscoveredRegistry,
   loadProjectRegistry,
   saveProjectRegistry,
+  loadSessionRegistry,
+  saveSessionRegistry,
+  buildEffectiveCapabilityManifest,
   type RegistryMergeResult,
 } from "../../src/dll-agent/capability-registry"
 import {
@@ -80,6 +83,19 @@ describe("mergeLayers", () => {
     expect(result.entries[0].source).toBe("project")
   })
 
+  test("session layer has highest precedence", () => {
+    const builtin = [makeTool("a", { source: "builtin" })]
+    const global = [makeTool("a", { source: "global" })]
+    const discovered = [makeTool("a", { source: "discovered" })]
+    const project = [makeTool("a", { source: "project" })]
+    const session = [makeTool("a", { source: "session" })]
+
+    const result = mergeLayers(builtin, global, discovered, project, undefined, session)
+    expect(result.entries.length).toBe(1)
+    expect(result.entries[0].source).toBe("session")
+    expect(result.layer.a).toBe("session")
+  })
+
   test("project removals exclude lower-layer entries", () => {
     const builtin = [makeTool("a"), makeTool("b")]
     const global: CapabilityEntry[] = []
@@ -93,6 +109,14 @@ describe("mergeLayers", () => {
     expect(result.removed).toContain("a")
   })
 
+  test("safety denylist cannot be removed", () => {
+    const builtin = [makeSkill("security-redaction"), makeSkill("test-gate"), makeTool("normal")]
+    const result = mergeLayers(builtin, [], [], [], ["security-redaction", "test-gate", "normal"])
+    const ids = result.entries.map((entry) => entry.id).sort()
+    expect(ids).toEqual(["security-redaction", "test-gate"])
+    expect(result.protected_removals).toEqual(["security-redaction", "test-gate"])
+  })
+
   test("layers can add new entries independently", () => {
     const builtin = [makeTool("a")]
     const global = [makeTool("b")]
@@ -103,6 +127,38 @@ describe("mergeLayers", () => {
     expect(result.entries.length).toBe(4)
     const ids = result.entries.map((e) => e.id).sort()
     expect(ids).toEqual(["a", "b", "c", "d"])
+  })
+
+  test("effective manifest records status counts and writes no secret values", () => {
+    const manifest = buildEffectiveCapabilityManifest({
+      builtin: [
+        makeTool("github", {
+          requires_token: true,
+          dependencies: { tokens: ["DLL_AGENT_TEST_TOKEN_DO_NOT_SET"] },
+          start_policy: "on_demand",
+        }),
+        makeTool("missing-bin", {
+          dependencies: { binaries: ["definitely-not-installed-dll-agent-bin"] },
+        }),
+      ],
+      recordEvidence: false,
+    })
+    expect(manifest.effective_status.github).toBe("requires_key")
+    expect(manifest.effective_status["missing-bin"]).toBe("requires_install")
+    expect(JSON.stringify(manifest)).not.toContain("secret-value")
+  })
+
+  test("session registry can be read without polluting project or global layers", () => {
+    const sessionID = `cap-registry-session-${Date.now()}`
+    try {
+      saveSessionRegistry(sessionID, [makeTool("session-only", { source: "session-file" })])
+      expect(loadSessionRegistry(sessionID).map((entry) => entry.id)).toContain("session-only")
+      const result = getFullRegistry([], undefined, sessionID)
+      expect(result.entries.map((entry) => entry.id)).toContain("session-only")
+      expect(loadGlobalRegistry().map((entry) => entry.id)).not.toContain("session-only")
+    } finally {
+      fs.rmSync(path.join(os.homedir(), ".dll-agent", "sessions", sessionID), { recursive: true, force: true })
+    }
   })
 
   test("layer counts are correct", () => {

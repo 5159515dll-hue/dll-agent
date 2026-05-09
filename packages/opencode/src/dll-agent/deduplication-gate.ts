@@ -41,6 +41,8 @@ export interface DedupCheck {
     | "continue_from_existing"
     | "repair_existing"
     | "verify_existing"
+    | "blocked_missing_evidence"
+    | "blocked_stale"
     | "redo_allowed"
     | "redo_not_allowed"
     | "no_existing_result"
@@ -152,13 +154,16 @@ If you believe redo is necessary, you MUST explain why with specific evidence.
     }
 
     case "sufficient_but_unverified": {
+      const action = sufficiency.action === "blocked_missing_evidence" ? "blocked_missing_evidence" : "verify_existing"
       return {
         isRedundant: true,
         existingResults: sufficiency.matchingResults,
-        canReuse: true,
+        canReuse: action === "verify_existing",
         sufficiency,
-        reason: `Result exists but needs verification (${sufficiency.bestResult?.packet_id})`,
-        recommendedAction: "verify_existing",
+        reason: action === "blocked_missing_evidence"
+          ? `Result exists but is missing reusable evidence (${sufficiency.bestResult?.packet_id})`
+          : `Result exists but needs verification (${sufficiency.bestResult?.packet_id})`,
+        recommendedAction: action,
         syntheticHint: `<dll-agent-dedup-gate>
 Result exists but is UNVERIFIED: ${sufficiency.bestResult?.packet_id}
 REQUIRED: run verification commands before claiming completion.
@@ -221,7 +226,7 @@ Review the failure diagnosis before re-executing. Do not repeat the same approac
         canReuse: false,
         sufficiency,
         reason: `Existing result is ${sufficiency.verdict} — redo is allowed`,
-        recommendedAction: "redo_allowed",
+        recommendedAction: sufficiency.verdict === "stale" ? "blocked_stale" : "redo_allowed",
         syntheticHint: null,
         evidenceRefs: sufficiency.evidenceRefs,
       }
@@ -267,6 +272,25 @@ export function buildDedupDispatchDecision(
       action: "hard_block_reuse",
       existing_packet_id: existingPacketId,
       reason: check.reason,
+    }, sessionID)
+    return {
+      shouldDispatch: false,
+      mustJustifyRedo: true,
+      action: check.recommendedAction,
+      reason: check.reason,
+      syntheticHint: check.syntheticHint,
+      existingPacketId,
+      evidenceRefs: check.evidenceRefs,
+    }
+  }
+  if (check.recommendedAction === "blocked_missing_evidence" || check.recommendedAction === "blocked_stale") {
+    writeEvidence(check.recommendedAction === "blocked_stale" ? "result.stale_detected" : "result.dedup_blocked", {
+      role,
+      task_goal: taskGoal.slice(0, 300),
+      action: check.recommendedAction,
+      existing_packet_id: existingPacketId,
+      reason: check.reason,
+      stale_reasons: check.sufficiency?.staleReasons ?? [],
     }, sessionID)
     return {
       shouldDispatch: false,

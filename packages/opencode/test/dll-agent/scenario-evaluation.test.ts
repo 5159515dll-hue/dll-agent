@@ -17,6 +17,7 @@ describe("Phase 10 real-world scenario evaluation", () => {
       expect(scenario.required_capabilities.length).toBeGreaterThan(0)
       expect(scenario.acceptance_refs.length).toBeGreaterThan(0)
       expect(["low", "medium", "high"]).toContain(scenario.risk)
+      expect(["deterministic", "local_smoke", "manual", "live_required"]).toContain(scenario.evaluation_layer)
     }
   })
 
@@ -62,9 +63,24 @@ describe("Phase 10 real-world scenario evaluation", () => {
     expect(report.total).toBe(20)
     expect(report.pass).toBe(20)
     expect(report.fail).toBe(0)
+    expect(report.deterministic_pass).toBe(20)
+    expect(report.deterministic_fail).toBe(0)
     expect(report.false_pass_risk).toBe(0)
     expect(report.unnecessary_reviewer_scenarios).toBe(0)
     expect(report.human_intervention_scenarios).toBe(2)
+  })
+
+  test("manual and live-only scenarios are not mislabeled as live passed", () => {
+    const report = evaluateRealWorldScenarioSuite()
+    const byID = Object.fromEntries(report.scenarios.map((scenario) => [scenario.scenario_id, scenario]))
+
+    expect(report.not_run_scenarios).toBe(17)
+    expect(report.manual_not_run_scenarios).toBe(2)
+    expect(report.live_not_run_scenarios).toBe(1)
+    expect(byID.S11_SECRET_PERMISSION.external_status).toBe("manual_not_run")
+    expect(byID.S12_MULTIMODAL_INPUT.external_status).toBe("live_not_run")
+    expect(byID.S19_USER_INTERVENTION_REQUIRED.external_status).toBe("manual_not_run")
+    expect(new Set(report.scenarios.map((scenario) => scenario.external_status as string)).has("pass")).toBe(false)
   })
 
   test("suite fails if a required runtime capability regresses to prompt-only", () => {
@@ -83,6 +99,8 @@ describe("Phase 10 real-world scenario evaluation", () => {
     expect(text).toContain("S01_SHORT_CODE_TASK")
     expect(text).toContain("S20_REVIEWER_CONFLICT")
     expect(text).toContain("false_pass_risk=0")
+    expect(text).toContain("live_not_run=1")
+    expect(text).toContain("external=live_not_run")
     expect(text.length).toBeLessThan(7000)
   })
 })
