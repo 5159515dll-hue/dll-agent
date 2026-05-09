@@ -10,6 +10,7 @@
  */
 import { classifyPermissionRequest, permissionActionForRisk } from "./permission-classifier"
 import { enabled as profileEnabled, autoAllowAll as profileAutoAllow } from "./profile"
+import { classifyRoleToolRequest, roleFromMetadata } from "./role-tool-policy"
 
 export interface PermissionBridgeResult {
   /** true if this request was intercepted and handled (auto-approved or blocked) */
@@ -32,11 +33,30 @@ export function permissionPreCheck(params: {
   metadata?: Record<string, unknown>
   projectRoot?: string
   cwd?: string
+  sessionID?: string
   /** Whether this permission type has been previously confirmed in this session */
   alreadyConfirmed?: boolean
 }): PermissionBridgeResult {
   if (!profileEnabled() || !profileAutoAllow()) {
     return { intercepted: false, action: "ask", reason: "dll-agent auto-allow not enabled" }
+  }
+
+  const role = roleFromMetadata(params.metadata)
+  const roleDecision = classifyRoleToolRequest({
+    role,
+    permission: params.permission,
+    patterns: params.patterns,
+    metadata: params.metadata,
+    projectRoot: params.projectRoot,
+    cwd: params.cwd,
+    sessionID: params.sessionID,
+  })
+  if (roleDecision.action === "deny") {
+    return {
+      intercepted: true,
+      action: "deny",
+      reason: roleDecision.reason,
+    }
   }
 
   const classification = classifyPermissionRequest({
@@ -46,6 +66,21 @@ export function permissionPreCheck(params: {
     projectRoot: params.projectRoot,
     cwd: params.cwd,
   })
+
+  if (
+    roleDecision.action === "allow" &&
+    classification.risk === "medium" &&
+    isProjectWritePermission(params.permission) &&
+    !classification.secretRisk &&
+    !classification.destructive &&
+    !classification.outOfProject
+  ) {
+    return {
+      intercepted: true,
+      action: "allow",
+      reason: `role=${role ?? "unknown"} writable project file operation: ${classification.reason}`,
+    }
+  }
 
   const action = permissionActionForRisk(classification.risk, params.alreadyConfirmed ?? false)
 
@@ -66,8 +101,12 @@ export function permissionPreCheck(params: {
   }
 
   return {
-    intercepted: false,
+    intercepted: true,
     action: "ask",
     reason: `risk=${classification.risk}: ${classification.reason} — requires user confirmation`,
   }
+}
+
+function isProjectWritePermission(permission: string) {
+  return permission === "file_write" || permission === "write" || permission === "edit"
 }

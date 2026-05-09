@@ -52,6 +52,43 @@ describe("capability-action-runner", () => {
     ])
   })
 
+  test("executes project-local python package auto install with PYTHONPATH verification", () => {
+    const calls: unknown[][] = []
+    const result = runCapabilityActions({
+      projectDir: process.cwd(),
+      actions: [action({
+        entry_id: "doc-docx",
+        install_command: [
+          "python3",
+          "-m",
+          "pip",
+          "install",
+          "--target",
+          ".dll-agent/tools/python",
+          "python-docx",
+        ],
+        verify_command: [`python3 -c "import docx"`],
+      })],
+      runner: ((bin: string, args: string[], opts: { env?: Record<string, string> }) => {
+        calls.push([bin, args, opts])
+        return { status: 0, stdout: "ok", stderr: "" }
+      }) as any,
+    })
+
+    expect(result[0].status).toBe("passed")
+    expect(calls[0][0]).toBe("python3")
+    expect(calls[0][1]).toEqual([
+      "-m",
+      "pip",
+      "install",
+      "--target",
+      ".dll-agent/tools/python",
+      "python-docx",
+    ])
+    expect(calls[1][1]).toEqual(["-c", "import docx"])
+    expect((calls[1][2] as { env?: Record<string, string> }).env?.PYTHONPATH).toContain(".dll-agent/tools/python")
+  })
+
   test("writes Result Ledger packet for verified auto install", () => {
     const sessionID = `cap_action_${Date.now()}_${Math.random().toString(16).slice(2)}`
     const result = runCapabilityActions({
@@ -67,6 +104,35 @@ describe("capability-action-runner", () => {
     expect(packets.length).toBe(1)
     expect(packets[0].completion_status).toBe("VERIFIED_COMPLETE")
     expect(packets[0].verification_results[0].name).toBe("which cap")
+  })
+
+  test("reuses verified capability result instead of reinstalling every turn", () => {
+    const sessionID = `cap_action_reuse_${Date.now()}_${Math.random().toString(16).slice(2)}`
+    let calls = 0
+    const first = runCapabilityActions({
+      sessionID,
+      projectDir: process.cwd(),
+      userGoal: "install reusable capability",
+      actions: [action({ entry_id: "reusable-cap", verify_command: ["which reusable-cap"] })],
+      runner: (() => {
+        calls++
+        return { status: 0, stdout: "ok", stderr: "" }
+      }) as any,
+    })
+    const second = runCapabilityActions({
+      sessionID,
+      projectDir: process.cwd(),
+      userGoal: "install reusable capability again",
+      actions: [action({ entry_id: "reusable-cap", verify_command: ["which reusable-cap"] })],
+      runner: (() => {
+        throw new Error("should reuse verified result")
+      }) as any,
+    })
+
+    expect(first[0].status).toBe("passed")
+    expect(second[0].status).toBe("passed")
+    expect(second[0].reason).toContain("reused verified capability result")
+    expect(calls).toBe(2)
   })
 
   test("marks Result Ledger partial when verification fails", () => {
@@ -124,5 +190,18 @@ describe("capability-action-runner", () => {
 
     expect(result[0].status).toBe("blocked")
     expect(result[0].reason).toContain("blocked command")
+  })
+
+  test("blocks python pip auto install without project-local target", () => {
+    const result = runCapabilityActions({
+      projectDir: process.cwd(),
+      actions: [action({ install_command: ["python3", "-m", "pip", "install", "python-docx"] })],
+      runner: (() => {
+        throw new Error("should not run")
+      }) as any,
+    })
+
+    expect(result[0].status).toBe("blocked")
+    expect(result[0].reason).toContain("--target")
   })
 })

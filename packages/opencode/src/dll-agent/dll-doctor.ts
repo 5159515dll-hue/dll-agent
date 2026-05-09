@@ -23,6 +23,10 @@ import { scanArtifactLedger } from "./artifact-ledger"
 import { buildEvidenceSnapshot } from "./evidence-normalizer"
 import { evaluateCompletionReadiness } from "./completion-readiness"
 import { doctorCheck as roleModelDoctorCheck } from "./role-model-registry"
+import { doctorCheckRoleToolPolicy } from "./role-tool-policy"
+import { doctorCheckGoalContracts } from "./goal-contract"
+import { buildTaskObservabilityReport } from "./task-observability"
+import { evaluateRealWorldScenarioSuite } from "./scenario-evaluation"
 import type { RiskLevel } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
 import { execSync } from "child_process"
@@ -108,6 +112,32 @@ function checkPermissionPolicy(): DoctorCheck[] {
   return checks
 }
 
+function checkRoleToolPolicy(): DoctorCheck[] {
+  const result = doctorCheckRoleToolPolicy()
+  return [{
+    name: "role-tool-policy",
+    severity: result.ok ? "PASS" : "FAIL",
+    message: result.ok
+      ? "Role tool policies validate correctly: writable roles can write, reviewers are read-only, high-risk tools require confirmation"
+      : `Role tool policy issues detected: ${result.issues.join("; ")}`,
+    nextAction: result.ok ? null : "Review role-tool-policy.ts and agent permission wiring",
+    evidence: result.ok ? "role-tool-policy smoke test passed" : result.issues.join("; "),
+  }]
+}
+
+function checkGoalContractHealth(): DoctorCheck[] {
+  const result = doctorCheckGoalContracts()
+  return [{
+    name: "goal-contract",
+    severity: result.ok ? "PASS" : "FAIL",
+    message: result.ok
+      ? `Goal Contract storage validates correctly (${result.checked} contract(s) checked)`
+      : `Goal Contract issues detected: ${result.issues.slice(0, 3).join("; ")}`,
+    nextAction: result.ok ? null : "Repair or remove corrupted ~/.dll-agent/sessions/*/goal-contract.json files",
+    evidence: result.ok ? "goal-contract doctor check passed" : result.issues.join("; "),
+  }]
+}
+
 function checkLspStrategy(projectRoot: string): DoctorCheck[] {
   const checks: DoctorCheck[] = []
   const result = lspDoctorCheck(projectRoot)
@@ -156,7 +186,7 @@ function checkEvidenceHealth(): DoctorCheck[] {
       name: "evidence-session-count",
       severity: "WARN",
       message: `${stats.sessionCount} session directories (max 100) — nearing limit`,
-      nextAction: "Run evidence rotation to clean old sessions",
+      nextAction: "Run: dll-agent doctor --repair-safe",
       evidence: `${stats.sessionsDir} (${stats.totalEvidenceFiles} files, ${(stats.totalSizeBytes / 1024).toFixed(1)} KB)`,
     })
   } else {
@@ -184,7 +214,7 @@ function checkEvidenceHealth(): DoctorCheck[] {
       name: "evidence-rotation-needed",
       severity: "WARN",
       message: "Evidence rotation recommended (session count or file count high)",
-      nextAction: "Run: evidence rotation script or dll-agent doctor --rotate",
+      nextAction: "Run: dll-agent doctor --repair-safe",
       evidence: null,
     })
   }
@@ -852,6 +882,57 @@ function checkCapabilityHealth(projectRoot?: string): DoctorCheck[] {
   return checks
 }
 
+function checkObservabilityHealth(projectRoot: string): DoctorCheck[] {
+  const checks: DoctorCheck[] = []
+  try {
+    const report = buildTaskObservabilityReport({
+      sessionID: "doctor-observability-smoke",
+      projectDir: projectRoot,
+      maxEvents: 2,
+    })
+    checks.push({
+      name: "task-observability",
+      severity: "PASS",
+      message: `Task status/trajectory renderer is available (evidence sessions=${report.cleanup.evidence_sessions})`,
+      nextAction: report.cleanup.repair_safe_recommended ? report.cleanup.recommendation : null,
+      evidence: `routing_decisions=${report.routing.decisions}, evidence_events=${report.evidence.total}`,
+    })
+  } catch (error) {
+    checks.push({
+      name: "task-observability",
+      severity: "FAIL",
+      message: "Task status/trajectory renderer failed",
+      nextAction: "Inspect task-observability.ts and /task-status command wiring",
+      evidence: String(error),
+    })
+  }
+  return checks
+}
+
+function checkScenarioEvaluationHealth(): DoctorCheck[] {
+  try {
+    const report = evaluateRealWorldScenarioSuite()
+    const severity: DoctorSeverity = report.fail > 0 || report.false_pass_risk > 0 ? "FAIL" : "PASS"
+    return [{
+      name: "real-world-scenario-evaluation",
+      severity,
+      message: severity === "PASS"
+        ? `Phase 10 regression scenarios pass (${report.pass}/${report.total}); false_pass_risk=${report.false_pass_risk}`
+        : `Phase 10 regression scenario gaps detected (${report.fail}/${report.total} failed, false_pass_risk=${report.false_pass_risk})`,
+      nextAction: severity === "PASS" ? null : "Run scenario-evaluation tests and inspect failed acceptance refs",
+      evidence: `human_intervention=${report.human_intervention_scenarios}, unnecessary_reviewer=${report.unnecessary_reviewer_scenarios}`,
+    }]
+  } catch (error) {
+    return [{
+      name: "real-world-scenario-evaluation",
+      severity: "FAIL",
+      message: "Phase 10 real-world scenario evaluator failed",
+      nextAction: "Inspect scenario-evaluation.ts",
+      evidence: String(error),
+    }]
+  }
+}
+
 // ─── Role Model Health Check ─────────────────────────────────────────────────
 
 function checkRoleModelHealth(projectRoot: string): DoctorCheck[] {
@@ -902,6 +983,8 @@ export function runDoctor(projectRoot?: string): DoctorReport {
 
   // Permission checks
   allChecks.push(...checkPermissionPolicy())
+  allChecks.push(...checkRoleToolPolicy())
+  allChecks.push(...checkGoalContractHealth())
 
   // LSP checks
   allChecks.push(...checkLspStrategy(root))
@@ -921,6 +1004,10 @@ export function runDoctor(projectRoot?: string): DoctorReport {
 
   // Capability system checks
   allChecks.push(...checkCapabilityHealth(root))
+
+  // UX / observability checks
+  allChecks.push(...checkObservabilityHealth(root))
+  allChecks.push(...checkScenarioEvaluationHealth())
 
   const passCount = allChecks.filter((c) => c.severity === "PASS").length
   const warnCount = allChecks.filter((c) => c.severity === "WARN").length

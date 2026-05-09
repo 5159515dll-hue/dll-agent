@@ -55,6 +55,12 @@ describe("DllAgentEvidence rotation (P0-4)", () => {
     expect(content).not.toContain("sk-abcdefghijklmn")
     expect(content).toContain("REDACTED")
   })
+
+  test("does not redact task-completion role names as sk- keys", () => {
+    const result = redact({ role: "task-completion-archivist", text: "task-completion check" })
+    expect(JSON.stringify(result)).toContain("task-completion-archivist")
+    expect(JSON.stringify(result)).not.toContain("task-REDACTED")
+  })
 })
 
 describe("DllAgentEvidence session cleanup", () => {

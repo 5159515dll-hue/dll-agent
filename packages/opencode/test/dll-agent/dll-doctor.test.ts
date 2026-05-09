@@ -53,4 +53,19 @@ describe("dll-doctor", () => {
     const artifactCheck = report.checks.find((c) => c.name === "artifact-ledger")
     expect(artifactCheck).toBeDefined()
   })
+
+  it("task observability check is included", () => {
+    const report = runDoctor(process.cwd())
+    const observability = report.checks.find((c) => c.name === "task-observability")
+    expect(observability).toBeDefined()
+    expect(observability?.severity).toBe("PASS")
+  }, 15_000)
+
+  it("real-world scenario evaluation check is included", () => {
+    const report = runDoctor(process.cwd())
+    const scenario = report.checks.find((c) => c.name === "real-world-scenario-evaluation")
+    expect(scenario).toBeDefined()
+    expect(scenario?.severity).toBe("PASS")
+    expect(scenario?.message).toContain("20")
+  }, 15_000)
 })

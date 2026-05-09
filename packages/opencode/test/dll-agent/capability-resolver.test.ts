@@ -48,6 +48,30 @@ describe("resolveCapability", () => {
     expect(result.requires_user_consent).toBe(false)
   })
 
+  test("project_local_pip installs declared packages into project-local target", () => {
+    const entry = createMinimalEntry({
+      id: "doc-docx",
+      kind: "tool",
+      name: "doc-docx",
+      capabilities: ["docx-read"],
+      status: "missing_dependency",
+      install_strategy: "project_local_pip",
+      requires_install: true,
+      dependencies: { binaries: ["python3"], packages: ["python-docx"] },
+    })
+    const result = resolveCapability(entry)
+    expect(result.action).toBe("auto_install")
+    expect(result.install_command).toEqual([
+      "python3",
+      "-m",
+      "pip",
+      "install",
+      "--target",
+      ".dll-agent/tools/python",
+      "python-docx",
+    ])
+  })
+
   test("auto_install for npx_runtime", () => {
     const entry = createMinimalEntry({
       id: "test-npx",

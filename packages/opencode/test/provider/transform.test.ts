@@ -310,6 +310,87 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
   })
 })
 
+describe("ProviderTransform.normalizeReasoningOptions", () => {
+  const createModel = (
+    providerID: string,
+    apiId: string,
+    npm = "@ai-sdk/openai-compatible",
+    reasoning = true,
+  ) =>
+    ({
+      id: `${providerID}/${apiId}`,
+      providerID,
+      api: {
+        id: apiId,
+        url: "https://example.com/v1",
+        npm,
+      },
+      name: apiId,
+      capabilities: {
+        temperature: true,
+        reasoning,
+        attachment: false,
+        toolcall: true,
+        input: { text: true, audio: false, image: false, video: false, pdf: false },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: false,
+      },
+      cost: {
+        input: 0.001,
+        output: 0.002,
+        cache: { read: 0.0001, write: 0.0002 },
+      },
+      limit: {
+        context: 128000,
+        output: 8192,
+      },
+      status: "active",
+      options: {},
+      headers: {},
+      release_date: "2026-01-01",
+    }) as any
+
+  test("maps max to high for OpenAI-compatible providers that only accept low/medium/high", () => {
+    const result = ProviderTransform.normalizeReasoningOptions(
+      createModel("mimo", "mimo-v2.5-pro"),
+      { reasoningEffort: "max" },
+    )
+
+    expect(result.reasoningEffort).toBe("high")
+    expect(result.reasoning_effort).toBeUndefined()
+  })
+
+  test("keeps max when the provider/model variant explicitly supports max", () => {
+    const result = ProviderTransform.normalizeReasoningOptions(
+      createModel("deepseek", "deepseek-v4-pro"),
+      { reasoningEffort: "max" },
+    )
+
+    expect(result.reasoningEffort).toBe("max")
+  })
+
+  test("removes reasoning effort for unsupported providers", () => {
+    const result = ProviderTransform.normalizeReasoningOptions(
+      createModel("zai", "glm-5.1", "@ai-sdk/openai-compatible", false),
+      { reasoningEffort: "max", reasoningSummary: "auto" },
+    )
+
+    expect(result.reasoningEffort).toBeUndefined()
+    expect(result.reasoning_effort).toBeUndefined()
+    expect(result.reasoningSummary).toBeUndefined()
+  })
+
+  test("normalizes snake_case reasoning_effort from wrapper options", () => {
+    const result = ProviderTransform.normalizeReasoningOptions(
+      createModel("openai-compatible", "custom-reasoning-model"),
+      { reasoning_effort: "max" },
+    )
+
+    expect(result.reasoningEffort).toBe("high")
+    expect(result.reasoning_effort).toBeUndefined()
+  })
+})
+
 describe("ProviderTransform.options - gateway", () => {
   const sessionID = "test-session-123"
 

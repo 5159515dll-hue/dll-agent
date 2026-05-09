@@ -36,7 +36,7 @@ export interface ReportRedactionResult {
 
 const SENSITIVE_HEADER = /^(password|passwd|pwd|token|api[_ -]?key|secret|cookie|authorization|密码|口令|令牌)$/i
 const SECRET_PATTERNS: RegExp[] = [
-  /sk-[A-Za-z0-9_-]{12,}/g,
+  /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}/g,
   /github_pat_[A-Za-z0-9_]+/g,
   /ghp_[A-Za-z0-9_]+/g,
   /Bearer\s+[A-Za-z0-9._-]+/gi,

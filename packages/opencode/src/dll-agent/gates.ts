@@ -15,8 +15,10 @@ import {
 } from "./interfaces"
 import type { MessageV2 } from "@/session/message-v2"
 import { loadResults } from "./result-ledger"
+import { checkResultSufficiency } from "./result-sufficiency-gate"
 import { buildEvidenceSnapshot } from "./evidence-normalizer"
 import { evaluateCompletionReadiness } from "./completion-readiness"
+import { assessGoalCompletion, loadGoalContract } from "./goal-contract"
 
 /** 同一 block reason 在同一 session 中最多允许自动重试次数 */
 export const GATE_MAX_RETRIES = 2
@@ -351,6 +353,43 @@ export function finalGate(params: {
     })
     if (!readiness.can_claim_verified) {
       reasons.push(...readiness.reasons.map((reason) => `completion readiness: ${reason}`))
+    }
+  }
+
+  if (params.sessionID) {
+    const contract = loadGoalContract(params.sessionID)
+    if (contract) {
+      const resultSufficiency = checkResultSufficiency(params.sessionID, contract.user_goal, {
+        requiredVerifications: contract.required_verification,
+        projectDir: params.projectDir,
+      })
+      if (resultSufficiency.verdict !== "sufficient") {
+        reasons.push(
+          `result ledger missing verified result for goal contract: ${resultSufficiency.verdict} (${resultSufficiency.neededActions.join("; ")})`,
+        )
+      }
+      const assessment = assessGoalCompletion({
+        contract,
+        verificationResults: params.evidenceGate.passed
+          ? [{ name: "evidence_gate", status: "passed", evidenceRef: "gate:evidence" }]
+          : [{ name: "evidence_gate", status: "not_run" }],
+        blockers: params.supervisorState.blocked_completion && params.supervisorState.block_reason
+          ? [params.supervisorState.block_reason]
+          : [],
+        budgetExhausted: params.costExceeded,
+      })
+      writeEvidence("goal_contract.evaluated", {
+        task_id: contract.task_id,
+        final_status: assessment.final_status,
+        can_claim_complete: assessment.can_claim_complete,
+        reasons: assessment.reasons,
+        blocking_items: assessment.blocking_items,
+      }, params.sessionID)
+      if (!assessment.can_claim_complete) {
+        reasons.push(
+          `goal contract ${assessment.final_status}: ${assessment.reasons.join("; ")}${assessment.blocking_items.length ? ` (${assessment.blocking_items.join("; ")})` : ""}`,
+        )
+      }
     }
   }
 

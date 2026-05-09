@@ -141,6 +141,25 @@ describe("toolToCapabilityEntry", () => {
     expect(entry.capabilities).toContain("docx-read")
     expect(entry.capabilities).toContain("docx-write")
     expect(entry.input_types).toContain(".docx")
+    expect(entry.install_strategy).toBe("project_local_pip")
+    expect(entry.dependencies?.packages).toEqual(["python-docx"])
+    expect(entry.verify_commands).toEqual([`python3 -c "import docx"`])
+  })
+
+  test("document tools map to project-local package installs, not binary installs", () => {
+    const expectations = [
+      ["pdf", "pypdf", `python3 -c "import pypdf"`],
+      ["ppt-pptx", "python-pptx", `python3 -c "import pptx"`],
+      ["xlsx", "openpyxl", `python3 -c "import openpyxl"`],
+    ]
+    for (const [toolID, pkg, verify] of expectations) {
+      const tool = GLOBAL_DEFAULT_TOOLS.find((t) => t.id === toolID)!
+      const entry = toolToCapabilityEntry(tool)
+      expect(entry.install_strategy).toBe("project_local_pip")
+      expect(entry.dependencies?.packages).toEqual([pkg])
+      expect(entry.dependencies?.packages).not.toContain("python3")
+      expect(entry.verify_commands).toEqual([verify])
+    }
   })
 
   test("github maps with requires_token true", () => {

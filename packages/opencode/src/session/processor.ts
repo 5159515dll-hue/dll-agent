@@ -368,7 +368,7 @@ export const layer: Layer.Layer<
               permission: "doom_loop",
               patterns: [value.toolName],
               sessionID: ctx.assistantMessage.sessionID,
-              metadata: { tool: value.toolName, input: value.input },
+              metadata: { tool: value.toolName, input: value.input, dllAgentRole: ctx.assistantMessage.agent },
               always: [value.toolName],
               ruleset: agent.permission,
             })

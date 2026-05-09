@@ -48,6 +48,7 @@ import { useArgs } from "@tui/context/args"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { WorkspaceLabel, type WorkspaceStatus } from "../workspace-label"
 import { enabled as dllEnabled } from "@/dll-agent/profile"
+import { resolveRoleModel } from "@/dll-agent/role-model-registry"
 
 export type PromptProps = {
   sessionID?: string
@@ -1132,7 +1133,13 @@ export function Prompt(props: PromptProps) {
   const agentLabel = createMemo(() => {
     const agent = local.agent.current()
     if (!agent) return ""
-    if (dllEnabled() && agent.name === "commander") return "DeepSeek Commander"
+    if (dllEnabled() && agent.name === "commander") {
+      const projectDir = project.instance.path().worktree || project.instance.directory()
+      const effective = resolveRoleModel("commander", props.sessionID, projectDir)
+      const slash = effective.primary.indexOf("/")
+      const model = slash === -1 ? effective.primary : effective.primary.slice(slash + 1)
+      return `Commander: ${model} [${effective.source}]`
+    }
     return Locale.titlecase(agent.name)
   })
 

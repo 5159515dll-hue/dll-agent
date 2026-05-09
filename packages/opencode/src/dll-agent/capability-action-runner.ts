@@ -10,7 +10,7 @@ import { spawnSync } from "child_process"
 import path from "path"
 import type { CapabilityAction } from "./capability-orchestrator"
 import { write as writeEvidence } from "./evidence"
-import { buildResultPacket, writeResult } from "./result-ledger"
+import { buildResultPacket, loadResults, writeResult, type ResultPacket } from "./result-ledger"
 
 export interface CapabilityActionRun {
   entry_id: string
@@ -68,6 +68,10 @@ function isSafeAutoInstallCommand(command: string[], projectDir: string): { ok: 
       return { ok: false, reason: "pip auto-install requires a project-local virtualenv" }
     }
   }
+  if (bin === "python" || bin === "python3") {
+    const pipTarget = safePythonPipTarget(args, projectDir)
+    if (!pipTarget.ok) return pipTarget
+  }
   if (!["bun", "npm", "pnpm", "yarn", "pip", "pip3", "python", "python3", "npx"].includes(bin)) {
     return { ok: false, reason: `command is not in auto-install allowlist: ${bin}` }
   }
@@ -75,7 +79,51 @@ function isSafeAutoInstallCommand(command: string[], projectDir: string): { ok: 
 }
 
 function splitCommand(command: string): string[] {
-  return command.trim().split(/\s+/).filter(Boolean)
+  const result: string[] = []
+  let current = ""
+  let quote: '"' | "'" | undefined
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    if ((ch === `"` || ch === "'") && !quote) {
+      quote = ch
+      continue
+    }
+    if (ch === quote) {
+      quote = undefined
+      continue
+    }
+    if (!quote && /\s/.test(ch)) {
+      if (current) result.push(current)
+      current = ""
+      continue
+    }
+    current += ch
+  }
+  if (current) result.push(current)
+  return result
+}
+
+function safePythonPipTarget(args: string[], projectDir: string): { ok: boolean; reason: string } {
+  const isPipInstall = args[0] === "-m" && args[1] === "pip" && args[2] === "install"
+  if (!isPipInstall) return { ok: true, reason: "safe python command" }
+  const targetIndex = args.findIndex((arg) => arg === "--target")
+  if (targetIndex === -1 || !args[targetIndex + 1]) {
+    return { ok: false, reason: "python pip auto-install requires --target inside the project" }
+  }
+  const target = path.resolve(projectDir, args[targetIndex + 1])
+  const allowed = path.resolve(projectDir, ".dll-agent", "tools", "python")
+  if (target !== allowed && !target.startsWith(`${allowed}${path.sep}`)) {
+    return { ok: false, reason: "python pip --target must stay under .dll-agent/tools/python" }
+  }
+  return { ok: true, reason: "safe project-local python target install" }
+}
+
+function childEnv(projectDir: string) {
+  const pythonPath = path.resolve(projectDir, ".dll-agent", "tools", "python")
+  return {
+    ...process.env,
+    PYTHONPATH: process.env.PYTHONPATH ? `${pythonPath}${path.delimiter}${process.env.PYTHONPATH}` : pythonPath,
+  }
 }
 
 function isSafeVerifyCommand(command: string[]): { ok: boolean; reason: string } {
@@ -113,6 +161,7 @@ function runVerifyCommands(
       encoding: "utf8",
       timeout: input.timeoutMs ?? 120_000,
       shell: false,
+      env: childEnv(input.projectDir),
     })
     results.push({
       command: raw,
@@ -123,6 +172,21 @@ function runVerifyCommands(
     })
   }
   return results
+}
+
+function findReusableCapabilityResult(sessionID: string | undefined, action: CapabilityAction): ResultPacket | undefined {
+  if (!sessionID) return undefined
+  return loadResults(sessionID)
+    .filter((packet) =>
+      packet.executing_role === "executor" &&
+      packet.model === "dll-agent-capability-runner" &&
+      packet.completion_status === "VERIFIED_COMPLETE" &&
+      packet.reusable &&
+      !packet.stale &&
+      packet.subtask_goal === `Install and verify capability ${action.entry_id}` &&
+      packet.evidence_refs.includes("capability.actions")
+    )
+    .at(-1)
 }
 
 function maybeWriteResultLedger(
@@ -187,6 +251,26 @@ export function runCapabilityActions(input: CapabilityActionRunInput): Capabilit
       })
       continue
     }
+    const reusable = findReusableCapabilityResult(input.sessionID, action)
+    if (reusable) {
+      const run: CapabilityActionRun = {
+        entry_id: action.entry_id,
+        action: action.type,
+        status: "passed",
+        reason: `reused verified capability result ${reusable.packet_id}`,
+        verification: reusable.verification_results.map((verification) => ({
+          command: verification.name,
+          status: verification.status === "passed" ? "passed" : verification.status === "failed" ? "failed" : "not_run",
+          reason: `reused from ${reusable.packet_id}`,
+        })),
+      }
+      writeEvidence("capability.action_reused", {
+        entry_id: action.entry_id,
+        packet_id: reusable.packet_id,
+      }, input.sessionID)
+      results.push(run)
+      continue
+    }
     if (!action.auto_allowed || action.risk_level === "high") {
       results.push({
         entry_id: action.entry_id,
@@ -224,6 +308,7 @@ export function runCapabilityActions(input: CapabilityActionRunInput): Capabilit
       encoding: "utf8",
       timeout: timeoutMs,
       shell: false,
+      env: childEnv(input.projectDir),
     })
     const installRun: CapabilityActionRun = {
       entry_id: action.entry_id,

@@ -25,7 +25,8 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { zod } from "@/util/effect-zod"
 import { withStatics, type DeepMutable } from "@/util/schema"
 import { enabled as dllEnabled, autoAllowAll as dllAutoAllow, writeEvidence as dllLogEvidence, roleRoster as dllRoleRoster } from "@/dll-agent/profile"
-import { resolveRoleModel } from "@/dll-agent/role-model-registry"
+import { resolveRoleModel, type DllRole } from "@/dll-agent/role-model-registry"
+import { isReadOnlyRole, permissionConfigForRole } from "@/dll-agent/role-tool-policy"
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -256,10 +257,11 @@ export const layer = Layer.effect(
           // Uses project and global config overrides via resolveRoleModel().
           // Session overrides are not available at agent registration time;
           // they take effect via supervisor.ts auto-triggers and command execution.
-          const roleModel = (role: string) => {
-            const effective = resolveRoleModel(role as any, undefined, ctx.directory)
+          const roleModel = (role: DllRole) => {
+            const effective = resolveRoleModel(role, undefined, ctx.directory)
             return Provider.parseModel(effective.primary)
           }
+          const rolePermission = (role: DllRole) => Permission.fromConfig(permissionConfigForRole(role))
 
           // Phase 5 fix: dll-agent 自动放行所有权限 —— dllAllowAll 必须放在 user 之后，
           // 因为 Permission.evaluate 用 findLast，最末规则胜出。否则 defaults 中的
@@ -280,6 +282,7 @@ export const layer = Layer.effect(
               }),
               user,
               dllAllowAll,
+              rolePermission("commander"),
             ),
             options: {},
           }
@@ -291,30 +294,9 @@ export const layer = Layer.effect(
             model: roleModel("chief-engineer"),
             prompt:
               "You are the dll-agent chief engineer subagent. Execute concrete engineering work, diagnose failures, use tools, install project-local dependencies when needed, and verify with real commands. Every claim must cite evidence.",
-            permission: Permission.merge(defaults, user, dllAllowAll),
+            permission: Permission.merge(defaults, user, dllAllowAll, rolePermission("chief-engineer")),
             options: {},
           }
-          // Inspector reviewers are read-only by design: deny bash/edit/webfetch/websearch
-          // appended AFTER dllAllowAll so they win (Permission.evaluate uses findLast).
-          // Allowed tools: read, grep, glob, list — sufficient for intent / context alignment review.
-          const inspectorLockdown = Permission.fromConfig({
-            bash: "deny",
-            edit: "deny",
-            write: "deny",
-            patch: "deny",
-            task: "deny",
-            todowrite: "deny",
-            webfetch: "deny",
-            websearch: "deny",
-          })
-          const readOnlyAuditLockdown = Permission.fromConfig({
-            bash: "deny",
-            edit: "deny",
-            write: "deny",
-            patch: "deny",
-            task: "deny",
-            todowrite: "deny",
-          })
           agents["requirements-inspector"] = {
             name: "requirements-inspector",
             description: "dll-agent requirements inspector. GLM Chinese intent, rule, and logic checker.",
@@ -329,7 +311,7 @@ export const layer = Layer.effect(
               Permission.fromConfig({ edit: "deny", read: "allow" }),
               user,
               dllAllowAll,
-              inspectorLockdown,
+              rolePermission("requirements-inspector"),
             ),
             options: {},
           }
@@ -347,7 +329,7 @@ export const layer = Layer.effect(
               Permission.fromConfig({ edit: "deny", read: "allow" }),
               user,
               dllAllowAll,
-              inspectorLockdown,
+              rolePermission("long-context-archivist"),
             ),
             options: {},
           }
@@ -365,7 +347,7 @@ export const layer = Layer.effect(
               Permission.fromConfig({ webfetch: "allow", websearch: "allow", read: "allow" }),
               user,
               dllAllowAll,
-              readOnlyAuditLockdown,
+              rolePermission("final-auditor"),
             ),
             options: {},
           }
@@ -380,15 +362,10 @@ export const layer = Layer.effect(
               "Temporarily inspect the task from another role's viewpoint. This is not a permanent role change. Gather missing information, find blind spots, propose actionable fixes, and then return control to the normal role roster.",
             permission: Permission.merge(
               defaults,
-              Permission.fromConfig({
-                edit: "deny",
-                bash: "allow",
-                webfetch: "allow",
-                websearch: "allow",
-                read: "allow",
-              }),
+              Permission.fromConfig({ webfetch: "allow", websearch: "allow", read: "allow" }),
               user,
               dllAllowAll,
+              rolePermission("role-cross"),
             ),
             options: {},
           }
@@ -414,7 +391,7 @@ export const layer = Layer.effect(
               }),
               user,
               dllAllowAll,
-              inspectorLockdown, // read-only: denies bash/edit/write/patch/task
+              rolePermission("multimodal-context-interpreter"),
             ),
             options: {},
           }
@@ -433,6 +410,7 @@ export const layer = Layer.effect(
               Permission.fromConfig({ question: "allow", plan_enter: "allow" }),
               user,
               dllAllowAll,
+              rolePermission("executor"),
             ),
             options: {},
           }
@@ -483,12 +461,9 @@ export const layer = Layer.effect(
             "compaction",
             "explore",
             "plan",
-            "requirements-inspector",
-            "long-context-archivist",
-            "final-auditor",
           ])
           for (const name in agents) {
-            if (skip.has(name)) continue
+            if (skip.has(name) || isReadOnlyRole(name)) continue
             agents[name].permission = Permission.merge(agents[name].permission, dllAllowAll)
           }
         }

@@ -119,8 +119,9 @@ function generateInstallCommand(entry: CapabilityEntry): string[] | undefined {
     case "project_local_npm":
       return ["bun", "add", "-d", entry.id]
     case "project_local_pip": {
-      const pkgs = entry.dependencies?.packages ?? entry.dependencies?.binaries ?? [entry.id]
-      return ["pip", "install", ...pkgs]
+      const pkgs = entry.dependencies?.packages ?? []
+      if (pkgs.length === 0) return undefined
+      return ["python3", "-m", "pip", "install", "--target", ".dll-agent/tools/python", ...pkgs]
     }
     case "user_local_binary":
       return undefined // Needs custom download logic, ask permission

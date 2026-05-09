@@ -206,7 +206,7 @@ export const COOLDOWN_CONFIG = {
   /** 最小 step 间隔 */
   min_step_interval: 2,
   /** 单轮最多自动触发的 reviewer 数量 */
-  max_reviewers_per_round: 5,
+  max_reviewers_per_round: 1,
   /** 每个 reviewer 每 session 最大调用次数 */
   max_calls_per_reviewer: 5,
   /** 全局每 session 最大 reviewer 调用次数 */
@@ -403,9 +403,22 @@ export type EvidenceRecordType =
   | "cost.cap_exceeded"
   | "cooldown.skipped"
   | "llm.call"
+  | "model.routing_decision"
   | "agent.profile.enabled"
   | "agent.get"
   | "system.environment"
+  // Goal Contract evidence types
+  | "goal_contract.created"
+  | "goal_contract.updated"
+  | "goal_contract.refined"
+  | "goal_contract.evaluated"
+  | "continuation_gate.blocked"
+  | "continuation_gate.consumed"
+  | "continuation_gate.dispatched"
+  | "continuation_gate.budget_exhausted"
+  | "recovery.decision"
+  | "recovery.prompt_injected"
+  | "recovery.blocked"
   // Phase 7: Result Ledger evidence types
   | "result.produced"
   | "result.reused"

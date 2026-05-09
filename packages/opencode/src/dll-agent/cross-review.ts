@@ -18,6 +18,7 @@
  */
 
 import type { ReviewerRole, RiskLevel, ReviewerOutput, TriggerDecision } from "./interfaces"
+import type { ResultPacket } from "./result-ledger"
 
 // ─── Council Trigger Types ──────────────────────────────────────────────────
 
@@ -44,6 +45,7 @@ export interface CouncilPacket {
   filesChanged: string[]
   commandsRun: { command: string; result: string }[]
   verificationResults: { command: string; status: "passed" | "failed" | "not_run"; output?: string }[]
+  resultLedger: CouncilResultLedgerSnapshot
   failures: { type: string; fingerprint: string; attempts: number }[]
   recoveryAttempts: number
   reviewerHistory: { reviewer: ReviewerRole; verdict: string; completed: boolean }[]
@@ -56,6 +58,18 @@ export interface CouncilPacket {
   decisionNeeded: string
   triggerReason: CouncilTriggerReason
   riskLevel: RiskLevel
+}
+
+export interface CouncilResultLedgerSnapshot {
+  verifiedResults: { packetId: string; role: string; goal: string; files: string[] }[]
+  partialResults: { packetId: string; role: string; goal: string; unresolvedItems: string[] }[]
+  failedResults: { packetId: string; role: string; goal: string; risks: string[] }[]
+  staleResults: { packetId: string; role: string; goal: string; reason: string | null }[]
+  reusablePacketIds: string[]
+  evidenceRefs: string[]
+  filesChanged: string[]
+  unresolvedItems: string[]
+  summary: string
 }
 
 // ─── Council Review Request ─────────────────────────────────────────────────
@@ -234,12 +248,76 @@ export function validateCouncilPacket(packet: CouncilPacket): {
   if (packet.failures.length === 0 && packet.triggerReason !== "user_correction") {
     missing.push("failures (expected for non-correction trigger)")
   }
+  if (!packet.resultLedger) missing.push("result_ledger")
   if (!packet.decisionNeeded) missing.push("decision_needed")
-  if (packet.evidenceRefs.length === 0 && packet.triggerReason !== "user_correction") {
+  if (
+    packet.evidenceRefs.length === 0 &&
+    (packet.resultLedger?.evidenceRefs.length ?? 0) === 0 &&
+    packet.triggerReason !== "user_correction"
+  ) {
     missing.push("evidence_refs")
   }
 
   return { valid: missing.length === 0, missingFields: missing }
+}
+
+export function summarizeCouncilResultLedger(results: ResultPacket[], limit = 8): CouncilResultLedgerSnapshot {
+  const recent = [...results]
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, limit)
+  const verifiedResults = recent
+    .filter((result) => result.completion_status === "VERIFIED_COMPLETE" && result.reusable && !result.stale)
+    .map((result) => ({
+      packetId: result.packet_id,
+      role: result.executing_role,
+      goal: result.subtask_goal,
+      files: result.files_changed.map((file) => file.filePath),
+    }))
+  const partialResults = recent
+    .filter((result) => result.completion_status === "PARTIAL")
+    .map((result) => ({
+      packetId: result.packet_id,
+      role: result.executing_role,
+      goal: result.subtask_goal,
+      unresolvedItems: result.unresolved_items,
+    }))
+  const failedResults = recent
+    .filter((result) => result.completion_status === "FAILED" || result.completion_status === "BLOCKED")
+    .map((result) => ({
+      packetId: result.packet_id,
+      role: result.executing_role,
+      goal: result.subtask_goal,
+      risks: result.known_risks,
+    }))
+  const staleResults = recent
+    .filter((result) => result.stale || result.completion_status === "STALE" || result.completion_status === "INVALIDATED")
+    .map((result) => ({
+      packetId: result.packet_id,
+      role: result.executing_role,
+      goal: result.subtask_goal,
+      reason: result.invalidation_reason ?? null,
+    }))
+  const evidenceRefs = [...new Set(recent.flatMap((result) => result.evidence_refs))].slice(0, 20)
+  const filesChanged = [...new Set(recent.flatMap((result) => result.files_changed.map((file) => file.filePath)))].slice(0, 20)
+  const unresolvedItems = [...new Set(recent.flatMap((result) => result.unresolved_items))].slice(0, 20)
+
+  return {
+    verifiedResults,
+    partialResults,
+    failedResults,
+    staleResults,
+    reusablePacketIds: verifiedResults.map((result) => result.packetId),
+    evidenceRefs,
+    filesChanged,
+    unresolvedItems,
+    summary: [
+      `verified=${verifiedResults.length}`,
+      `partial=${partialResults.length}`,
+      `failed_or_blocked=${failedResults.length}`,
+      `stale_or_invalidated=${staleResults.length}`,
+      `evidence_refs=${evidenceRefs.length}`,
+    ].join(", "),
+  }
 }
 
 // ─── Review Independence Check ──────────────────────────────────────────────

@@ -187,7 +187,10 @@ export function queryResults(
       if (!hasOverlap) return false
     }
     if (filter.since && r.created_at < filter.since) return false
-    if (filter.reusable_only && !r.reusable) return false
+    if (filter.reusable_only) {
+      if (!r.reusable) return false
+      if (r.stale || r.completion_status === "STALE" || r.completion_status === "INVALIDATED") return false
+    }
     return true
   })
 }

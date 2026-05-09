@@ -25,8 +25,17 @@ triggers.ts ──→ supervisor.ts ──→ gates.ts ──→ final completio
 **代码模式**: ✅ flat exports (P0-1: 已移除 self-reexport, 改为 flat named exports)。
 
 ### gates.ts
-Evidence gate、reconciliation gate、final completion gate 的判定标准。所有 gate 判断基于代码，部分需要模型辅助时通过 reviewer 完成。
+Evidence gate、reconciliation gate、Goal Contract gate、final completion gate 的判定标准。所有 gate 判断基于代码，部分需要模型辅助时通过 reviewer 完成。
 **代码模式**: ✅ flat exports (P0-1: 已移除 self-reexport, 改为 flat named exports)。
+
+### goal-contract.ts (Phase 1.1)
+最小 Goal Contract runtime：持久化 user goal、success criteria、success criteria status、non-goals、constraints、required verification、active plan，并提供 `assessGoalCompletion()` 给 task-state、final gate、continuation gate 使用。
+- 原始 `user_goal` 创建后不覆盖；后续只允许 append/refine criteria、non-goals、constraints、required verification。
+- `pending` / `blocked` success criteria 和 active plan 会阻断 final PASS。
+- `non_blocking` follow-up 不阻断 verified complete。
+- 缺 required verification 时只能是 `UNVERIFIED_PARTIAL` 或继续执行，不能写 verified complete。
+- 创建、更新、refine、评估均写入脱敏 evidence。
+**状态**: implemented_runtime_verified（Phase 1.1）。
 
 ### evidence.ts
 Evidence 日志系统：自动脱敏、写入 evidence file。
@@ -78,15 +87,33 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 
 ### actionable-error.ts (NEW — Phase 3)
 可执行错误构建器：将 raw error 转换为分类后的可执行建议。
-- 自动分类 14 种错误类型（typecheck_error、test_failure、permission_denied 等）
+- 自动分类 16 种错误类型（typecheck_error、test_failure、permission_denied、config_error、provider_normalization_error 等）
 - 输出包含：what failed、why likely、next automatic action、user action if required
 - 生成 failure fingerprint 用于去重
 **代码模式**: ✅ flat exports。
+
+### recovery-loop.ts (Phase 3)
+Autonomous Recovery Loop 最小 runtime policy：从真实 tool failure 中提取失败、分类、生成 fingerprint、检查 recovery budget，并决定 commander 自动继续、升级 reviewer、还是输出 blocked report。
+- 普通 typecheck/test/import/path/config/provider normalization 错误默认自动继续。
+- 同一 failure fingerprint 第二次升级 `chief-engineer`，第三次升级 `role-cross`。
+- permission denied、secrets/token/login、破坏性命令、push/release/upload、全局系统修改、高成本/预算阻断输出 `BLOCKED_USER_REQUIRED` 或 `BLOCKED_BUDGET_EXHAUSTED`。
+- prompt supervisor loop 已接入：写 `recovery.decision` evidence，自动恢复 hint 注入 commander，必要 reviewer 进入 subtask 队列。
+**状态**: implemented_runtime_verified（Phase 3 最小闭环）。
+
+### result-ledger.ts / deduplication-gate.ts / result-sufficiency-gate.ts (Phase 4)
+Result Ledger / Dedup Hard-block / Stale Detection 最小 runtime policy：用结构化 `ResultPacket` 传递已完成工作，避免模型重复执行已经 verified 的任务。
+- `queryResults(..., { reusable_only: true })` 会排除 stale / invalidated packet，即使旧 packet 的 `reusable` 标记没有同步更新。
+- `checkResultSufficiency()` 会把缺 evidence refs 或缺 passed verification 的 `VERIFIED_COMPLETE` 降级为 `sufficient_but_unverified`，不能直接复用为最终完成证据。
+- `files_changed[].hashAfter` 会和当前文件 bytes 做 sha256 对比；hash 变化时 verdict 为 `stale`，写入 `result.stale_detected` evidence。
+- `buildDedupDispatchDecision()` 将 `reuse_existing` 转换为 dispatch hard skip；reviewer dispatch 已跳过重复 reviewer，commander final claim 必须明确复用已有 packet 或给出 redo justification。
+- `finalGate()` 在存在 Goal Contract 时要求匹配的 `VERIFIED_COMPLETE` ResultPacket；自然语言 summary 不能替代 Result Ledger。
+**状态**: implemented_runtime_verified（Phase 4 最小闭环）。低层 tool-call 全局拦截、跨 session 结果共享、cross-review council 消费 ledger 仍是 partial/missing。
 
 ### cross-review.ts (NEW — Phase 5)
 多模型对抗交叉审查系统（Cross-Review Council）。
 - 触发条件：重复失败、reviewer 冲突、高风险完成、证据不足、用户纠偏
 - 结构化 council packet — 所有 reviewer 基于同一证据判断
+- Council packet 读取同 session Result Ledger snapshot，包含 verified/partial/failed/stale result、reusable packet id、evidence refs、unresolved items，避免 reviewer 忽略已有结果。
 - Reviewer 输出结构化（blocking、confidence、findings、required_verification）
 - role-cross 仲裁冲突（基于 evidence，不是投票）
 - council 受 cooldown 和 cost guard 限制
@@ -94,14 +121,30 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 
 ### role-model-registry.ts (NEW — Phase 8)
 统一 Role Model Registry：所有 dll-agent 角色的模型来源走同一个解析逻辑。
-- 三层覆盖：session override > project override > global override > built-in default
+- 覆盖顺序：TUI/`/role-model-set` explicit session override > session override > project override > global override > built-in default > Provider default fallback
 - 支持 11 个角色（含 3 个 future role）
 - Fallback chain 解析：primary 不可用时自动使用 fallback
-- Provider 可用性检测（API key env var check）
+- Provider 可用性 hint（API key env var check，仅诊断；最终以 OpenCode Provider.Service 为准）
 - Voice/TTS 模型 guard（禁止用于 coding role）
 - 配置冲突检测（global + project 同时定义同一角色）
 - 所有模型变更写入 evidence
 **代码模式**: ✅ flat exports。
+
+### Correctness-Aware Model Routing Policy (P1)
+模型路由目标不是单纯少调用模型，而是在用户目标完成、正确性、evidence 充分性和安全边界优先的前提下，拦截重复、过期、无证据、无触发条件、低价值的模型调用。
+- 普通低风险任务默认 commander 单独执行。
+- 用户纠偏必须触发 requirements-inspector。
+- repeated failure 必须升级 chief-engineer / role-cross。
+- final claim 缺 evidence 必须触发 final gate / verifier；高风险 final claim 可触发 final-auditor。
+- high-risk provider/routing/gate/evidence/permission 修改允许 2-3 个必要 reviewer，不受低风险默认 1 reviewer 限制。
+- 每次 commander/reviewer/subtask/fallback/skipped reviewer 都写 `model.routing_decision` evidence，包含 correctness_reason 与 cost_reason。
+
+### Provider request normalization (P0)
+`reasoningEffort` 的最终兜底在 `session/llm.ts` 合并 model/agent/variant options 后执行，再进入 `ProviderTransform.providerOptions()`。
+- provider/model 支持 `max` 时保留。
+- provider/model 只支持 `low|medium|high` 时 `max -> high`。
+- provider/model 不支持 reasoning effort 时删除该字段。
+- registry 或 wrapper 仍带 `max` 时也不会发送非法 `reasoning_effort=max`。
 
 ## 实现状态
 
@@ -134,7 +177,7 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 | 结构化输出 | `skill-loader.ts:SkillActivationOutput` | 每个技能激活产出结构化报告 |
 | Bash 命令拦截 | `skills.ts:checkForbiddenCommand()` | 技能 forbiddenCommands 硬阻断 |
 | dll-agent profile | `profile.ts` | quality/verify mode、role roster、system prompt |
-| Auto-allow-all | `profile.ts:autoAllowAll()` + `agent/agent.ts` | dll-agent 启用后自动放行所有工具权限 |
+| Risk-based permission precheck | `permission-bridge.ts` + `permission-classifier.ts` + `role-tool-policy.ts` | dll-agent 启用后自动放行低风险/commander 项目内普通写入；高风险 push/sudo/secrets/destructive 仍强制 ask；read-only reviewer 写入 deny |
 | MCP 管理器 | `mcp-manager.ts` | 配置驱动声明、按需启动、互斥锁、healthcheck、degrade/cooldown |
 | MCP 管理桥接 | `mcp-manager.ts:fromCatalogRegistration()` | 桥接 tool-catalog → mcp-manager，提供 McpRegistration 类型 |
 | 脚本工具箱 | `toolbox.ts` | 9 个内置脚本（typecheck/test/python/doctor/git-diff/quota/smoke），+ tools/MCP doctor 检查 |
@@ -155,6 +198,10 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 | **Tool prompt 注入 (NEW)** | `prompt.ts` | buildPromptIndex() 注入 system prompt array，≤1200 chars |
 | **Actionable error 接入 (NEW)** | `prompt.ts` | buildActionableError() 在 gate block 时注入 recovery suggestion |
 | **Continuation Gate (NEW)** | `continuation-gate.ts` + `prompt.ts` | Kimi task-completion-archivist 检查 blocking unfinished items；continuation packet 生成；budget 控制；在 evidence gate 前运行 |
+| **Goal Contract Gate (Phase 1.1)** | `goal-contract.ts` + `task-state.ts` + `gates.ts` + `continuation-gate.ts` + `prompt.ts` | commander 首轮创建 Goal Contract；task-state 暴露 goal_status；final gate/continuation gate 读取 contract，未满足 success criteria、active plan 或 verification 时不允许 final PASS |
+| **Completion / Continuation Closure (Phase 2)** | `continuation-gate.ts` + `prompt.ts` | final report 前运行 continuation check；active plan、verification not_run、doctor failed、reviewer block 会生成 continuation packet；packet 可形成 commander/chief-engineer/requirements-inspector dispatcher action；budget exhausted 输出 BLOCKED report |
+| **Autonomous Recovery Loop (Phase 3)** | `recovery-loop.ts` + `actionable-error.ts` + `prompt.ts` | 从 tool failure 生成恢复决策；普通错误自动继续；repeated fingerprint 升级 chief-engineer/role-cross；权限/secrets/破坏性/发布/预算问题输出 blocked report |
+| **Result Ledger / Dedup Hard-block (Phase 4)** | `result-ledger.ts` + `result-sufficiency-gate.ts` + `deduplication-gate.ts` + `gates.ts` + `prompt.ts` | verified result 可复用；缺 evidence/verification 的结果不能复用为完成；hash changed 判 stale；重复 reviewer dispatch 硬跳过；Goal Contract final PASS 必须有 verified ResultPacket |
 | **Tool-prompt project overlay (NEW)** | `prompt.ts` | loadProjectOverlay() + buildEffectiveManifest() 替换 buildGlobalEffective()，项目级工具配置生效 |
 | **UX state TUI 接入 (NEW)** | `dll-agent-panel.tsx` | uxLine() memo 驱动 buildCompactSummary()，TUI 面板实时显示 task/supervisor/cost 状态 |
 | **Capability Runtime Orchestrator (NEW)** | `capability-orchestrator.ts` + `capability-action-runner.ts` + `prompt.ts` | 用户目标 → registry merge → capability plan → resolver → low-risk action runner / skill intents / MCP requests / gate context；在 `resolveTools()` 前通过 OpenCode `MCP.Service.add()` 接入可自动连接 MCP |
@@ -167,6 +214,158 @@ LSP 预热策略：检测项目主语言，只预热主语言 LSP，辅助语言
 | **Session Gate Reconciler (NEW)** | `session-reconciler.ts` + `prompt.ts` | resumed/long session 中旧的 no-evidence gate block 会在发现 artifact/result evidence 后清理或重分类，避免历史状态导致无限卡住 |
 | **Artifact Result Backfill (NEW)** | `artifact-result-ledger.ts` + `evidence-normalizer.ts` | artifact report/screenshots/scripts 自动补写 Result Ledger，避免 live task 有报告但 `results.jsonl` 为空 |
 | **Task Artifact State TUI (NEW)** | `task-state.ts` + `capability-status.ts` + `sidebar/capability.tsx` | sidebar 显示由 artifact/result/supervisor 推导出的 task verified/partial/blocked 状态，抵消模型 Todo 过期问题 |
+
+### Phase 1.1 Goal Contract 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| Goal Contract 持久化 user goal | implemented_runtime_verified | `ensureGoalContract()` 在 commander prompt path 创建；已测试不覆盖原始目标 |
+| append/refine criteria/non-goals/constraints/verification | implemented_runtime_verified | `refineGoalContract()` 只追加/更新结构化字段，不替换 `user_goal` |
+| success criteria status 驱动 gate | implemented_runtime_verified | `pending` / `blocked` criteria 使 `assessGoalCompletion()` 返回 `CONTINUATION_REQUIRED` |
+| active plan tracking | implemented_runtime_verified | `updateGoalPlan()` + task-state + continuation gate 读取 active plan |
+| Final Gate 读取 Goal Contract | implemented_runtime_verified | `finalGate()` 写入 `goal_contract.evaluated` evidence，未满足 contract 时阻断 PASS |
+| Continuation Gate 读取 Goal Contract | implemented_runtime_verified | final report 文本无 unfinished marker 时，contract 中 pending plan 仍会生成 continuation packet |
+| non-blocking follow-up | implemented_runtime_verified | `non_blocking` plan/criteria 不阻断 verified complete |
+| required verification 缺失 | implemented_runtime_verified | `assessGoalCompletion()` 返回 `UNVERIFIED_PARTIAL`，不能 claim verified complete |
+| 自动 continuation dispatch | implemented_runtime_verified | Continuation packet 被转换为 dispatcher-ready action；commander action 作为 synthetic hint，chief-engineer/requirements-inspector action 会进入 reviewer subtask 队列 |
+| Goal Contract doctor check | implemented_runtime_verified | doctor 检查 schema/必需字段；warn/failed 语义不伪装 |
+
+### Phase 2 Completion / Continuation Gate 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| Final report 前 continuation check | implemented_runtime_verified | `prompt.ts` 在 evidence gate 前调用 `checkContinuationGate()` |
+| active plan 未完成阻断 PASS | implemented_runtime_verified | Goal Contract pending plan 生成 `PARTIAL_CONTINUED` packet |
+| required verification not_run 阻断 verified complete | implemented_runtime_verified | 有 Goal Contract required verification 且无真实验证证据时生成 continuation packet |
+| doctor failed 阻断 PASS | implemented_runtime_verified | `blocked_completion + block_reason` 进入 continuation assessment |
+| reviewer block 阻断 PASS | implemented_runtime_verified | reviewer block reason 进入 continuation packet 的 reviewer_blocks |
+| final report 状态表 false positive | implemented_runtime_verified | Markdown 状态表中的 PASS/PARTIAL/FAIL 不会单独触发 blocking unfinished |
+| non-blocking follow-up | implemented_runtime_verified | 有验证证据时 non-blocking plan/follow-up 不阻断完成 |
+| continuation packet dispatcher action | implemented_runtime_verified | `buildContinuationDispatchPlan()` 支持 commander、chief-engineer、requirements-inspector |
+| budget exhausted blocked report | implemented_runtime_verified | `buildBudgetExhaustedReport()` 输出 `BLOCKED_BUDGET_EXHAUSTED`，明确禁止 claim `VERIFIED_COMPLETE` |
+| full autonomous recovery loop | partial_runtime | Phase 3 已完成最小 runtime recovery policy；完整工具执行闭环仍依赖 commander/reviewer 后续执行与验证 |
+
+### Phase 3 Autonomous Recovery Loop 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| failure classifier | implemented_runtime_verified | `actionable-error.ts` 分类 typecheck/test/permission/gate/reviewer/dependency/path/config/provider normalization 等错误 |
+| failure fingerprint | implemented_runtime_verified | `buildFailureFingerprint()` 归一化路径和数字；`recovery-loop.ts` 用 fingerprint 追踪 repair budget |
+| recovery budget | implemented_runtime_verified | `repair_counts` 按 fingerprint 计数；超限输出 `BLOCKED_BUDGET_EXHAUSTED` |
+| automatic repair loop policy | implemented_runtime_verified | recoverable failure 注入 `dll-agent-recovery-loop` hint，要求 commander 继续修复并验证 |
+| verification loop guidance | implemented_runtime_verified | recovery decision 带 `verification` 列表，如 rerun typecheck/tests/provider smoke |
+| repeated failure escalation | implemented_runtime_verified | 同 fingerprint 第二次 -> chief-engineer，第三次 -> role-cross |
+| blocked with evidence | implemented_runtime_verified | permission/secrets/destructive/push/global/budget 阻断写 `recovery.blocked` evidence |
+| no-stop-on-normal-error policy | implemented_runtime_verified | 普通 typecheck/test/config/provider normalization 错误不要求用户介入 |
+| actual code patch execution | partial_runtime | Phase 3 负责 runtime policy 和 prompt/subtask dispatch；具体修复仍由 commander/reviewer tool loop 执行并受权限策略约束 |
+
+### Phase 10 Real-World Scenario Evaluation 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 20 个真实任务验收场景 | implemented_runtime_verified | `scenario-evaluation.ts` 固化普通短任务、用户纠偏、测试失败、typecheck 失败、repeated failure、final evidence 缺失、未完成计划、result reuse/stale、高风险 provider/routing、权限/secrets、MiMo 多模态、MiMo fallback、role-model-set、doctor failed、doctor --repair-safe、final report、普通问题自动推进、必须用户介入、reviewer conflict 等 20 个场景 |
+| 场景输出字段完整性 | implemented_runtime_verified | 每个场景记录 goal、expected route、model roles used、evidence、final status、human intervention、cost/token tier、acceptance refs |
+| false PASS 防护 | implemented_runtime_verified | `evaluateRealWorldScenarioSuite()` 检查 VERIFIED_COMPLETE 必须有 evidence 和 gate；final evidence 缺失场景不能是 VERIFIED_COMPLETE |
+| 正确性优先路由验收 | implemented_runtime_verified | 用户纠偏必须 requirements-inspector；repeated failure 必须 chief-engineer/role-cross；reviewer conflict 必须 role-cross；高风险 provider/routing 允许多 reviewer |
+| 普通任务成本守卫验收 | implemented_runtime_verified | 普通短代码任务只使用 commander，不触发 reviewer；MiMo-V2.5 不进入纯文本 fallback 场景 |
+| Doctor 集成 | implemented_runtime_verified | `dll-doctor.ts` 增加 `real-world-scenario-evaluation` 检查，场景 fail 或 false_pass_risk > 0 时 doctor failed |
+| Live scenario execution | partial_runtime | Phase 10 当前是 deterministic regression dashboard，不自动跑 20 个真实 live 任务；live provider/task scenario 可在后续单独 smoke harness 中执行 |
+
+### Phase 4 Result Ledger / Dedup / Stale 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| ResultPacket write/query | implemented_runtime_verified | `writeResult()` / `queryResults()` 维护 session-scoped JSONL；`reusable_only` 排除 stale/invalidated packet |
+| Result Sufficiency Gate | implemented_runtime_verified | `checkResultSufficiency()` 区分 sufficient、verify_existing、partial、failed、stale、invalidated |
+| missing evidence cannot reuse | implemented_runtime_verified | `VERIFIED_COMPLETE` 缺 `evidence_refs` 或 passed verification 会降级为 `sufficient_but_unverified` |
+| file hash stale detection | implemented_runtime_verified | `files_changed[].hashAfter` 与当前文件 sha256 不一致时 verdict=`stale` |
+| reviewer dedup hard-block | implemented_runtime_verified | `supervisor.generateSubtasks()` 发现 reusable verified reviewer result 时不再派发 reviewer，并写 routing/evidence |
+| commander duplicate completion guard | implemented_runtime_verified | `prompt.ts` final loop 要求 commander 明确复用已有 packet 或说明 redo reason |
+| Final Gate reads Result Ledger | implemented_runtime_verified | 有 Goal Contract 时 final PASS 必须存在 matching `VERIFIED_COMPLETE` ResultPacket |
+| stale result reuse | implemented_runtime_verified | stale/expired/hash changed result 只能 reverify/redo，不能作为 final PASS 依据 |
+| cross-session result sharing | missing | 当前仍是 session scoped，不跨 session 复用 |
+| global low-level tool-call dedup | partial_runtime | reviewer dispatch 与 final completion 已接入；单个底层 tool call 尚未全局拦截 |
+| cross-review council ledger consumption | implemented_runtime_verified | `cross-review-bridge.ts` 将 session Result Ledger snapshot 写入 council packet 和 `cross_review.council_triggered` evidence；跨 session comparison 仍未实现 |
+
+### Phase 5 Correctness-Aware Routing / Multi-model Review 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 普通短任务不触发 reviewer | implemented_runtime_verified | supervisor tests 覆盖 default commander path |
+| 用户纠偏触发 requirements-inspector | implemented_runtime_verified | correctness-aware routing tests 覆盖 user correction |
+| repeated failure 触发 chief-engineer / role-cross | implemented_runtime_verified | recovery loop + supervisor tests 覆盖 second/third same fingerprint |
+| high-risk 允许多个 reviewer | implemented_runtime_verified | high-risk repeated failure 可路由 requirements-inspector + chief-engineer |
+| final evidence missing gate | implemented_runtime_verified | evidence/final gate 和 verifier subtask 覆盖无真证据完成声明 |
+| routing evidence | implemented_runtime_verified | `model.routing_decision` 包含 correctness_reason / cost_reason |
+| council consumes Result Ledger | implemented_runtime_verified | council packet 包含 session Result Ledger snapshot、evidence refs、unresolved items |
+| reviewer output protocol | implemented_runtime_verified | reviewer prompts 包含 machine-readable JSON template；parse/mark 完成后写 ResultPacket |
+| reconciliation gate | implemented_runtime_verified | completed reviewer 未被 commander 吸收时阻断 final completion |
+| cross-session council result comparison | missing | 当前只消费当前 session ledger，不做跨 session 结果仲裁 |
+
+### Phase 6 Permissions / Role Tool Policy / Safety 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| risk-based permission precheck | implemented_runtime_verified | `Permission.ask()` 进入 ruleset 前调用 `permissionPreCheck()`；高风险返回 force ask，不被 allow-all ruleset 覆盖 |
+| reviewer read-only policy | implemented_runtime_verified | requirements-inspector、long-context-archivist、task-completion-archivist、final-auditor、role-cross、multimodal-context-interpreter deny mutating tools |
+| commander/chief/executor writable | implemented_runtime_verified | writable roles 允许项目内普通 file write/edit；未知 shell command 仍 ask |
+| high-risk confirmation | implemented_runtime_verified | `git push`、`sudo`、`rm -rf`、secret file access 在 `DLL_AGENT_AUTO_ALLOW=1` 下仍 ask |
+| permission evidence | implemented_runtime_verified | role/tool decisions 写 `role_tool_policy.decision` evidence，不记录 secrets 内容 |
+| doctor role-tool-policy check | implemented_runtime_verified | `dll-doctor.ts` 调用 `doctorCheckRoleToolPolicy()`，doctor warn/failed 不伪装 |
+| doctor --repair-safe wrapper入口 | implemented_runtime_verified | `/Users/dailulu/.local/bin/dll-agent doctor --repair-safe` 只调用 inactive session/evidence cleanup 和 managed MCP state reconciliation；不碰 secrets，不 push，不做系统级修改 |
+| full sandbox isolation | missing | 仍依赖 OpenCode tool permission + local policy；未引入 OS-level sandbox |
+
+### Phase 7 Tools / Skills / MCP / LSP / Multimodal 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| capability-driven runtime | implemented_runtime_verified | `prompt.ts` 调用 `orchestrateCapabilities()`，在 `resolveTools()` 前规划 selected tools / skills / MCP requests / system summary |
+| low-risk tool auto-upgrade | implemented_runtime_verified | 文档类 Python tools 声明真实 package，`capability-resolver.ts` 生成项目内 `.dll-agent/tools/python` target install，不再错误尝试安装 `python3` binary |
+| auto-install verification | implemented_runtime_verified | `capability-action-runner.ts` 使用 allowlisted argv 执行 install + verify，verify 子进程带 project-local `PYTHONPATH` |
+| auto-upgrade result reuse | implemented_runtime_verified | 已验证 capability install 写入 Result Ledger；同一 session 再次需要同一 capability 时复用 `VERIFIED_COMPLETE` packet，不重复安装/提示 |
+| high-risk install guard | implemented_runtime_verified | `brew`、global npm、无 project-local `--target` 的 pip、high-risk capability 仍 blocked/ask，不因 auto-upgrade 绕过权限 |
+| on-demand MCP planning | implemented_runtime_verified | registry trigger 选中 MCP 后通过 `MCP.Service.add()` 接入；credential/login/destructive/remote risk 会阻断 auto connect |
+| LSP project-main strategy | pure_function_only | `lsp-strategy.ts` / `lsp-bridge.ts` 已有策略和 doctor check；尚未接入 OpenCode LSP launch pipeline |
+| multimodal routing guard | implemented_runtime_verified | 纯文本/代码任务不触发 `multimodal-context-interpreter`；非文本输入才触发 MiMo 多模态路径 |
+| TTS/VoiceClone exclusion | implemented_runtime_verified | voice/TTS model guard 禁止进入 coding role；MiMo-V2.5 仅用于多模态理解 |
+| full third-party tool marketplace | missing | 本轮不引入 skill 市场或第三方依赖安装系统 |
+
+### Phase 8 UX / Doctor / Observability 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| task status command | implemented_runtime_verified | `/task-status` 由 session runtime 本地处理，调用 `renderTaskStatus()`，不发起 LLM 调用 |
+| task trajectory / flight recorder | implemented_runtime_verified | `task-observability.ts` 聚合 Goal Contract、Supervisor、Result Ledger、evidence 和 routing decision，输出 bounded trajectory |
+| routing report visibility | implemented_runtime_verified | task status 汇总 `model.routing_decision` 的 selected models 与 skipped reviewers |
+| Result Ledger visibility | implemented_runtime_verified | task status 显示 total/verified/partial/failed/reusable，并把 unresolved items 作为 blockers/next actions |
+| doctor observability check | implemented_runtime_verified | `dll-doctor.ts` 增加 `task-observability` 自检，失败时给出 inspect next action |
+| doctor safe cleanup next action | implemented_runtime_verified | evidence session 超阈值时 doctor 明确建议 `dll-agent doctor --repair-safe` |
+| TUI visual redesign | missing | 本 Phase 不改 TUI 外观；只提供 direct status adapter 和 doctor observability check |
+| regression dashboard | missing | 尚未实现 20 场景 dashboard；留到 Phase 10 |
+
+### Phase 9 Architecture Modularization 状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| session adapter extraction | implemented_runtime_verified | `session-adapter.ts` 统一构造 dll-agent local command 的 MessageV2 user/assistant/part 记录 |
+| prompt.ts local command simplification | implemented_runtime_verified | `prompt.ts` 不再手写 `/role-models`、`/role-model-set`、`/task-status` 响应消息结构，只负责 provider 校验、session 写入和 event publish |
+| local command no-LLM invariant | implemented_runtime_verified | local status/model commands 仍通过 zero-cost assistant message 返回，不调用 LLM |
+| role/provider boundary unchanged | implemented_runtime_verified | RoleModel resolver 和 Provider validation 调用路径未改变；`session-adapter.ts` 不解析 provider/model |
+| gate/supervisor large split | partial_runtime | 本 Phase 未继续拆 supervisor/gates，避免一次性大迁移；保留后续可回滚小切片 |
+| prompt.ts full cleanup | partial_runtime | 本 Phase 只减少 local command coupling；capability/recovery/gate orchestration 仍在 prompt loop 中 |
+
+### Phase 9.1 Architecture Modularization 后续切片状态
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| gate composition extraction | implemented_runtime_verified | `session-gate-orchestrator.ts` 统一处理 dedup/capability/reconciliation block reason 和 synthetic hint 合并，减少 `prompt.ts` 两条 finalization path 的重复逻辑 |
+| reviewer dispatch planning | implemented_runtime_verified | `reviewer-dispatch.ts` 将 supervisor subtask drain 和 read-only parallel / write-capable serial 分组规则提取为纯函数 |
+| reviewer result bridge | implemented_runtime_verified | `reviewer-result-bridge.ts` 负责 structured reviewer output -> Result Ledger packet 的转换和 best-effort 写入 |
+| prompt.ts orchestration shrink | implemented_runtime_verified | `prompt.ts` 行数从 3029 降至约 2950；仍保留 Effect runtime orchestration，不改变行为 |
+| supervisor result wiring shrink | implemented_runtime_verified | `supervisor.ts` 行数从 1207 降至约 1182；reviewer completion 状态更新仍留在 supervisor，Result Ledger 转换移出 |
+| TUI / Provider / RoleModel / routing behavior | unchanged_runtime_verified | 本切片不改 TUI、Provider、RoleModel、routing 策略或模型默认值 |
+| full prompt.ts decomposition | partial_runtime | capability action execution、MCP connect、recovery loop 注入仍在 prompt loop 中，后续应继续按小切片提取 |
+| supervisor prompt template extraction | partial_runtime | reviewer prompt templates 仍在 supervisor.ts；为避免大规模行为变化，本轮未迁移 |
 
 ### ⚠️ 只是配置层实现（需要环境变量）
 

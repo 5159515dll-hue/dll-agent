@@ -1,6 +1,6 @@
 # dll-agent Result Handoff System
 
-> **Phase 7**: Multi-model result passing — preventing redundant work, token waste, and result overwriting.
+> **Phase 4 runtime slice**: Multi-model result passing — preventing redundant work, token waste, and result overwriting.
 
 ## Overview
 
@@ -56,41 +56,44 @@ Every completed subtask produces a `ResultPacket`:
 | ResultPacket write | `result-ledger.ts:writeResult()` | Called by `supervisor.ts:markReviewerCompleted()` |
 | ResultPacket query | `result-ledger.ts:queryResults()` | Filterable by role, status, files, timestamp |
 | Results summary | `result-ledger.ts:buildResultsSummary()` | Text block for reviewer context |
-| Sufficiency check | `result-sufficiency-gate.ts:checkResultSufficiency()` | Returns `sufficient/partial/stale/insufficient` verdict |
-| Staleness detection | `result-sufficiency-gate.ts:isResultStale()` | Time-based + explicit stale/invalidated status |
+| Sufficiency check | `result-sufficiency-gate.ts:checkResultSufficiency()` | Returns `sufficient/partial/stale/insufficient` verdict; verified results without evidence are downgraded to verification-required |
+| Staleness detection | `result-sufficiency-gate.ts:isResultStale()` + hash check | Time-based, explicit stale/invalidated status, and `files_changed[].hashAfter` mismatch |
 | Deduplication gate | `deduplication-gate.ts:checkDeduplication()` | Returns `redundant/not_redundant` verdict |
+| Dispatch decision | `deduplication-gate.ts:buildDedupDispatchDecision()` | Converts dedup verdict into hard dispatch skip / verify / continue / repair action |
 | Dedup context injection | `deduplication-gate.ts:buildDedupContextSummary()` | Text block for commander/gate hints |
 | Reviewer results recorded | `supervisor.ts:markReviewerCompleted()` | Writes `ResultPacket` when `ReviewerOutput` is available |
 | Reviewer context enhanced | `supervisor.ts:buildReviewerContext()` | Includes results summary from ledger |
 | Continuation packet populated | `continuation-gate.ts:buildContinuationPacket()` | `already_completed`, `files_involved`, `commands_run` from ledger |
-| Gate hints injection | `prompt.ts:gatePendingHints` | Dedup context injected before model continues |
+| Gate/runtime integration | `prompt.ts:gatePendingHints` + final gate loop | Verified duplicate commander completion is blocked until it reuses the existing packet or justifies redo |
+| Final gate ledger requirement | `gates.ts:finalGate()` | Goal Contract sessions cannot claim PASS without a matching verified `ResultPacket` |
 | Evidence types | `interfaces.ts:EvidenceRecordType` | `result.produced`, `result.reused`, `result.invalidated`, `result.dedup_blocked`, `result.dedup_allowed`, `result.stale_detected` |
 
 ### ⚠️ Partially Implemented
 
 | Feature | Status | Gap |
 |---------|--------|-----|
-| File-hash staleness | Time-based only | Git hash / mtime comparison not yet implemented |
-| Tool-execution dedup | Prompt-only | subtask dispatch not yet checked via `checkDeduplication()` before execution (dedup context is injected but not enforced at dispatch time) |
+| File-hash staleness | Runtime verified for `hashAfter` | Git index/tree hash comparison is not implemented; current check compares stored packet hash to current file bytes |
+| Tool-execution dedup | Runtime enforced for reviewer dispatch and final commander completion claims | Individual low-level tool calls are not globally intercepted; enforcement happens before reviewer subtask dispatch and before final completion exits |
 | Cross-session result sharing | Session-scoped | Results only visible within one session |
 
 ### ❌ Not Yet Implemented
 
 | Feature | Notes |
 |---------|-------|
-| `artifact-reuse-policy.ts` | Reuse policy rules not yet formalized as a standalone module |
 | Cross-session baseline comparison | Kimi cannot yet compare results across sessions |
-| Council result integration | Cross-review council does not yet consume result ledger |
+| Council result integration | Cross-review council packet consumes session Result Ledger snapshot; arbitration still does not do cross-session result comparison |
 
 ## Deduplication Gate Rules
 
 When a model attempts to execute work:
 1. **Result exists + VERIFIED_COMPLETE** → `reuse_existing` (BLOCK re-execution)
-2. **Result exists + UNVERIFIED** → `verify_existing` (only verify, don't redo)
+2. **Result exists + VERIFIED_COMPLETE but missing evidence / passed verification** → `verify_existing` (only verify, don't redo)
 3. **Result exists + PARTIAL** → `continue_from_existing` (fill gaps only)
 4. **Result exists + FAILED** → `repair_existing` (redo allowed with diagnosis)
 5. **Result exists + STALE/INVALIDATED** → `redo_allowed` (existing result invalid)
 6. **No result exists** → `no_existing_result` (execute normally)
+
+For Goal Contract sessions, `finalGate()` also requires a matching `VERIFIED_COMPLETE` result packet before allowing final PASS. Natural-language summaries are not accepted as a substitute for Result Ledger state.
 
 ## Doctor Checks
 
@@ -107,7 +110,7 @@ When a model attempts to execute work:
 
 ```bash
 bun run --cwd packages/opencode typecheck   # ✅ 0 errors
-bun test --cwd packages/opencode test/dll-agent/  # ✅ 356 pass, 0 fail
+bun test --cwd packages/opencode test/dll-agent/  # ✅ Phase 4 target + full dll-agent suite pass
 /Users/dailulu/.local/bin/dll-agent doctor  # ✅ result=warn (non-blocking)
 python3 -m py_compile /Users/dailulu/.local/bin/dll-agent  # ✅ ok
 git diff --check  # ✅ clean

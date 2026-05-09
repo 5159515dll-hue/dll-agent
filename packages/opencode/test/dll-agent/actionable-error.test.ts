@@ -54,6 +54,24 @@ describe("actionable-error", () => {
       expect(err.category).toBe("gate_blocked")
     })
 
+    it("classifies config errors", () => {
+      const err = buildActionableError({
+        whatFailed: "Config parse failed",
+        stderr: "config invalid: unexpected token in JSON",
+      })
+      expect(err.category).toBe("config_error")
+      expect(err.userActionRequired).toBe(false)
+    })
+
+    it("classifies provider normalization errors", () => {
+      const err = buildActionableError({
+        whatFailed: "Provider request failed",
+        stderr: "literal_error: reasoning_effort max should be low, medium or high",
+      })
+      expect(err.category).toBe("provider_normalization_error")
+      expect(err.userActionRequired).toBe(false)
+    })
+
     it("returns unknown for unrecognized errors", () => {
       const err = buildActionableError({
         whatFailed: "Something went wrong",

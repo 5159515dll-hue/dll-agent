@@ -36,7 +36,14 @@ import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { enabled as profileEnabled, autoAllowAll as profileAutoAllow, quality as profileQuality, verify as profileVerify, roleRoster as profileRoleRoster, roleCommands as profileRoleCommands, systemPrompt as profileSystemPrompt, writeEvidence as profileWriteEvidence } from "@/dll-agent/profile"
-import { resolveMainModel } from "@/dll-agent/role-model-registry"
+import { resolveRoleModel, setRoleModelOverride } from "@/dll-agent/role-model-registry"
+import { resolveEffectiveRoleModel, roleForAgent } from "@/dll-agent/role-model-runtime"
+import {
+  parseRoleModelSetArgs,
+  roleModelSetSuccessText,
+  roleModelsText,
+  validateRoleModelSetArgs,
+} from "@/dll-agent/role-model-command"
 import { decide as supervisorDecide, updateState as supervisorUpdateState, loadState as supervisorLoadState, saveState as supervisorSaveState, isCooldown as supervisorIsCooldown, recordReviewerCall, generateSubtasks, buildVerifierSubtask, buildTaskCompletionSubtask, markReviewerCompleted, setQueuedReviewers, setRunningReviewers, isReadOnlyReviewer, reviewerRuntimeMs as getReviewerRuntimeMs, modelContextLimit } from "@/dll-agent/supervisor"
 import { checkEvidenceGate, checkReconciliationGate, isGateRetryExhausted, buildGateBlockSummary } from "@/dll-agent/gates"
 import { checkCap as checkCostCap, trackLastCall } from "@/dll-agent/cost-cap"
@@ -49,11 +56,27 @@ import { buildGlobalEffective, buildEffectiveManifest, loadProjectOverlay } from
 import { GLOBAL_DEFAULT_TOOLS, DEFAULT_MANIFEST } from "@/dll-agent/tool-catalog"
 import { buildPromptIndex } from "@/dll-agent/tool-prompt"
 import { buildActionableError, formatActionableError } from "@/dll-agent/actionable-error"
-import { checkContinuationGate, isContinuationBudgetExhausted, parseKimiContinuationOutput, consumeContinuationPacket } from "@/dll-agent/continuation-gate"
-import { checkDeduplication, buildDedupContextSummary } from "@/dll-agent/deduplication-gate"
+import { checkContinuationGate, isContinuationBudgetExhausted, parseKimiContinuationOutput, consumeContinuationPacket, buildBudgetExhaustedReport } from "@/dll-agent/continuation-gate"
+import {
+  checkDeduplication,
+  buildDedupContextSummary,
+  buildDedupDispatchDecision,
+  isDedupReuseAcknowledged,
+} from "@/dll-agent/deduplication-gate"
 import { orchestrateCapabilities, type CapabilityOrchestrationResult } from "@/dll-agent/capability-orchestrator"
 import { runCapabilityActions } from "@/dll-agent/capability-action-runner"
 import { reconcileSessionState } from "@/dll-agent/session-reconciler"
+import { ensureGoalContract } from "@/dll-agent/goal-contract"
+import { extractLatestFailure, planRecovery, buildRecoveryHint, buildBlockedRecoveryReport, writeRecoveryDecision } from "@/dll-agent/recovery-loop"
+import { renderTaskStatus } from "@/dll-agent/task-observability"
+import { buildLocalCommandResponse } from "@/dll-agent/session-adapter"
+import {
+  appendGateBlock,
+  buildCapabilityGateBlock,
+  buildDedupGateBlock,
+  capabilityGateEvidence,
+} from "@/dll-agent/session-gate-orchestrator"
+import { drainSupervisorDispatchBatch, planReviewerDispatchGroups } from "@/dll-agent/reviewer-dispatch"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -425,6 +448,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           permission
             .ask({
               ...req,
+              metadata: { ...(req.metadata ?? {}), dllAgentRole: input.agent.name },
               sessionID: input.session.id,
               tool: { messageID: input.processor.message.id, callID: options.toolCallId },
               ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
@@ -577,7 +601,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
       const { task: taskTool } = yield* registry.named()
-      const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
+      const taskRole = profileEnabled() ? roleForAgent(task.agent) : undefined
+      const resolvedTaskModel = taskRole
+        ? yield* resolveEffectiveRoleModel({
+            role: taskRole,
+            sessionID,
+            projectDir: ctx.worktree,
+            triggerReason: "subtask effective role model",
+            provider,
+            validateModel: getModel,
+          })
+        : undefined
+      const taskModel = resolvedTaskModel
+        ? yield* getModel(resolvedTaskModel.providerID, resolvedTaskModel.modelID, sessionID)
+        : task.model
+          ? yield* getModel(task.model.providerID, task.model.modelID, sessionID)
+          : model
       const assistantMessage: MessageV2.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
         role: "assistant",
@@ -787,10 +826,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               throw error
             }
             let model = input.model ?? agent.model ?? (yield* lastModel(input.sessionID))
-            // When dll-agent is enabled, the role-model registry is the single source of truth
-            if (profileEnabled()) {
-              const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
-              model = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+            const role = profileEnabled() ? roleForAgent(agent.name) : undefined
+            if (role) {
+              model = yield* resolveEffectiveRoleModel({
+                role,
+                sessionID: input.sessionID,
+                projectDir: ctx.worktree,
+                explicitModel: input.model,
+                triggerReason: input.model ? "explicit TUI/session model selection" : "shell effective role model",
+                provider,
+                validateModel: getModel,
+              })
             }
             const userMsg: MessageV2.User = {
               id: input.messageID ?? MessageID.ascending(),
@@ -952,12 +998,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const lastModel = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
-      // When dll-agent is enabled, commander role-model is the single source of truth
-      if (profileEnabled()) {
-        const ctx = yield* InstanceState.context
-        const cmdr = resolveMainModel(sessionID, ctx.worktree)
-        return { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
-      }
       return yield* provider.defaultModel()
     })
 
@@ -973,12 +1013,32 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
 
       let model = input.model ?? ag.model ?? (yield* lastModel(input.sessionID))
-      // When dll-agent is enabled, the role-model registry is the single source of truth
-      // for model selection — the commander's model overrides all automatic paths
-      if (profileEnabled()) {
+      const role = profileEnabled() ? roleForAgent(ag.name) : undefined
+      if (role) {
         const ctx = yield* InstanceState.context
-        const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
-        model = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+        model = yield* resolveEffectiveRoleModel({
+          role,
+          sessionID: input.sessionID,
+          projectDir: ctx.worktree,
+          explicitModel: input.model,
+          triggerReason: input.model ? "explicit TUI/session model selection" : "prompt effective role model",
+          provider,
+          validateModel: getModel,
+        })
+      }
+      if (profileEnabled() && role === "commander") {
+        const goalText = input.parts
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("\n")
+          .trim()
+        if (goalText) {
+          ensureGoalContract({
+            sessionID: input.sessionID,
+            userGoal: goalText,
+            evidenceRefs: [`message:${input.messageID ?? "pending"}`],
+          })
+        }
       }
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
@@ -1416,6 +1476,87 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info, parts }
     }, Effect.scoped)
 
+    const roleModelCommandResponse = Effect.fn("SessionPrompt.roleModelCommandResponse")(function* (
+      input: CommandInput,
+      text: string,
+    ) {
+      const ctx = yield* InstanceState.context
+      const model = yield* resolveEffectiveRoleModel({
+        role: "commander",
+        sessionID: input.sessionID,
+        projectDir: ctx.worktree,
+        triggerReason: "local role-model command response",
+        provider,
+        validateModel: getModel,
+      })
+      const response = buildLocalCommandResponse({
+        sessionID: input.sessionID,
+        command: input.command,
+        arguments: input.arguments,
+        agent: input.agent,
+        messageID: input.messageID,
+        providerID: model.providerID,
+        modelID: model.modelID,
+        cwd: ctx.directory,
+        root: ctx.worktree,
+        text,
+      })
+      yield* sessions.updateMessage(response.user)
+      yield* sessions.updatePart(response.commandPart)
+      yield* sessions.updateMessage(response.assistant)
+      yield* sessions.updatePart(response.assistantPart)
+      yield* bus.publish(Command.Event.Executed, {
+        name: input.command,
+        sessionID: input.sessionID,
+        arguments: input.arguments,
+        messageID: response.assistant.id,
+      })
+      return { info: response.assistant, parts: [response.assistantPart] }
+    })
+
+    const handleLocalRoleModelCommand = Effect.fn("SessionPrompt.handleLocalRoleModelCommand")(function* (
+      input: CommandInput,
+    ) {
+      const ctx = yield* InstanceState.context
+      if (input.command === "role-models") {
+        return yield* roleModelCommandResponse(input, roleModelsText(input.sessionID, ctx.worktree))
+      }
+
+      if (input.command !== "role-model-set") return undefined
+
+      const parsed = validateRoleModelSetArgs(parseRoleModelSetArgs(input.arguments))
+      if (!parsed.ok) return yield* roleModelCommandResponse(input, parsed.message)
+
+      const model = Provider.parseModel(parsed.model)
+      yield* getModel(model.providerID, model.modelID, input.sessionID)
+      const change = setRoleModelOverride(parsed.role, parsed.model, parsed.scope, input.sessionID, ctx.worktree)
+      if (!change) return yield* roleModelCommandResponse(input, `Failed to write ${parsed.scope} override for ${parsed.role}.`)
+      const effective = resolveRoleModel(parsed.role, input.sessionID, ctx.worktree)
+      return yield* roleModelCommandResponse(
+        input,
+        roleModelSetSuccessText({
+          role: parsed.role,
+          previous: change.previousPrimary,
+          current: effective.primary,
+          source: effective.source,
+        }),
+      )
+    })
+
+    const handleLocalDllStatusCommand = Effect.fn("SessionPrompt.handleLocalDllStatusCommand")(function* (
+      input: CommandInput,
+    ) {
+      if (input.command !== "task-status") return undefined
+      const ctx = yield* InstanceState.context
+      return yield* roleModelCommandResponse(
+        input,
+        renderTaskStatus({
+          sessionID: input.sessionID,
+          projectDir: ctx.worktree,
+        }),
+      )
+    })
+
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -1515,6 +1656,49 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 projectDir: ctx.directory,
                 state: updatedState,
               }).state
+
+              // Phase 3 — Autonomous Recovery Loop:
+              // normal recoverable tool/test/typecheck/provider failures should
+              // produce a concrete automatic recovery action instead of stopping.
+              try {
+                const failure = extractLatestFailure(msgs)
+                if (failure) {
+                  updatedState.repair_counts ??= {}
+                  const recovery = planRecovery({
+                    failure,
+                    repairCounts: updatedState.repair_counts,
+                    maxRecoveryAttempts: 5,
+                  })
+                  updatedState.repair_counts[recovery.fingerprint] = recovery.recoveryAttempts + 1
+                  supervisorSaveState(sessionID, updatedState)
+                  writeRecoveryDecision(sessionID, recovery)
+                  if (recovery.userActionRequired || !recovery.shouldContinue) {
+                    gatePendingHints.push(buildBlockedRecoveryReport(recovery))
+                    evidenceWrite("recovery.blocked", {
+                      status: recovery.status,
+                      category: recovery.category,
+                      fingerprint: recovery.fingerprint,
+                      reason: recovery.reason,
+                    }, sessionID)
+                  } else {
+                    gatePendingHints.push(buildRecoveryHint(recovery))
+                    evidenceWrite("recovery.prompt_injected", {
+                      category: recovery.category,
+                      fingerprint: recovery.fingerprint,
+                      reviewer: recovery.reviewer,
+                    }, sessionID)
+                    if (recovery.reviewer && !decision.reviewers.includes(recovery.reviewer)) {
+                      decision.reviewers.push(recovery.reviewer)
+                      decision.reasons[recovery.reviewer] = `autonomous recovery: ${recovery.reason}`
+                      decision.fingerprints ??= {}
+                      decision.fingerprints[recovery.reviewer] = `recovery:${recovery.fingerprint}`
+                      decision.should_review = true
+                    }
+                  }
+                }
+              } catch (recoveryErr) {
+                yield* slog.error("autonomous recovery loop error", { error: String(recoveryErr) })
+              }
 
               // 2a. Capability orchestration — bridge the declarative capability
               // registry into the live session loop. This is intentionally before
@@ -1726,12 +1910,36 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }).state
                 const metrics = computeTriggerMetrics(msgs)
                 const lastAssistantText = messageText(lastAssistantMsg)
+                const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
+                const currentTaskGoal = lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : ""
 
                 const costCheck = checkCostCap(sessionID, msgs)
+                let dedupHardBlock: { reason: string; hint: string | null; packetId?: string } | null = null
 
-                // Phase 7 — Deduplication Gate: inject prior result context so models
-                // can see what's already been completed and avoid redundant re-execution.
+                // Phase 4 — Deduplication Gate: block redundant result re-dispatch when a verified
+                // reusable ResultPacket already covers the current task.
                 try {
+                  const dedupDispatch = buildDedupDispatchDecision(sessionID, currentTaskGoal, "commander", {
+                    projectDir: ctx.directory,
+                    maxAgeMinutes: 120,
+                  })
+                  if (
+                    metrics.finalClaim &&
+                    !dedupDispatch.shouldDispatch &&
+                    !isDedupReuseAcknowledged(lastAssistantText, dedupDispatch.existingPacketId)
+                  ) {
+                    dedupHardBlock = {
+                      reason: dedupDispatch.reason,
+                      hint: dedupDispatch.syntheticHint,
+                      packetId: dedupDispatch.existingPacketId,
+                    }
+                    yield* slog.info("dedup hard-blocked redundant commander completion", {
+                      existing_packet_id: dedupDispatch.existingPacketId,
+                    })
+                  }
+                  if (dedupDispatch.syntheticHint) {
+                    gatePendingHints.push(dedupDispatch.syntheticHint)
+                  }
                   const dedupContext = buildDedupContextSummary(sessionID)
                   if (dedupContext) {
                     gatePendingHints.push(dedupContext)
@@ -1740,17 +1948,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     })
                   }
                 } catch {
-                  // Dedup context injection is advisory; must not block the loop
+                  // Dedup checks are best-effort; ledger errors must not break the loop.
                 }
 
                 // Phase 5 — Continuation Gate: 在 evidence gate 之前检查是否有 blocking unfinished
-                const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
                 const continuationResult = checkContinuationGate({
                   assistantText: lastAssistantText,
                   isCompletionClaim: metrics.finalClaim,
                   state,
                   sessionID,
-                  userGoal: lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : "",
+                  userGoal: currentTaskGoal,
                 })
                 if (!continuationResult.passed) {
                   const budgetCheck = isContinuationBudgetExhausted({
@@ -1778,9 +1985,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       reason: budgetCheck.reason,
                       continuation_count: state.continuation_count ?? 0,
                     })
-                    gatePendingHints.push(
-                      `<dll-agent-continuation-gate>\nContinuation budget exhausted: ${budgetCheck.reason}\nManual user intervention required.\n</dll-agent-continuation-gate>`
-                    )
+                    const blockedReport = buildBudgetExhaustedReport({
+                      sessionID,
+                      userGoal: currentTaskGoal,
+                      reason: budgetCheck.reason ?? "continuation budget exhausted",
+                      packet: continuationResult.continuation_packet,
+                    })
+                    gatePendingHints.push(blockedReport.report)
                   }
                 }
 
@@ -1796,26 +2007,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   projectDir: ctx.directory,
                 }, msgs)
 
-                if (metrics.finalClaim && capabilityRuntime) {
-                  const capabilityBlocks = [
-                    ...capabilityRuntime.unresolvedGaps.map((g) => `missing capability: ${g.tag}`),
-                    ...capabilityRuntime.blockedReasons,
-                  ]
-                  if (capabilityBlocks.length > 0) {
-                    gateResult.passed = false
-                    const block = `capability requirements unresolved: ${capabilityBlocks.slice(0, 4).join("; ")}`
-                    gateResult.block_reason = gateResult.block_reason
-                      ? `${gateResult.block_reason}; ${block}`
-                      : block
-                    gateResult.synthetic_hint = [
-                      gateResult.synthetic_hint,
-                      `<dll-agent-capability-gate>\n${block}\nResolve, verify, or explicitly disclose these capability gaps before claiming completion.\n</dll-agent-capability-gate>`,
-                    ].filter(Boolean).join("\n")
-                    evidenceWrite("gate.capability_blocked", {
-                      fingerprint: capabilityRuntime.fingerprint,
-                      blocks: capabilityBlocks,
-                    }, sessionID)
-                  }
+                if (dedupHardBlock) {
+                  Object.assign(gateResult, appendGateBlock(
+                    gateResult,
+                    buildDedupGateBlock({ packetId: dedupHardBlock.packetId, hint: dedupHardBlock.hint }),
+                  ))
+                  evidenceWrite("result.dedup_blocked", {
+                    role: "commander",
+                    reason: dedupHardBlock.reason,
+                    existing_packet_id: dedupHardBlock.packetId,
+                    action: "completion_blocked_until_reuse_acknowledged",
+                  }, sessionID)
+                }
+
+                const capabilityBlock = buildCapabilityGateBlock(capabilityRuntime, metrics.finalClaim)
+                if (capabilityBlock) {
+                  Object.assign(gateResult, appendGateBlock(gateResult, capabilityBlock))
+                  evidenceWrite("gate.capability_blocked", capabilityGateEvidence(capabilityRuntime), sessionID)
                 }
 
                 // Phase 4: reconciliation gate — completion 必须显式吸收 reviewer 结论
@@ -1825,13 +2033,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   state,
                 })
                 if (!reconResult.passed) {
-                  gateResult.passed = false
-                  gateResult.block_reason = gateResult.block_reason
-                    ? `${gateResult.block_reason}; ${reconResult.block_reason}`
-                    : reconResult.block_reason
-                  gateResult.synthetic_hint = [gateResult.synthetic_hint, reconResult.synthetic_hint]
-                    .filter(Boolean)
-                    .join("\n")
+                  Object.assign(gateResult, appendGateBlock(gateResult, {
+                    reason: reconResult.block_reason ?? "reconciliation required",
+                    hint: reconResult.synthetic_hint,
+                  }))
                   evidenceWrite("gate.reconciliation_blocked", {
                     reason: reconResult.block_reason,
                     completed_reviews: state.completed_reviews,
@@ -1945,15 +2150,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // 只读 reviewer 可以并行；任何可能写文件、跑命令、修复问题的 reviewer 必须串行。
           // 这样保留 GLM/Kimi/审计类读取任务的速度优势，同时避免 chief-engineer/executor 类任务写入冲突。
           if (profileEnabled() && tasks.length >= 2) {
-            const batch: MessageV2.SubtaskPart[] = []
-            while (tasks.length > 0) {
-              const tail = tasks[tasks.length - 1]
-              if (tail.type === "subtask" && tail.command === "dll-agent-supervisor") {
-                batch.push(tasks.pop() as MessageV2.SubtaskPart)
-                continue
-              }
-              break
-            }
+            const batch = drainSupervisorDispatchBatch(tasks)
             if (batch.length >= 2) {
               const completeSupervisorTask = (task: MessageV2.SubtaskPart) => {
                 try {
@@ -2008,25 +2205,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }
               })
 
-              let index = 0
-              while (index < batch.length) {
-                const current = batch[index]
-                if (isReadOnlyReviewer(current.agent)) {
-                  const readOnlyGroup: MessageV2.SubtaskPart[] = []
-                  while (index < batch.length && isReadOnlyReviewer(batch[index].agent)) {
-                    readOnlyGroup.push(batch[index])
-                    index++
-                  }
-                  if (readOnlyGroup.length >= 2) {
-                    yield* runReadOnlyGroup(readOnlyGroup)
-                  } else {
-                    yield* runSingleSupervisorTask(readOnlyGroup[0], "parallel-read")
-                  }
+              for (const group of planReviewerDispatchGroups(batch, isReadOnlyReviewer)) {
+                if (group.mode === "parallel-read" && group.tasks.length >= 2) {
+                  yield* runReadOnlyGroup(group.tasks)
                   continue
                 }
-
-                yield* runSingleSupervisorTask(current, "serial-write")
-                index++
+                yield* runSingleSupervisorTask(group.tasks[0], group.mode)
               }
               continue
             }
@@ -2073,11 +2257,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                             ``,
                             `Action items:`,
                             ...consumed.actionItems.map((a, i) =>
-                              `${i + 1}. [${a.role}] ${a.action} (verify: ${a.verification})`
+                              `${i + 1}. [${a.role}] ${a.action} (verify: ${a.verification}; reason: ${a.dispatch_reason})`
                             ),
                             `</dll-agent-continuation-result>`,
                           ].join("\n")
                           gatePendingHints.push(contHint)
+                          for (const action of consumed.actionItems) {
+                            if (action.role === "commander") continue
+                            tasks.push({
+                              type: "subtask",
+                              id: PartID.ascending(),
+                              messageID: MessageID.ascending(),
+                              sessionID,
+                              agent: action.role,
+                              description: `Continuation: ${action.description}`,
+                              command: "dll-agent-supervisor",
+                              prompt: [
+                                `[dll-agent continuation dispatch]`,
+                                `Role: ${action.role}`,
+                                `Reason: ${action.dispatch_reason}`,
+                                `Action: ${action.action}`,
+                                `Verification: ${action.verification}`,
+                                `Evidence refs: ${action.evidence_refs.join(", ") || "none"}`,
+                                ``,
+                                `Return structured reviewer output. If this is repairable without user input, provide concrete next actions and required verification.`,
+                              ].join("\n"),
+                            })
+                          }
                         }
                       }
                     }
@@ -2384,26 +2590,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   projectDir: ctx.directory,
                 }, msgs)
 
-                if (metrics.finalClaim && capabilityRuntime) {
-                  const capabilityBlocks = [
-                    ...capabilityRuntime.unresolvedGaps.map((g) => `missing capability: ${g.tag}`),
-                    ...capabilityRuntime.blockedReasons,
-                  ]
-                  if (capabilityBlocks.length > 0) {
-                    gateResult.passed = false
-                    const block = `capability requirements unresolved: ${capabilityBlocks.slice(0, 4).join("; ")}`
-                    gateResult.block_reason = gateResult.block_reason
-                      ? `${gateResult.block_reason}; ${block}`
-                      : block
-                    gateResult.synthetic_hint = [
-                      gateResult.synthetic_hint,
-                      `<dll-agent-capability-gate>\n${block}\nResolve, verify, or explicitly disclose these capability gaps before claiming completion.\n</dll-agent-capability-gate>`,
-                    ].filter(Boolean).join("\n")
-                    evidenceWrite("gate.capability_blocked", {
-                      fingerprint: capabilityRuntime.fingerprint,
-                      blocks: capabilityBlocks,
-                    }, sessionID)
-                  }
+                const capabilityBlock = buildCapabilityGateBlock(capabilityRuntime, metrics.finalClaim)
+                if (capabilityBlock) {
+                  Object.assign(gateResult, appendGateBlock(gateResult, capabilityBlock))
+                  evidenceWrite("gate.capability_blocked", capabilityGateEvidence(capabilityRuntime), sessionID)
                 }
 
                 // Phase 4: reconciliation hard-block on second gate path too
@@ -2413,13 +2603,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   state,
                 })
                 if (!reconResult.passed) {
-                  gateResult.passed = false
-                  gateResult.block_reason = gateResult.block_reason
-                    ? `${gateResult.block_reason}; ${reconResult.block_reason}`
-                    : reconResult.block_reason
-                  gateResult.synthetic_hint = [gateResult.synthetic_hint, reconResult.synthetic_hint]
-                    .filter(Boolean)
-                    .join("\n")
+                  Object.assign(gateResult, appendGateBlock(gateResult, {
+                    reason: reconResult.block_reason ?? "reconciliation required",
+                    hint: reconResult.synthetic_hint,
+                  }))
                   evidenceWrite("gate.reconciliation_blocked", {
                     reason: reconResult.block_reason,
                     completed_reviews: state.completed_reviews,
@@ -2476,6 +2663,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* elog.info("command", { sessionID: input.sessionID, command: input.command, agent: input.agent })
+      if (profileEnabled() && (input.command === "role-models" || input.command === "role-model-set")) {
+        const local = yield* handleLocalRoleModelCommand(input)
+        if (local) return local
+      }
+      if (profileEnabled() && input.command === "task-status") {
+        const local = yield* handleLocalDllStatusCommand(input)
+        if (local) return local
+      }
       const cmd = yield* commands.get(input.command)
       if (!cmd) {
         const available = (yield* commands.list()).map((c) => c.name)
@@ -2525,7 +2720,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
       template = template.trim()
 
-      const taskModel = yield* Effect.gen(function* () {
+      let taskModel = yield* Effect.gen(function* () {
         if (cmd.model) return Provider.parseModel(cmd.model)
         if (cmd.agent) {
           const cmdAgent = yield* agents.get(cmd.agent)
@@ -2534,12 +2729,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         if (input.model) return Provider.parseModel(input.model)
         return yield* lastModel(input.sessionID)
       })
-      // When dll-agent is enabled, the role-model registry is the single source of truth
       let resolvedModel = taskModel
       if (profileEnabled()) {
         const ctx = yield* InstanceState.context
-        const cmdr = resolveMainModel(input.sessionID, ctx.worktree)
-        resolvedModel = { providerID: ProviderID.make(cmdr.providerID), modelID: ModelID.make(cmdr.modelID) }
+        const role = roleForAgent(agentName)
+        if (role) {
+          resolvedModel = yield* resolveEffectiveRoleModel({
+            role,
+            sessionID: input.sessionID,
+            projectDir: ctx.worktree,
+            explicitModel: input.model ? Provider.parseModel(input.model) : undefined,
+            triggerReason: input.model ? "explicit command model selection" : "command effective role model",
+            provider,
+            validateModel: getModel,
+          })
+          taskModel = resolvedModel
+        }
       }
 
       yield* getModel(resolvedModel.providerID, resolvedModel.modelID, input.sessionID)
@@ -2562,18 +2767,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               agent: agent.name,
               description: cmd.description ?? "",
               command: input.command,
-              model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
+              model: { providerID: resolvedModel.providerID, modelID: resolvedModel.modelID },
               prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
             },
           ]
         : [...templateParts, ...(input.parts ?? [])]
 
       const userAgent = isSubtask ? (input.agent ?? (yield* agents.defaultAgent())) : agentName
-      const userModel = isSubtask
-        ? input.model
-          ? Provider.parseModel(input.model)
-          : yield* lastModel(input.sessionID)
-        : taskModel
+      const userModel = resolvedModel
 
       yield* plugin.trigger(
         "command.execute.before",

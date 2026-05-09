@@ -82,7 +82,7 @@ export function modeSummary() {
     defaultAgent: "commander",
     defaultModel: cmdr.primary,
     commands: [
-      "roles", "dll-status", "quality", "verify", "model-capability",
+      "roles", "dll-status", "task-status", "quality", "verify", "model-capability",
       "chief-engineer", "requirements-check", "context-check", "final-audit",
       "cross-review", "team-review",
       "role-models", "role-model-set", "role-model-reset", "role-model-test",
@@ -131,6 +131,12 @@ export function roleCommands() {
         `OpenAI strategic/final auditor: ${fa.primary}, on-demand only for stuck/off-track/conflict/high-risk finalization.`,
         "Available commands: /quality, /verify, /model-capability, /roles, /team-review, /chief-engineer, /cross-review, /role-models.",
       ].join("\n"),
+    },
+    "task-status": {
+      description: "直接显示当前任务目标、阶段、阻塞、验证、Result Ledger、routing evidence 和下一步动作。",
+      agent: "commander",
+      template:
+        "Direct local command handled by dll-agent runtime. It must render current task status without making an LLM call.",
     },
     "quality": {
       description: "查看或设置质量模式：max / auto / balanced / economy。默认推荐 max。",
@@ -215,8 +221,12 @@ export function roleCommands() {
         "This is a read-only status command.",
       ].join("\n"),
     },
-    // role-model-set 已升级为 TUI 交互式对话框（见 dialog-role-model-set.tsx），
-    // 不再注册为模板命令，避免自动补全中出现重复条目。
+    "role-model-set": {
+      description: "设置角色模型覆盖。用法：/role-model-set <role> <provider/model> [--scope session|project|global]",
+      agent: "commander",
+      template:
+        "Local dll-agent command handled by SessionPrompt without an LLM call. Arguments: $ARGUMENTS",
+    },
     "role-model-reset": {
       description: "重置角色模型覆盖，回退到下一层默认配置。用法：/role-model-reset <role> [--scope session|project|global|all]",
       agent: "commander",
@@ -562,7 +572,7 @@ export function systemPrompt() {
     "The UI may show one active agent, but dll-agent is a role team. The commander should do normal work directly and call real subagents through the task tool when the task is complex, high-risk, stuck, weakly evidenced, or challenged by the user.",
     "Do not call OpenAI for ordinary status, ordinary planning, routine coding, or first-pass answers.",
     "Available subagents: chief-engineer, requirements-inspector, long-context-archivist, final-auditor, role-cross.",
-    "Available role commands: /dll-status, /quality, /verify, /model-capability, /roles, /chief-engineer, /requirements-check, /context-check, /final-audit, /cross-review, /team-review, /role-models, /role-model-set, /role-model-reset, /role-model-test, /capabilities, /capability-status, /capability-discover, /capability-plan, /capability-refresh, /capability-doctor.",
+    "Available role commands: /dll-status, /task-status, /quality, /verify, /model-capability, /roles, /chief-engineer, /requirements-check, /context-check, /final-audit, /cross-review, /team-review, /role-models, /role-model-set, /role-model-reset, /role-model-test, /capabilities, /capability-status, /capability-discover, /capability-plan, /capability-refresh, /capability-doctor.",
     "Prompting is layered: source-level invariants are short and global; role prompts are role-specific; task packets are phase-specific; evidence packets are retrieved precisely; cross-role packets are temporary and removed after recovery.",
     "Do not feed every instruction to every model. Keep each model focused on its role unless role crossing is explicitly needed for recovery.",
     "",
@@ -578,5 +588,3 @@ export function writeEvidence(type: string, payload: unknown) {
   if (!enabled()) return
   evidenceWrite(type, payload)
 }
-
-

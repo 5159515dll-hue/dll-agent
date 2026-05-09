@@ -18,7 +18,7 @@ const cny = new Intl.NumberFormat("zh-CN", {
 })
 
 /** Providers that bill in CNY (all except OpenAI) */
-const CNY_PROVIDERS = new Set(["deepseek", "kimi", "zai"])
+const CNY_PROVIDERS = new Set(["deepseek", "kimi", "zai", "mimo"])
 
 /** Format a cost value in the provider's billing currency. Costs are stored in USD internally. */
 function formatProviderCost(cost: number, providerID: string): string {
@@ -66,11 +66,20 @@ function balanceLine(value: any) {
   if (value.stale) {
     // stale data — show old value with stale marker
     if (value.status === "missing_key") return "quota: missing key [stale]"
+    if (value.status === "configured") return "configured [stale]"
+    if (value.status === "expired") return "expired [stale]"
+    if (value.status === "quota_unavailable" || value.status === "no_quota_endpoint") return "quota unavailable [stale]"
+    if (value.status === "local_estimate_only") return "local est. only [stale]"
     if (value.status === "error") return "quota unavailable [stale]"
     if (value.kind === "token_fallback") return "local est. only [stale]"
     if (value.kind === "cost" && typeof value.cost_usd === "number") return `provider billed: ~${money.format(value.cost_usd)} [stale]`
   }
   if (value.status === "missing_key") return "quota: missing key"
+  if (value.status === "configured") return "configured; quota unavailable"
+  if (value.status === "expired") return "expired"
+  if (value.status === "quota_unavailable" || value.status === "no_quota_endpoint") return "quota unavailable"
+  if (value.status === "local_estimate_only") return "local est. only"
+  if (value.status === "unavailable") return "unavailable"
   if (value.status === "requires_admin_key") return "quota: admin key needed"
   if (value.status === "endpoint_error") return "balance API rejected"
   if (value.status === "error") return "quota unavailable"
@@ -217,7 +226,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         <text fg={theme().text}>
           <b>Quota</b>
         </text>
-        <For each={["deepseek", "kimi", "openai", "zai"]}>
+        <For each={["deepseek", "kimi", "openai", "zai", "mimo"]}>
           {(name) => <text fg={theme().textMuted}>{name}: {balanceLine(quota()?.providers?.[name])}</text>}
         </For>
         <Show when={quota()}>

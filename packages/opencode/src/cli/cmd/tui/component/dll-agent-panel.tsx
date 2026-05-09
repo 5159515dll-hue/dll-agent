@@ -1,50 +1,149 @@
 import fs from "fs"
 import path from "path"
 import os from "os"
-import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { Show, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { useTerminalDimensions } from "@opentui/solid"
-import { useTheme } from "@tui/context/theme"
+import { useProject } from "@tui/context/project"
 import { Locale } from "@/util/locale"
 import { enabled as dllEnabled, quality as dllQuality, verify as dllVerify } from "@/dll-agent/profile"
-import { buildCompactSummary, defaultUxState, type UxState } from "@/dll-agent/ux-state"
 import { idleAwareInterval, isIdleBySupervisorState } from "./dll-agent-idle"
+import { resolveRoleModel, type DllRole, type EffectiveRoleModel } from "@/dll-agent/role-model-registry"
 
 function enabled() {
   return dllEnabled()
 }
 
 function commandLine(compact: boolean) {
-  if (compact) return "/ commands | /dll-status | /roles | /team-review"
-  return "/ commands | /dll-status | /quality | /verify | /model-capability | /roles | /team-review"
-}
-
-function teamLine(compact: boolean) {
-  if (compact) return "team: deepseek | inspect | openai audit | mimo multimodal"
-  return "team: commander=deepseek-v4-pro | inspect=glm/kimi | audit=openai | multimodal=mimo"
+  if (compact) return "/task-status | /role-models | /role-model-set | /team-review"
+  return "/task-status | /role-models | /role-model-set | /quality | /verify | /model-capability | /team-review"
 }
 
 function modeLine() {
   return `autopilot | quality=${dllQuality()} | verify=${dllVerify()} | role-crossing=temporary`
 }
 
+type SupervisorPanelState = ReturnType<typeof readSupervisorState>
+type CostPanelState = ReturnType<typeof readCostStatus>
+
+const STATUS_ROLES: DllRole[] = [
+  "commander",
+  "requirements-inspector",
+  "task-completion-archivist",
+  "final-auditor",
+  "multimodal-context-interpreter",
+]
+
+function truncate(value: string, width: number) {
+  return Locale.truncate(value, Math.max(20, width))
+}
+
+function shortModel(model: string, compact: boolean) {
+  if (!compact) return model
+  const slash = model.indexOf("/")
+  if (slash === -1) return model
+  return model.slice(slash + 1)
+}
+
+function roleModel(role: DllRole, sessionID: string | undefined, projectDir: string | undefined) {
+  return resolveRoleModel(role, sessionID, projectDir)
+}
+
+function formatRoleModel(model: EffectiveRoleModel, compact: boolean) {
+  return `${shortModel(model.primary, compact)} [${model.source}]`
+}
+
+export function buildModelStatusLine(input: {
+  commander: EffectiveRoleModel
+  runningRoles?: string[]
+  compact: boolean
+  width: number
+}) {
+  const running = input.runningRoles?.length
+    ? ` | running ${input.runningRoles.map((role) => role.replace("-archivist", "")).join("+")}`
+    : ""
+  return truncate(`model commander=${formatRoleModel(input.commander, input.compact)}${running}`, input.width)
+}
+
+export function buildWorkStatusLine(input: {
+  supervisor: SupervisorPanelState
+  width: number
+}) {
+  const s = input.supervisor
+  if (!s) return "work ready | phase:default | risk:low | gate:open | verify:not_run"
+  const m = s.metrics ?? {}
+  const verify = m.real_tool_evidence ? "passed" : m.verification_evidence ? "partial" : "not_run"
+  const gate = s.blocked_completion ? "blocked" : s.reviewer_conflict ? "conflict" : "open"
+  return truncate(`work ${gate === "open" ? "ready" : gate} | phase:${s.phase} | risk:${s.risk} | gate:${gate} | verify:${verify}`, input.width)
+}
+
+export function buildReviewStatusLine(input: {
+  supervisor: SupervisorPanelState
+  width: number
+}) {
+  const s = input.supervisor
+  if (!s) return "review idle | required:0 completed:0"
+  const pending = s.required_reviews.filter((reviewer) => !s.completed_reviews.includes(reviewer))
+  const running = s.running_reviewers ?? []
+  const queued = s.queued_reviewers ?? []
+  const parts = [
+    running.length ? `running:${running.join("+")}` : "",
+    queued.length ? `queued:${queued.join(",")}` : "",
+    pending.length ? `pending:${pending.join(",")}` : "pending:none",
+    `done:${s.completed_reviews.length}`,
+  ].filter(Boolean)
+  return truncate(`review ${parts.join(" | ")}`, input.width)
+}
+
+export function buildCostStatusLine(input: {
+  cost: CostPanelState
+  capUsd: number
+  width: number
+}) {
+  const c = input.cost
+  if (!c) return "cost local est. $0.00"
+  const total = formatCostUsd(c.session_total_usd)
+  const cap = formatCostUsd(input.capUsd)
+  const pct = input.capUsd > 0 ? Math.round((c.session_total_usd / input.capUsd) * 100) : 0
+  const flag = c.session_cap_exceeded ? " CAP" : pct >= 80 ? ` ${pct}%` : ""
+  return truncate(`cost ${total}/${cap}${flag}`, input.width)
+}
+
+export function buildQuotaStatusLine(input: {
+  quota: ReturnType<typeof readQuotaFile>
+  width: number
+}) {
+  const providers = input.quota?.providers ?? {}
+  const parts = [
+    ["D", "deepseek"],
+    ["K", "kimi"],
+    ["O", "openai"],
+    ["Z", "zai"],
+    ["M", "mimo"],
+  ].map(([label, provider]) => `${label}:${quotaLine(providers[provider]).replace("quota unavailable", "quota n/a").replace("local est. only", "local")}`)
+  return truncate(`quota ${parts.join(" | ")}${quotaAgeLine(input.quota)}`, input.width)
+}
+
+export function buildNextActionLine(input: {
+  supervisor: SupervisorPanelState
+  cost: CostPanelState
+  width: number
+}) {
+  const s = input.supervisor
+  const c = input.cost
+  if (c?.session_cap_exceeded) return truncate("next user decision required: cost cap exceeded", input.width)
+  if (!s) return "next ready for a task"
+  if (s.blocked_completion && s.block_reason) return truncate(`next resolve gate: ${s.block_reason}`, input.width)
+  const running = s.running_reviewers ?? []
+  if (running.length > 0) return truncate(`next wait for reviewer: ${running.join(", ")}`, input.width)
+  const pending = s.required_reviews.filter((reviewer) => !s.completed_reviews.includes(reviewer))
+  if (pending.length > 0) return truncate(`next complete reviewer: ${pending.join(", ")}`, input.width)
+  return "next ready"
+}
+
 const money = new Intl.NumberFormat("en-US", {
   style: "currency",
   currency: "USD",
 })
-
-const cny = new Intl.NumberFormat("zh-CN", {
-  style: "currency",
-  currency: "CNY",
-})
-
-const CNY_PROVIDERS = new Set(["deepseek", "kimi", "zai", "mimo"])
-
-function formatProviderCost(cost: number, providerID: string): string {
-  if (CNY_PROVIDERS.has(providerID)) {
-    return cny.format(cost * 7.2)
-  }
-  return money.format(cost)
-}
 
 function readQuotaFile() {
   const file = process.env.DLL_AGENT_QUOTA_FILE
@@ -127,6 +226,11 @@ function quotaLine(value: any) {
   if (!value) return "local est. only"
   if (value.stale) {
     if (value.status === "missing_key") return "missing key [stale]"
+    if (value.status === "configured") return "configured; quota unavailable [stale]"
+    if (value.status === "expired") return "expired [stale]"
+    if (value.status === "quota_unavailable" || value.status === "no_quota_endpoint") return "quota unavailable [stale]"
+    if (value.status === "local_estimate_only") return "local est. only [stale]"
+    if (value.status === "unavailable") return "unavailable [stale]"
     if (value.status === "requires_admin_key") return "admin key needed [stale]"
     if (value.status === "endpoint_error") return "balance API rejected [stale]"
     if (value.status === "error") return "quota unavailable [stale]"
@@ -137,6 +241,11 @@ function quotaLine(value: any) {
     if (value.kind === "token_fallback") return "local est. only [stale]"
   }
   if (value.status === "missing_key") return "missing key"
+  if (value.status === "configured") return "configured; quota unavailable"
+  if (value.status === "expired") return "expired"
+  if (value.status === "quota_unavailable" || value.status === "no_quota_endpoint") return "quota unavailable"
+  if (value.status === "local_estimate_only") return "local est. only"
+  if (value.status === "unavailable") return "unavailable"
   if (value.status === "requires_admin_key") return "admin key needed"
   if (value.status === "endpoint_error") return "balance API rejected"
   if (value.status === "error") return "quota unavailable"
@@ -171,7 +280,7 @@ function quotaAgeLine(value: any) {
 }
 
 export function DllAgentHomeStatus() {
-  const { theme } = useTheme()
+  const project = useProject()
   const dimensions = useTerminalDimensions()
   const compact = createMemo(() => dimensions().width < 106)
   const [quota, setQuota] = createSignal(readQuotaFile())
@@ -181,6 +290,14 @@ export function DllAgentHomeStatus() {
     return "session: " + Locale.truncateMiddle(sid, compact() ? 24 : 36)
   })
   const width = createMemo(() => Math.max(62, Math.min(compact() ? 82 : 110, dimensions().width - 8)))
+  const contentWidth = createMemo(() => width() - 2)
+  const projectDir = createMemo(() => project.instance.path().worktree || project.instance.directory() || process.cwd())
+  const commander = createMemo(() => roleModel("commander", process.env.DLL_AGENT_SESSION_ID, projectDir()))
+  const rolesLine = createMemo(() => {
+    const roles = STATUS_ROLES.map((role) => roleModel(role, process.env.DLL_AGENT_SESSION_ID, projectDir()))
+    const line = roles.map((model) => `${model.role.replace("-context-interpreter", "").replace("-inspector", "")}=${shortModel(model.primary, true)}`).join(" | ")
+    return truncate(line, contentWidth())
+  })
 
   // Idle-aware: 15s active, 60s idle (quota doesn't change rapidly)
   onMount(() => {
@@ -201,77 +318,61 @@ export function DllAgentHomeStatus() {
   return (
     <Show when={enabled()}>
       <box flexDirection="column" width={width()} gap={0}>
-        <text fg={theme.text}>
-          <b>dll-agent status: active.</b>
+        <text>
+          <b>dll-agent</b> active
         </text>
-        <text fg={theme.textMuted}>{session()}</text>
+        <text>{session()}</text>
         <box height={1} />
-        <text fg={theme.textMuted}>Show dll-agent status for this session.</text>
-        <text fg={theme.textMuted}>
-          Quality mode: {dllQuality()}. MAX: strongest role team by default; DeepSeek handles normal execution, OpenAI is reserved for escalation/audit triggers.
-        </text>
-        <text fg={theme.textMuted}>
-          Verification mode: {dllVerify()}. STRICT: every important claim needs evidence; high-risk completion needs role review.
-        </text>
-        <text fg={theme.textMuted}>
-          Default commander/executor: deepseek/deepseek-v4-pro, context 1,048,576, thinking=max.
-        </text>
-        <text fg={theme.textMuted}>Inspectors: zai/glm-5.1 and kimi/kimi-k2.6.</text>
-        <text fg={theme.textMuted}>
-          OpenAI strategic/final auditor: openai/gpt-5.5-pro, on-demand only for stuck/off-track/conflict/high-risk finalization.
-        </text>
-        <text fg={theme.textMuted}>
-          Multimodal context interpreter: mimo/mimo-v2.5-pro, on-demand only for non-text inputs (screenshots, images, video, audio).
-        </text>
-        <text fg={theme.textMuted}>
-          Mention commands: /quality, /verify, /model-capability, /roles, /team-review, /chief-engineer, /cross-review.
-        </text>
+        <text>{buildModelStatusLine({ commander: commander(), compact: compact(), width: contentWidth() })}</text>
+        <text>{truncate(modeLine(), contentWidth())}</text>
+        <text>{rolesLine()}</text>
         <box height={1} />
-        <text fg={theme.text}>
-          <b>Quota</b>
-        </text>
-        <For each={["deepseek", "kimi", "openai", "zai", "mimo"]}>
-          {(name) => <text fg={theme.textMuted}>{name}: {quotaLine(quota()?.providers?.[name])}</text>}
-        </For>
-        <text fg={theme.textMuted}>updated: {quotaAgeLine(quota())}</text>
+        <text>{buildQuotaStatusLine({ quota: quota(), width: contentWidth() })}</text>
+        <text>{truncate(commandLine(compact()), contentWidth())}</text>
       </box>
     </Show>
   )
 }
 
 export function DllAgentHomeLogo() {
-  const { theme } = useTheme()
+  const project = useProject()
   const dimensions = useTerminalDimensions()
   const compact = createMemo(() => dimensions().width < 96)
+  const projectDir = createMemo(() => project.instance.path().worktree || project.instance.directory() || process.cwd())
+  const commander = createMemo(() => roleModel("commander", process.env.DLL_AGENT_SESSION_ID, projectDir()))
+  const lineWidth = createMemo(() => Math.max(24, Math.min(96, dimensions().width - 8)))
 
   return (
     <Show when={enabled()}>
       <box flexDirection="column" alignItems="center" gap={1}>
-        <text fg={theme.text}>
+        <text>
           <b>dll-agent</b>
         </text>
-        <text fg={theme.textMuted}>{modeLine()}</text>
-        <text fg={theme.textMuted}>{teamLine(compact())}</text>
+        <text>{truncate(modeLine(), lineWidth())}</text>
+        <text>{buildModelStatusLine({ commander: commander(), compact: compact(), width: lineWidth() })}</text>
       </box>
     </Show>
   )
 }
 
 export function DllAgentSessionPanel(props: { sessionID?: string }) {
-  const { theme } = useTheme()
+  const project = useProject()
   const dimensions = useTerminalDimensions()
   const compact = createMemo(() => dimensions().width < 106)
+  const sessionID = createMemo(() => process.env.DLL_AGENT_SESSION_ID || props.sessionID)
   const session = createMemo(() => {
-    const sid = process.env.DLL_AGENT_SESSION_ID || props.sessionID
+    const sid = sessionID()
     if (!sid) return "session: active"
     return "session: " + Locale.truncateMiddle(sid, compact() ? 24 : 36)
   })
-  const left = createMemo(() => Locale.truncate(`dll-agent | ${session()} | ${modeLine()}`, Math.max(30, dimensions().width - 4)))
-  const right = createMemo(() => Locale.truncate(teamLine(compact()), Math.max(30, dimensions().width - 4)))
+  const contentWidth = createMemo(() => Math.max(34, dimensions().width - 4))
+  const projectDir = createMemo(() => project.instance.path().worktree || project.instance.directory() || process.cwd())
+  const commander = createMemo(() => roleModel("commander", sessionID(), projectDir()))
 
   // Supervisor state signal
   const [supervisor, setSupervisor] = createSignal(readSupervisorState())
   const [costStatus, setCostStatus] = createSignal(readCostStatus())
+  const [quota, setQuota] = createSignal(readQuotaFile())
 
   onMount(() => {
     let lastUpdated = ""
@@ -280,6 +381,7 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
         const sv = readSupervisorState()
         setSupervisor(sv)
         setCostStatus(readCostStatus())
+        setQuota(readQuotaFile())
         lastUpdated = sv?.updated_at ?? ""
       },
       10_000, // active: 10s
@@ -289,103 +391,10 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
     onCleanup(cleanup)
   })
 
-  const riskColor = createMemo(() => {
-    const risk = supervisor()?.risk
-    if (risk === "high") return "#ef4444" // red
-    if (risk === "medium") return "#f59e0b" // amber
-    return theme.textMuted
-  })
-
-  const supervisorLine = createMemo(() => {
-    const s = supervisor()
-    if (!s) return null
-    const parts: string[] = []
-    parts.push(`phase:${s.phase}`)
-    parts.push(`risk:${s.risk}`)
-    if (s.blocked_completion) parts.push("BLOCKED")
-    const pending = s.required_reviews.filter((r: string) => !s.completed_reviews.includes(r))
-    if (pending.length > 0) parts.push(`reviews:${pending.join(",")}`)
-    const running = s.running_reviewers ?? []
-    if (running.length > 0) parts.push(`running:${running.join("+")}(parallel x${running.length})`)
-    const queued = s.queued_reviewers ?? []
-    if (queued.length > 0) parts.push(`queued:${queued.join(",")}`)
-    return Locale.truncate(parts.join(" | "), Math.max(28, dimensions().width - 6))
-  })
-
-  const costLine = createMemo(() => {
-    const c = costStatus()
-    if (!c) return null
-    const total = formatCostUsd(c.session_total_usd)
-    const cap = formatCostUsd(SESSION_CAP_USD)
-    const pct = SESSION_CAP_USD > 0 ? Math.round((c.session_total_usd / SESSION_CAP_USD) * 100) : 0
-    const flag = c.session_cap_exceeded ? " CAP!" : pct >= 80 ? ` ${pct}%` : ""
-    return `local est. ${total}/${cap}${flag}`
-  })
-
-  const costByProviderLine = createMemo(() => {
-    const c = costStatus()
-    if (!c) return null
-    const entries = Object.entries(c.by_provider ?? {})
-      .filter(([, v]) => Number.isFinite(v) && v > 0)
-      .sort(([, a], [, b]) => b - a)
-    if (entries.length === 0) return null
-    const exceededMap = c.provider_cap_exceeded ?? {}
-    const parts = entries.map(([provider, cost]) => {
-      const flag = exceededMap[provider] ? "!" : ""
-      return `${provider}${flag}=${formatProviderCost(cost, provider)}`
-    })
-    return Locale.truncate(`local est.: ${parts.join("  ")}`, Math.max(28, dimensions().width - 6))
-  })
-
   const costWarningLine = createMemo(() => {
     const w = costStatus()?.last_warning
     if (!w) return null
-    return Locale.truncate(`! ${w}`, Math.max(28, dimensions().width - 6))
-  })
-
-  const uxLine = createMemo(() => {
-    const s = supervisor()
-    const c = costStatus()
-    if (!s) return null
-    const m = s.metrics ?? {}
-    const ux: UxState = {
-      ...defaultUxState(),
-      task: {
-        goal: s.phase || "default",
-        phase: s.phase,
-        plan: null,
-        blocker: s.block_reason,
-        risk: (s.risk as any) ?? "low",
-        modifiedFiles: [],
-        verificationStatus: m.real_tool_evidence ? "passed" as const : m.verification_evidence ? "partial" as const : "not_run" as const,
-        nextAction: s.blocked_completion ? "resolve blockers" : s.required_reviews.length > 0 ? "complete reviews" : null,
-        requiresUserInput: false,
-        userInputReason: null,
-      },
-      supervisor: {
-        active: s.blocked_completion || s.required_reviews.length > 0,
-        recoveryActive: s.required_reviews.includes("chief-engineer" as any),
-        recoveryAttempts: 0,
-        maxRecoveryAttempts: 5,
-        reviewers: {
-          required: s.required_reviews as any[],
-          completed: s.completed_reviews as any[],
-          queued: s.queued_reviewers ?? [],
-          running: s.running_reviewers ?? [],
-        },
-        gateBlocked: s.blocked_completion,
-        gateBlockReason: s.block_reason,
-        gateRetriesExhausted: s.reviewer_conflict,
-        crossReviewActive: s.reviewer_conflict,
-      },
-      cost: {
-        sessionTotalUsd: c?.session_total_usd ?? 0,
-        capUsd: SESSION_CAP_USD,
-        exceeded: c?.session_cap_exceeded ?? false,
-        lastWarning: c?.last_warning ?? null,
-      },
-    }
-    return buildCompactSummary(ux)
+    return Locale.truncate(`warning ${w}`, contentWidth())
   })
 
   return (
@@ -393,28 +402,34 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
       <box
         flexDirection="column"
         gap={0}
-        paddingTop={1}
+        paddingTop={0}
         paddingBottom={1}
-        paddingLeft={2}
-        paddingRight={2}
-        backgroundColor={theme.backgroundPanel}
+        paddingLeft={1}
+        paddingRight={1}
       >
-        <text fg={theme.text}>{left()}</text>
-        <text fg={theme.textMuted}>{right()}</text>
-        <Show when={supervisorLine()}>
-          <text fg={riskColor()}>{supervisorLine()}</text>
-        </Show>
-        <Show when={costLine()}>
-          <text fg={costStatus()?.session_cap_exceeded ? "#ef4444" : theme.textMuted}>{costLine()}</text>
-        </Show>
-        <Show when={costByProviderLine()}>
-          <text fg={theme.textMuted}>{costByProviderLine()}</text>
-        </Show>
+        <text>
+          <b>dll-agent</b> {supervisor()?.blocked_completion ? "blocked" : "ready"}{" "}
+          {truncate(session(), compact() ? 38 : 54)}
+        </text>
+        <text>
+          {buildModelStatusLine({
+            commander: commander(),
+            runningRoles: supervisor()?.running_reviewers,
+            compact: compact(),
+            width: contentWidth(),
+          })}
+        </text>
+        <text>{buildWorkStatusLine({ supervisor: supervisor(), width: contentWidth() })}</text>
+        <text>{buildReviewStatusLine({ supervisor: supervisor(), width: contentWidth() })}</text>
+        <text>
+          {buildCostStatusLine({ cost: costStatus(), capUsd: SESSION_CAP_USD, width: contentWidth() })}
+        </text>
+        <text>{buildQuotaStatusLine({ quota: quota(), width: contentWidth() })}</text>
+        <text>
+          {buildNextActionLine({ supervisor: supervisor(), cost: costStatus(), width: contentWidth() })}
+        </text>
         <Show when={costWarningLine()}>
-          <text fg="#f59e0b">{costWarningLine()}</text>
-        </Show>
-        <Show when={uxLine()}>
-          <text fg={theme.textMuted}>{uxLine()}</text>
+          <text>{costWarningLine()}</text>
         </Show>
       </box>
     </Show>
@@ -422,14 +437,13 @@ export function DllAgentSessionPanel(props: { sessionID?: string }) {
 }
 
 export function DllAgentPromptHint() {
-  const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
   const compact = createMemo(() => dimensions().width < 96)
   const text = createMemo(() => Locale.truncate(commandLine(compact()), Math.max(24, Math.floor(dimensions().width * 0.55))))
 
   return (
     <Show when={enabled()}>
-      <text fg={theme.textMuted} wrapMode="none">
+      <text wrapMode="none">
         {text()}
       </text>
     </Show>

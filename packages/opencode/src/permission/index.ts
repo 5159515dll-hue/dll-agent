@@ -186,6 +186,7 @@ export const layer = Layer.effect(
         permission: request.permission,
         patterns: [...request.patterns],
         metadata: request.metadata as Record<string, unknown> | undefined,
+        sessionID: request.sessionID,
       })
       if (preCheck.intercepted && preCheck.action === "allow") {
         log.info("dll-agent auto-approved", {
@@ -200,8 +201,9 @@ export const layer = Layer.effect(
           ruleset: [{ permission: request.permission, pattern: "*", action: "deny" }],
         })
       }
+      const forceAsk = preCheck.intercepted && preCheck.action === "ask"
 
-      let needsAsk = false
+      let needsAsk = forceAsk
 
       for (const pattern of request.patterns) {
         const rule = evaluate(request.permission, pattern, ruleset, approved)
@@ -211,7 +213,7 @@ export const layer = Layer.effect(
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
         }
-        if (rule.action === "allow") continue
+        if (rule.action === "allow" && !forceAsk) continue
         needsAsk = true
       }
 

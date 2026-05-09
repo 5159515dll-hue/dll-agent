@@ -40,7 +40,7 @@ const START_POLICY_MAP: Record<McpStartPolicy, StartPolicy> = {
 function inferInstallStrategy(tool: ToolEntry): InstallStrategy {
   if (tool.kind === "skill") return "none"
   if (tool.kind === "mcp" && tool.mcp?.command?.[0] === "npx") return "npx_runtime"
-  if (tool.requirements?.binaries?.includes("python3")) return "project_local_pip"
+  if (inferPythonPackages(tool).length > 0) return "project_local_pip"
   if (tool.requirements?.binaries?.includes("npx")) return "npx_runtime"
   if (tool.requirements?.binaries?.includes("gh")) return "system_package_manager"
   return "none"
@@ -156,7 +156,26 @@ function mapDependencies(tool: ToolEntry): CapabilityDependencies | undefined {
   if (tool.requirements?.binaries?.length) deps.binaries = tool.requirements.binaries
   if (tool.requirements?.tokens?.length) deps.tokens = tool.requirements.tokens
   if (tool.requirements?.ports?.length) deps.ports = tool.requirements.ports
+  const packages = inferPythonPackages(tool)
+  if (packages.length > 0) deps.packages = packages
   return Object.keys(deps).length > 0 ? deps : undefined
+}
+
+function inferPythonPackages(tool: ToolEntry): string[] {
+  if (tool.id === "doc-docx") return ["python-docx"]
+  if (tool.id === "pdf") return ["pypdf"]
+  if (tool.id === "ppt-pptx") return ["python-pptx"]
+  if (tool.id === "xlsx") return ["openpyxl"]
+  return []
+}
+
+function inferVerifyCommands(tool: ToolEntry): string[] | undefined {
+  if (tool.id === "doc-docx") return [`python3 -c "import docx"`]
+  if (tool.id === "pdf") return [`python3 -c "import pypdf"`]
+  if (tool.id === "ppt-pptx") return [`python3 -c "import pptx"`]
+  if (tool.id === "xlsx") return [`python3 -c "import openpyxl"`]
+  if (tool.id === "engineering-test") return ["bun typecheck", "bun test test/dll-agent/"]
+  return undefined
 }
 
 function mapSecurity(tool: ToolEntry): CapabilitySecurity | undefined {
@@ -206,9 +225,7 @@ export function toolToCapabilityEntry(tool: ToolEntry): CapabilityEntry {
     dependencies: mapDependencies(tool),
     security: mapSecurity(tool),
     triggers: mapTriggers(tool),
-    verify_commands: (tool.kind === "skill" || tool.id === "engineering-test")
-      ? ["bun typecheck", "bun test test/dll-agent/"]
-      : undefined,
+    verify_commands: inferVerifyCommands(tool),
     source: "tool-catalog.ts::GLOBAL_DEFAULT_TOOLS",
     source_type: "builtin",
     confidence: 1.0,
