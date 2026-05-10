@@ -2,7 +2,7 @@ import { resolveRoleModel, type DllRole } from "./role-model-registry"
 import { COOLDOWN_CONFIG, type ReviewerRole, type RiskLevel } from "./interfaces"
 import type { Metrics } from "./triggers"
 import type { MessageV2 } from "@/session/message-v2"
-import { canSuppressRoutineReview } from "./task-intake-classifier"
+import { canSuppressRoutineReview, canUseReadOnlyAnswerFinalization } from "./task-intake-classifier"
 
 const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "deepseek/deepseek-v4-pro": 1_048_576,
@@ -45,7 +45,7 @@ export function assessRisk(metrics: Metrics): RiskLevel {
 
   if (metrics.reviewerConflictSignal) score += 2
 
-  if (metrics.finalClaim && !metrics.verificationEvidence) score += 3
+  if (metrics.finalClaim && !metrics.verificationEvidence && !isReadOnlyAnswerTask(metrics)) score += 3
   if (metrics.highRiskTaskSignal) score += 4
 
   if (score >= 6) return "high"
@@ -118,7 +118,7 @@ export function maxReviewersForRouting(risk: RiskLevel, metrics: Metrics) {
     risk === "high" ||
     metrics.reviewerConflictSignal ||
     metrics.repeatedToolFailure ||
-    (metrics.finalClaim && !metrics.realToolEvidence)
+    (metrics.finalClaim && !metrics.realToolEvidence && !isReadOnlyAnswerTask(metrics))
   ) return 3
   if (risk === "medium" || metrics.recentUserCorrection || metrics.userCorrections > 0 || metrics.kimiCompletionCheckSignal) return 2
   return COOLDOWN_CONFIG.max_reviewers_per_round
@@ -136,12 +136,13 @@ export function reviewerRequiredForCorrectness(
   if (reviewer === "chief-engineer" && (metrics.repeatedToolFailure || metrics.toolFailures >= 3 || metrics.permissionDenied > 0)) return true
   if (reviewer === "role-cross" && metrics.reviewerConflictSignal) return true
   if (reviewer === "task-completion-archivist" && metrics.kimiCompletionCheckSignal) return true
-  if (reviewer === "final-auditor" && metrics.finalClaim) return true
+  if (reviewer === "final-auditor" && metrics.finalClaim && !isReadOnlyAnswerTask(metrics)) return true
   if (reviewer === "multimodal-context-interpreter" && reason.includes("multimodal input")) return true
   return false
 }
 
 function isSuppressibleStatelessTask(metrics: Metrics) {
+  if (isReadOnlyAnswerTask(metrics)) return true
   if (
     !metrics.trivialNoToolTask &&
     !metrics.statelessGreetingTask &&
@@ -152,6 +153,18 @@ function isSuppressibleStatelessTask(metrics: Metrics) {
   if (metrics.repeatedToolFailure || metrics.toolFailures > 0) return false
   if (metrics.permissionDenied > 0) return false
   if (metrics.finalClaim) return false
+  if (metrics.reviewerConflictSignal) return false
+  if (metrics.highRiskTaskSignal) return false
+  if (metrics.multimodalSignal) return false
+  if (metrics.scopeExpandedSignal || metrics.phaseSwitchSignal) return false
+  return true
+}
+
+function isReadOnlyAnswerTask(metrics: Metrics) {
+  if (!metrics.readOnlyAnswerTask && !canUseReadOnlyAnswerFinalization(metrics.taskClassification)) return false
+  if (metrics.recentUserCorrection || metrics.userCorrections > 0) return false
+  if (metrics.repeatedToolFailure || metrics.toolFailures > 0) return false
+  if (metrics.permissionDenied > 0) return false
   if (metrics.reviewerConflictSignal) return false
   if (metrics.highRiskTaskSignal) return false
   if (metrics.multimodalSignal) return false

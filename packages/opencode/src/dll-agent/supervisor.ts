@@ -310,12 +310,13 @@ export function decide(
       (initialState.queued_reviewers ?? []).length > 0 ||
       (initialState.running_reviewers ?? []).length > 0,
   )
-  const metrics = (rawMetrics.statelessChatTask || canSuppressRoutineReview(rawMetrics.taskClassification)) && hasUnresolvedSupervisorState
+  const metrics = (rawMetrics.statelessChatTask || rawMetrics.readOnlyAnswerTask || canSuppressRoutineReview(rawMetrics.taskClassification)) && hasUnresolvedSupervisorState
     ? {
         ...rawMetrics,
         trivialNoToolTask: false,
         statelessGreetingTask: false,
         statelessChatTask: false,
+        readOnlyAnswerTask: false,
         taskClassification: rawMetrics.taskClassification
           ? {
               ...rawMetrics.taskClassification,
@@ -523,12 +524,18 @@ export function decide(
         ? "trivial_no_tool_task"
         : metrics.taskClassification?.interaction_level === "L1"
         ? `task_intake:${metrics.taskClassification.task_kind}:L1`
+        : metrics.readOnlyAnswerTask
+        ? `task_intake:${metrics.taskClassification?.task_kind ?? "read_only"}:L2`
         : "ordinary low-risk task or no correctness-required reviewer trigger",
       skippedReviewers: [],
-      correctnessReason: metrics.statelessChatTask || canSuppressRoutineReview(metrics.taskClassification)
+      correctnessReason: metrics.readOnlyAnswerTask
+        ? "user-origin task is read-only analysis: no mutation, no required verification, no blocker, and no high-risk state"
+        : metrics.statelessChatTask || canSuppressRoutineReview(metrics.taskClassification)
         ? "no stateful task, no tool use, no file mutation, no verification requirement, and no blocking supervisor state"
         : "commander can proceed alone because no correction, repeated failure, evidence gap, high-risk, conflict, long-context, or multimodal trigger was present",
-      costReason: metrics.statelessChatTask || canSuppressRoutineReview(metrics.taskClassification)
+      costReason: metrics.readOnlyAnswerTask
+        ? "avoid unnecessary reviewer/verifier/final-auditor for read-only analysis answer"
+        : metrics.statelessChatTask || canSuppressRoutineReview(metrics.taskClassification)
         ? "avoid unnecessary reviewer/verifier for stateless short answer"
         : "avoid unnecessary multi-model review when correctness does not require it",
       evidenceRefs: [],
@@ -571,6 +578,8 @@ export function decide(
       trivial_no_tool_task: metrics.trivialNoToolTask,
       stateless_greeting_task: metrics.statelessGreetingTask,
       stateless_chat_task: metrics.statelessChatTask,
+      read_only_answer_task: metrics.readOnlyAnswerTask,
+      read_only_tool_answer_task: metrics.readOnlyToolAnswerTask,
       task_kind: metrics.taskClassification?.task_kind,
       interaction_level: metrics.taskClassification?.interaction_level,
     },

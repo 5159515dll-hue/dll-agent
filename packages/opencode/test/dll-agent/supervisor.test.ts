@@ -131,23 +131,13 @@ describe("DllAgentSupervisor.buildVerifierSubtask", () => {
     expect(b.agent).toBe("general")
   })
 
-  test("dedupes same reviewer/reason for the same user message via trigger fingerprint", () => {
+  test("does not create reviewer fingerprint from natural-language correction without structured/model judgement", () => {
     const sid = sessionID("fingerprint")
     const messages = [userMsg("msg_user_same", "不对，这个方向跑偏了，需要按新的方向处理。")]
     const first = decide(messages, sid, 1)
-    expect(first.reviewers).toContain("requirements-inspector")
-    const reviewer = "requirements-inspector"
-    recordReviewerCall(
-      sid,
-      reviewer,
-      1,
-      first.fingerprints?.[reviewer],
-      first.reasons[reviewer],
-      "msg_user_same",
-    )
-    markReviewerCompleted(sid, reviewer)
-
+    expect(first.reviewers).toEqual([])
     const second = decide(messages, sid, 10)
+    expect(second.reviewers).toEqual([])
     expect(second.reviewers).not.toContain("requirements-inspector")
   })
 
@@ -361,17 +351,15 @@ describe("DllAgentSupervisor buildFinalReportContext (P0-loop)", () => {
 })
 
 describe("DllAgentSupervisor auto-verifier (P0-verification)", () => {
-  test("completion claim without real tool evidence triggers auto-verifier", () => {
+  test("assistant natural-language completion claim alone does not trigger auto-verifier", () => {
     const sid = sessionID("auto_verifier")
     const messages: any[] = [
       userMsg("msg_u", "请修复bug"),
       asstMsg("已经完成修复，所有测试通过，可以交付。"),
     ]
     const decision = decide(messages, sid, 1)
-    expect(decision.verifierTask).toBeDefined()
-    expect(decision.verifierTask!.type).toBe("subtask")
-    expect(decision.verifierTask!.command).toBe("dll-agent-supervisor")
-    expect(decision.verifierTask!.prompt).toContain("bun typecheck")
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.final_claim).toBe(false)
   })
 
   test("non-completion message does NOT trigger auto-verifier", () => {
@@ -412,25 +400,9 @@ describe("DllAgentSupervisor reviewer fingerprint loop prevention", () => {
       asstMsg("好的，让我分析一下。"),
     ]
 
-    // Force longContextSignal by passing a low contextLimit to ensure contextPercent >= 40
+    // Natural-language "long context" wording no longer creates a reviewer trigger.
     const decision1 = decide(messages1, sid, 1, 400)
-    expect(decision1.reviewers).toContain("long-context-archivist")
-
-    // Record the reviewer call with the original fingerprint
-    const fpKey = "long-context-archivist"
-    recordReviewerCall(
-      sid,
-      fpKey,
-      1,
-      decision1.fingerprints?.[fpKey],
-      decision1.reasons[fpKey],
-      realUserID,
-    )
-
-    // Verify fingerprint was stored
-    const cd1 = loadCooldown(sid)
-    const fp1 = decision1.fingerprints?.[fpKey]
-    expect(cd1.review_fingerprints?.[fp1!]).toBeDefined()
+    expect(decision1.reviewers).not.toContain("long-context-archivist")
 
     // Step 2: simulate reviewer completes, synthetic user message injected
     const syntheticID = "msg_synthetic_summarize"
@@ -524,7 +496,7 @@ describe("DllAgentSupervisor.Phase6.modelContextLimit", () => {
 })
 
 describe("DllAgentSupervisor.Phase6.kimiPreReportTrigger", () => {
-  test("Rule 2b: triggers long-context-archivist when context >= 30% and final claim", () => {
+  test("Rule 2b: does not trigger long-context-archivist from assistant prose alone", () => {
     const sid = sessionID("kimi_pre_report")
     const msgs: any[] = [
       userMsg("msg_user_kpr", "继续执行任务"),
@@ -542,7 +514,7 @@ describe("DllAgentSupervisor.Phase6.kimiPreReportTrigger", () => {
       },
     ]
     const decision = decide(msgs, sid, 10, 1_000_000)
-    expect(decision.reviewers).toContain("long-context-archivist")
+    expect(decision.reviewers).not.toContain("long-context-archivist")
   })
 
   test("Rule 2b: does NOT trigger with low context and no final claim", () => {
@@ -557,26 +529,26 @@ describe("DllAgentSupervisor.Phase6.kimiPreReportTrigger", () => {
 })
 
 describe("DllAgentSupervisor.Phase6.glmCompletionClaimCheck", () => {
-  test("Rule 8: triggers requirements-inspector when completion claim without real tool evidence", () => {
+  test("Rule 8: natural-language completion prose alone does not trigger requirements-inspector", () => {
     const sid = sessionID("glm_completion_claim")
     const msgs: any[] = [
       userMsg("msg_user_glm", "修复那个bug"),
       asstMsg("已经完成了，验证通过，all tests pass"),
     ]
     const decision = decide(msgs, sid, 5)
-    expect(decision.reviewers).toContain("requirements-inspector")
+    expect(decision.reviewers).not.toContain("requirements-inspector")
   })
 })
 
 describe("DllAgentSupervisor.Phase6.kimiCompletionCheck", () => {
-  test("Rule 9: triggers task-completion-archivist when completion claim has unfinished indicators", () => {
+  test("Rule 9: natural-language completion prose alone does not trigger task-completion-archivist", () => {
     const sid = sessionID("kimi_completion")
     const msgs: any[] = [
       userMsg("msg_user_kc", "优化模型路由"),
       asstMsg("任务已完成，但未完成：TODO cleanup pending"),
     ]
     const decision = decide(msgs, sid, 8)
-    expect(decision.reviewers).toContain("task-completion-archivist")
+    expect(decision.reviewers).not.toContain("task-completion-archivist")
   })
 
   test("Rule 9: does NOT trigger without completion claim", () => {
@@ -591,26 +563,26 @@ describe("DllAgentSupervisor.Phase6.kimiCompletionCheck", () => {
 })
 
 describe("DllAgentSupervisor.Phase6.scopeExpansion", () => {
-  test("Rule 10: triggers requirements-inspector on scope expansion", () => {
+  test("Rule 10: natural-language scope expansion wording waits for semantic judgement", () => {
     const sid = sessionID("scope_expansion")
     const msgs: any[] = [
       userMsg("msg_user_se", "不对，你扩大了范围，增加了额外需求"),
       asstMsg("I see, let me narrow the scope."),
     ]
     const decision = decide(msgs, sid, 4)
-    expect(decision.reviewers).toContain("requirements-inspector")
+    expect(decision.reviewers).not.toContain("requirements-inspector")
   })
 })
 
 describe("DllAgentSupervisor.Phase6.phaseSwitch", () => {
-  test("Rule 2c: triggers long-context-archivist on phase switch", () => {
+  test("Rule 2c: natural-language phase switch wording waits for semantic judgement", () => {
     const sid = sessionID("phase_switch")
     const msgs: any[] = [
       userMsg("msg_user_ps", "先不要做那个了，换个方向，先处理 token 优化"),
       asstMsg("Switching direction to token optimization."),
     ]
     const decision = decide(msgs, sid, 6)
-    expect(decision.reviewers).toContain("long-context-archivist")
+    expect(decision.reviewers).not.toContain("long-context-archivist")
   })
 })
 
@@ -705,10 +677,11 @@ describe("DllAgentSupervisor.Phase6.defaultCommander", () => {
 })
 
 describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
-  test("user correction triggers requirements-inspector even when it costs more", () => {
+  test("natural-language correction waits for semantic judgement instead of hard-coded reviewer trigger", () => {
     const sid = sessionID("correctness_user_correction")
     const decision = decide([userMsg("msg_user_corr", "不对，不是这个目标，你跑偏了，按我原来的要求修。")], sid, 1)
-    expect(decision.reviewers).toContain("requirements-inspector")
+    expect(decision.reviewers).not.toContain("requirements-inspector")
+    expect(decision.metrics.interaction_level).toBe("L1")
   })
 
   test("high-risk repeated failure can route more than one reviewer", () => {
@@ -720,9 +693,8 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
       asstMsg("已完成，但 tests not run and doctor failed"),
     ]
     const decision = decide(messages, sid, 1)
-    expect(decision.reviewers.length).toBeGreaterThan(1)
-    expect(decision.reviewers).toContain("requirements-inspector")
     expect(decision.reviewers).toContain("chief-engineer")
+    expect(decision.reviewers).not.toContain("requirements-inspector")
   })
 
   test("MiMo multimodal reviewer does not enter pure text/code tasks", () => {
@@ -782,12 +754,12 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
     const decision = decide([userMsg("msg_user_hello", "你好")], sid, 1)
     expect(decision.reviewers).toEqual([])
     expect(decision.verifierTask).toBeUndefined()
-    expect(decision.metrics.stateless_greeting_task).toBe(true)
+    expect(decision.metrics.stateless_greeting_task).toBe(false)
     expect(decision.metrics.stateless_chat_task).toBe(true)
     expect(decision.metrics.high_risk_task_signal).toBe(false)
     const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
     const commanderOnly = entries.find((entry) => entry.payload.action === "commander_only")
-    expect(commanderOnly?.payload.trigger_reason).toBe("stateless_greeting_task")
+    expect(commanderOnly?.payload.trigger_reason).toBe("trivial_no_tool_task")
   })
 
   test("stateless greeting is not polluted by generated reviewer and verification prose", () => {
@@ -799,7 +771,7 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
     ], sid, 1)
     expect(decision.reviewers).toEqual([])
     expect(decision.verifierTask).toBeUndefined()
-    expect(decision.metrics.stateless_greeting_task).toBe(true)
+    expect(decision.metrics.stateless_greeting_task).toBe(false)
     expect(decision.metrics.high_risk_task_signal).toBe(false)
     expect(decision.metrics.final_claim).toBe(false)
   })
@@ -813,13 +785,36 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
     ], sid, 1)
     expect(decision.reviewers).toEqual([])
     expect(decision.verifierTask).toBeUndefined()
-    expect(decision.metrics.task_kind).toBe("informational")
+    expect(decision.metrics.task_kind).toBe("stateless_chat")
     expect(decision.metrics.interaction_level).toBe("L1")
     expect(decision.metrics.high_risk_task_signal).toBe(false)
     expect(decision.metrics.stateless_chat_task).toBe(true)
     const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
     const commanderOnly = entries.find((entry) => entry.payload.action === "commander_only")
-    expect(commanderOnly?.payload.trigger_reason).toBe("task_intake:informational:L1")
+    expect(commanderOnly?.payload.trigger_reason).toBe("trivial_no_tool_task")
+  })
+
+  test("read-only project introduction stays commander-only after answer completion prose", () => {
+    const evidence = useEvidenceFile("routing-read-only-project-intro")
+    const sid = sessionID("routing_read_only_project_intro")
+    const userText = ["介绍", "工程", "不修改内容"].join(" ")
+    const assistantText = [
+      ["完整", "介绍"].join(""),
+      ["未修改", "源文件"].join(""),
+      ["待完成", "后续实验"].join("："),
+    ].join("\n")
+    const decision = decide([
+      userMsg("msg_user_project_intro", userText),
+      asstMsg(assistantText),
+    ], sid, 1)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.high_risk_task_signal).toBe(false)
+    expect(decision.metrics.kimi_completion_check_signal).toBe(false)
+    expect(decision.metrics.glm_completion_claim_signal).toBe(false)
+    const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
+    const commanderOnly = entries.find((entry) => entry.payload.action === "commander_only")
+    expect(commanderOnly?.payload.trigger_reason).toBe("trivial_no_tool_task")
   })
 
   test("trivial no-tool prompt does not hide unresolved supervisor state", () => {
@@ -836,15 +831,13 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
     expect(decision.metrics.trivial_no_tool_task).toBe(false)
   })
 
-  test("high-risk provider/routing/gate task allows multiple reviewers", () => {
+  test("natural-language high-risk module names do not hard-trigger multiple reviewers", () => {
     const sid = sessionID("routing_high_risk_governance")
     const decision = decide([
       userMsg("msg_user_high_risk", "修改 provider routing gate evidence result ledger permission 相关逻辑，必须严格验证。"),
     ], sid, 1)
-    expect(decision.reviewers.length).toBeGreaterThan(1)
-    expect(decision.reviewers).toContain("requirements-inspector")
-    expect(decision.reviewers).toContain("chief-engineer")
-    expect(decision.metrics.high_risk_task_signal).toBe(true)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.metrics.high_risk_task_signal).toBe(false)
   })
 
   test("correctness-required skipped reviewer writes unresolved routing risk and final gate blocks", () => {

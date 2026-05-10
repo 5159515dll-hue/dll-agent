@@ -120,10 +120,11 @@ function matchSkill(
 
 function canUseRepoDoctorMarker(input: ActivationInput) {
   const classification = classifyTaskIntake({ userText: input.userText })
+  if (input.files.length > 0) return true
   if (!classification.repo_doctor_allowed && canSuppressRoutineReview(classification)) return false
   if (input.signals?.some((s) => s === "tool_failures_high" || s === "tool_failures_repeated" || s === "permission_denied" || s === "verification_failed")) return true
   if (input.intents.some((i) => i === "repo-doctor" || i === "diagnose")) return true
-  if (/项目.*乱|repo.*health|健康检查|baseline.*broken|项目.*坏|diagnose|repo doctor|跑不起来|启动失败|依赖.*问题|test|typecheck|build|doctor|检查|诊断/i.test(input.userText)) return true
+  if (/\b(?:repo[-_ ]?doctor|diagnose|typecheck|build|doctor|bun\s+test|npm\s+test|pytest)\b/i.test(input.userText)) return true
   return false
 }
 

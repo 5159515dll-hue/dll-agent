@@ -433,8 +433,22 @@ RC 额外边界：
 | model usage / routing report | implemented_runtime_verified | `/model-usage` 和 `/routing-report` 读取 `model.routing_decision`，显示 correctness/cost reason、skip reason 和 unresolved risk |
 | doctor next action | implemented_runtime_verified | `/doctor-next` 将 doctor warn/fail 映射为 no action / optional / authorization required / blocking，不执行 repair |
 | regression scenario tracker | implemented_runtime_verified | `/regression-status` 暴露 20 个验收场景的 `not_run` 状态；不把 registry 当成真实通过 |
-| TUI visual redesign | missing | 本 Phase 不改 TUI 外观；只提供 direct status adapter 和 doctor observability check |
+| TUI visual redesign | implemented_runtime_verified | session panel 已重排为 global status、task overview、model/capability summary、command activity mini window；仅消费只读 adapter，不改变业务状态 |
 | persistent regression run history | partial_runtime | 20 场景 registry/status 已实现；真实场景执行历史仍需后续记录 |
+
+### TUI Layout Refresh 状态
+
+| Capability | Status | Notes |
+|---|---|---|
+| Global status bar | implemented_runtime_verified | 顶部显示项目/session、final/task status、commander model/source、active role、doctor、cost/quota |
+| Task overview | implemented_runtime_verified | 显示 goal、phase/risk、plan blockers、next action、verification、Result Ledger 和 continuation 摘要 |
+| Model/capability summary | implemented_runtime_verified | 读取 role-provider snapshot 与 capability-status；显示 reviewer/routing、tools/skills/MCP/software、running/on-demand/blocked |
+| Command activity mini window | implemented_runtime_verified | `command-activity.ts` 从 evidence 和 Result Ledger command refs 构建脱敏只读 command/tool 摘要 |
+| Command expanded view | implemented_runtime_verified | 鼠标点击展开，Esc 收起，上下键滚动；不执行命令、不触发模型、不启动 MCP |
+| Terminal theme respect | implemented_runtime_verified | dll-agent panel 不设置固定 foreground/background；保持终端默认主题和少量文本强调 |
+| Chinese default labels | implemented_runtime_verified | dll-agent 自有标签默认中文；role/model/provider/evidence refs 保留原值以匹配真实 runtime |
+| Idle chat display guard | implemented_runtime_verified | 无 Goal Contract、verification、Result Ledger、reviewer、continuation、blocker 时显示“待命/普通对话/计划未建立”，不把闲聊显示成 UNVERIFIED_PARTIAL |
+| UI business side effects | unchanged_runtime_verified | 本切片不改 Provider/RoleModel、routing、gate、recovery、permission、Result Ledger、MCP/LSP/multimodal、Capability Acquisition 语义 |
 
 ### Phase 9 Architecture Modularization 状态
 
@@ -537,6 +551,7 @@ RC 额外边界：
 | Live smoke S1 trivial no-tool false positive | ✅ 本轮修复 | `/role-model-set commander ... --scope session` 后的“只回答 OK，不要执行工具。”识别为 `trivial_no_tool_task`，过滤本地 role-model command 输出，保持 commander-only，不触发 reviewer/verifier/MCP/tool；高风险、纠偏、repeated failure、final evidence 缺失、doctor failed 和 unresolved reviewer 仍不能被抑制 |
 | Live smoke S0 stateless greeting false positive | ✅ 本轮修复并 live_passed | “你好 / hello / hi / 在吗 / 谢谢”等无状态短问候识别为 `stateless_greeting_task`，保持 commander-only，不触发 long-context-archivist、requirements-inspector、chief-engineer、task-completion-archivist、final-auditor、executor auto-verifier、repo-doctor、MCP 或工具；自生成 `<task_result>`、Verification Report、reviewer fallback、subtask resume、Result Ledger、routing evidence、doctor/TUI 文本不再污染 trigger metrics。Live retest session `20260510-120122-08636405` 通过；OpenCode title request 仍按上游行为生成，任务响应为单 commander call |
 | Task Intake Classifier / Interaction Level Gate | ✅ 本轮实现 | 新增 `task-intake-classifier.ts`，按 user-origin input 输出 `task_kind` 与 `L0`-`L4` interaction level。`L0` 问候和 `L1` 普通问答 commander-only；`L2` 只读工程分析不默认 full governance；`L3` 代码/调试/验证接入 Goal Contract/Recovery/Verification；`L4` provider/routing/gate/evidence/permission/secrets/destructive/MCP/doctor failed 等高风险任务保留 reviewer/permission/final/evidence 严格要求 |
+| Intent judgement / consensus gate | ✅ 本轮基座实现 | `intent-consensus.ts` 生成意图裁判计划：确定性高置信直接接受；低置信先由 commander 的非 OpenAI 主模型单模型判断；单模型仍低置信再收集 `/role-model-set` 生效配置中的所有不同非 OpenAI 模型做共识。OpenAI、TTS、VoiceClone、speech/audio 模型被排除；L4 安全硬规则不能被模型共识降级 |
 
 ### Stateless greeting false-positive guard
 
@@ -567,9 +582,11 @@ Supported keys: `greetings`, `informational`, `light_engineering_analysis`, `cod
 
 Model classifier status: `partial_runtime` placeholder only. The deterministic classifier is runtime verified; live model classification is intentionally not called every turn and cannot override L4 safety rules.
 
-## Autonomous Capability Acquisition Phase A / B1
+Intent judgement status: `implemented_deterministic_verified` for planning/participant selection. The runtime now has a single-model-first, low-confidence multi-model-consensus plan, but live model judgement dispatch remains intentionally gated so ordinary high-confidence L0/L1/L2 requests do not create extra model calls. Consensus participants are all distinct effective `/role-model-set` models except OpenAI and voice/audio providers.
 
-Status: `implemented_runtime_verified` for Phase A design/schema/risk-classifier/doctor skeleton and Phase B1 local fixture quarantine/sandbox/rollback substrate. These phases do not download external software, install real packages, execute unknown binaries, start MCP, activate capabilities, or call a live final-auditor model.
+## Autonomous Capability Acquisition Phase A / B1 / B2 / C / D1 / D2
+
+Status: `implemented_runtime_verified` for Phase A design/schema/risk-classifier/doctor skeleton, Phase B1 local fixture quarantine/sandbox/rollback substrate, Phase B2 static download pipeline with local fixture HTTP, Phase C mock final-auditor policy gate, Phase D1 fixture sandbox smoke, and Phase D2 MCP metadata discovery. These phases do not install real packages, execute downloaded content, start MCP, activate capabilities, read GitHub tokens, or call a live final-auditor model.
 
 | Capability | Status | Notes |
 |---|---|---|
@@ -581,7 +598,10 @@ Status: `implemented_runtime_verified` for Phase A design/schema/risk-classifier
 | quarantine store | implemented_runtime_verified | `capability-quarantine.ts` supports fixture candidate create/read/risk/audit/reject/delete under quarantine root |
 | fixture sandbox runtime | implemented_runtime_verified | `capability-sandbox.ts` copies local fixture files and runs non-executing required-file smoke checks only |
 | fixture rollback | implemented_runtime_verified | `capability-rollback.ts` requires dry-run and deletes only managed fixture quarantine/sandbox paths |
-| real download/install/start | missing | No external download, real package install, MCP start, Playwright start, or capability activation in Phase B1 |
+| static download pipeline | implemented_runtime_verified | `capability-download.ts` validates http(s), blocks binary/executable/oversize content, computes sha256, quarantines static text, and creates rollback dry-run; tests use local fixture HTTP when no trusted GitHub raw URL is provided |
+| mock final-auditor gate | implemented_runtime_verified | `capability-audit-runtime.ts` enforces R2 pass-before-sandbox, R3 user authorization, and R4 hard-block with mock verdicts only |
+| MCP metadata discovery | implemented_runtime_verified | GitHub MCP metadata is classified R3 when token/repo mutation is involved; Playwright/browser MCP is R3/on-demand; modelcontextprotocol servers are reference/community mixed and not installed |
+| real download/install/start | partial_runtime | Static low-risk download path exists, but no arbitrary external URL was used this checkpoint; no real package install, MCP start, Playwright start, or capability activation |
 | commands/UX | missing | `/capability-install` and related commands are not wired in Phase B1 |
 
 Safety boundary: R2+ requires rollback before activation; R3 requires user authorization; R4 (`curl | sh`, `sudo`, global install, secrets, destructive delete, git push/release/upload, real browser profile, unknown binary) is hard-blocked by deterministic policy and cannot be auto-approved by final-auditor.

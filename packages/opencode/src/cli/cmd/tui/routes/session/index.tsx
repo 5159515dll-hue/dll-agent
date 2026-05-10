@@ -1185,7 +1185,9 @@ export function Session() {
                 <SubagentFooter />
               </Show>
               <Show when={visible()}>
-                <DllAgentSessionPanel sessionID={route.sessionID} />
+                <Show when={!sidebarVisible()}>
+                  <DllAgentSessionPanel sessionID={route.sessionID} />
+                </Show>
                 <TuiPluginRuntime.Slot
                   name="session_prompt"
                   mode="replace"

@@ -5,6 +5,8 @@ import { useTheme } from "../../context/theme"
 import { useTuiConfig } from "../../context/tui-config"
 import { InstallationChannel, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { TuiPluginRuntime } from "@/cli/cmd/tui/plugin/runtime"
+import { DllAgentSessionPanel } from "@tui/component/dll-agent-panel"
+import { enabled as dllEnabled } from "@/dll-agent/profile"
 
 import { getScrollAcceleration } from "../../util/scroll"
 import { WorkspaceLabel } from "../../component/workspace-label"
@@ -81,6 +83,9 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 </Show>
               </box>
             </TuiPluginRuntime.Slot>
+            <Show when={dllEnabled()}>
+              <DllAgentSessionPanel sessionID={props.sessionID} variant="sidebar" />
+            </Show>
             <TuiPluginRuntime.Slot name="sidebar_content" session_id={props.sessionID} title={session()!.title} />
           </box>
         </scrollbox>

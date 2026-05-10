@@ -1,6 +1,7 @@
 import fs from "fs"
 import os from "os"
 import path from "path"
+import crypto from "crypto"
 import { write as writeEvidence } from "./evidence"
 
 export type CapabilityAcquisitionKind = "skill" | "mcp" | "tool" | "software" | "provider" | "script"
@@ -239,6 +240,10 @@ export function writeCapabilityEvidence(type: string, payload: unknown, sessionI
   writeEvidence(type, payload, sessionID)
 }
 
+function hashText(value: string) {
+  return `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`
+}
+
 export function parseCapabilityJson(raw: string): unknown {
   try {
     return JSON.parse(raw)
@@ -352,9 +357,8 @@ export function doctorCheckCapabilityAcquisition(root = capabilityAcquisitionRoo
       if (
         isRecord(parsed) &&
         typeof parsed.manifest_checksum === "string" &&
-        isRecord(parsed.manifest) &&
         typeof parsed.manifest_json === "string" &&
-        parsed.manifest_checksum !== parsed.manifest_json
+        parsed.manifest_checksum !== hashText(parsed.manifest_json)
       ) {
         checksumMismatch++
       }

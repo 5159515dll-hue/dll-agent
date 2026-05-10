@@ -50,7 +50,11 @@ import { checkEvidenceGate, checkReconciliationGate, finalGate, isGateRetryExhau
 import { checkCap as checkCostCap, trackLastCall } from "@/dll-agent/cost-cap"
 import { checkCrossReviewTrigger } from "@/dll-agent/cross-review-bridge"
 import { metrics as computeTriggerMetrics, messageText, isTrivialNoToolPromptText, isStatelessChatPromptText } from "@/dll-agent/triggers"
-import { canSuppressRoutineReview, classifyTaskIntake } from "@/dll-agent/task-intake-classifier"
+import {
+  canSuppressRoutineReview,
+  canUseReadOnlyAnswerFinalization,
+  classifyTaskIntake,
+} from "@/dll-agent/task-intake-classifier"
 import { activate as activateSkills, loadActive as loadActiveSkills, persist as persistSkills } from "@/dll-agent/skills"
 import type { SkillSignal } from "@/dll-agent/skill-registry"
 import { write as evidenceWrite } from "@/dll-agent/evidence"
@@ -1753,7 +1757,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               // normal recoverable tool/test/typecheck/provider failures should
               // produce a concrete automatic recovery action instead of stopping.
               try {
-                const failure = extractLatestFailure(msgs)
+                const taskGoal = messageText(
+                  msgs.find((msg) => msg.info.id === lastUser.id) ??
+                    msgs.findLast((msg) => msg.info.role === "user") ??
+                    msgs[msgs.length - 1],
+                ).slice(0, 500)
+                const failure = extractLatestFailure(msgs, {
+                  ignoreReadOnlyToolFailures: canUseReadOnlyAnswerFinalization(classifyTaskIntake({ userText: taskGoal })),
+                })
                 if (failure) {
                   updatedState.repair_counts ??= {}
                   updatedState.recovery_phase_counts ??= {}
@@ -1767,7 +1778,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     maxPhaseAttempts: 5,
                     maxTaskAttempts: 8,
                     sessionID,
-                    taskGoal: messageText(msgs.find((msg) => msg.info.id === lastUser.id) ?? msgs.findLast((msg) => msg.info.role === "user") ?? msgs[msgs.length - 1]).slice(0, 500),
+                    taskGoal,
                     projectDir: ctx.directory,
                   })
                   updatedState.repair_counts[recovery.fingerprint] = recovery.recoveryAttempts + 1

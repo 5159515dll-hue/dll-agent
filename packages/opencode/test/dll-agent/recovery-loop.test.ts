@@ -6,6 +6,7 @@ import {
   buildBlockedRecoveryReport,
   buildRecoveryHint,
   classifyFailure,
+  extractLatestFailure,
   planRecoveryFromContinuationPacket,
   planRecovery,
   writeRecoveryDecision,
@@ -21,6 +22,30 @@ function failure(stderr: string): LatestFailure {
     whatFailed: "bun test",
     stderr,
     evidenceRef: "tool:bash:call_1",
+  }
+}
+
+function toolMessage(tool: string, status: "completed" | "error", text: string): any {
+  return {
+    info: {
+      id: `msg_${tool}_${status}`,
+      sessionID: "ses_test",
+      role: "assistant",
+      time: { created: 0 },
+      agent: "dll-agent-commander",
+      model: { providerID: "test", modelID: "test" },
+    },
+    parts: [{
+      type: "tool",
+      callID: `call_${tool}`,
+      tool,
+      state: status === "completed"
+        ? { status: "completed", input: { command: tool }, output: text, title: tool, metadata: {}, time: { start: 0, end: 1 } }
+        : { status: "error", input: { command: tool }, error: text, time: { start: 0, end: 1 } },
+      id: `part_${tool}`,
+      messageID: `msg_${tool}_${status}`,
+      sessionID: "ses_test",
+    }],
   }
 }
 
@@ -72,6 +97,25 @@ function continuationPacket(overrides: Partial<ContinuationPacket> = {}): Contin
 }
 
 describe("recovery-loop", () => {
+  test("read-only tool failures can be ignored for answer-only L2 flows", () => {
+    const messages = [
+      toolMessage("read", "error", "ENOENT: no such file or directory, open 'docs/missing.md'"),
+      toolMessage("glob", "error", "No files matched pattern"),
+    ]
+
+    expect(extractLatestFailure(messages)).not.toBeNull()
+    expect(extractLatestFailure(messages, { ignoreReadOnlyToolFailures: true })).toBeNull()
+  })
+
+  test("read-only failure ignore mode still keeps bash/security failures visible", () => {
+    expect(extractLatestFailure([
+      toolMessage("bash", "error", "FAIL test/foo.test.ts"),
+    ], { ignoreReadOnlyToolFailures: true })?.whatFailed).toBe("bash")
+    expect(extractLatestFailure([
+      toolMessage("read", "error", "permission denied reading .env"),
+    ], { ignoreReadOnlyToolFailures: true })?.whatFailed).toBe("read")
+  })
+
   test("typecheck failure gets automatic repair action", () => {
     const decision = planRecovery({
       failure: failure("src/foo.ts(1,1): error TS2322: Type 'string' is not assignable"),

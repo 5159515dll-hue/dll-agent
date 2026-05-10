@@ -14,6 +14,13 @@ export type TaskKind =
 
 export type InteractionLevel = "L0" | "L1" | "L2" | "L3" | "L4"
 
+export type TaskFinalizationPolicy =
+  | "stateless_answer"
+  | "informational_answer"
+  | "read_only_answer"
+  | "engineering_verification"
+  | "high_risk_governance"
+
 export type TaskIntakeClassification = {
   task_kind: TaskKind
   interaction_level: InteractionLevel
@@ -26,6 +33,7 @@ export type TaskIntakeClassification = {
   continuation_allowed: boolean
   final_gate_required: boolean
   model_classifier_needed: boolean
+  finalization_policy: TaskFinalizationPolicy
   confidence: "low" | "medium" | "high"
   reason: string
   matched_rules: string[]
@@ -33,39 +41,17 @@ export type TaskIntakeClassification = {
 }
 
 export const DEFAULT_TASK_INTAKE_RULES = {
-  greetings: [
-    /^(你好|您好|hello|hi|hey|在吗|哈喽|早上好|上午好|中午好|下午好|晚上好|谢谢|多谢|thanks|thank you|ok|okay|好的|好|嗯|收到|辛苦了)$/i,
-  ],
-  informational: [
-    /^(介绍一下|介绍下|介绍|讲讲|说说|说明一下|解释一下|什么是|何为|tell me about|explain|what is|介绍一下.*是什么)/i,
-    /(是什么|有什么用|用于什么|能做什么|怎么理解)$/i,
-    /^summarize (?:the )?(?:concept|idea|meaning|purpose|overview)\b/i,
-  ],
-  lightEngineeringAnalysis: [
-    /(帮我看看|看一下|分析一下|评估一下|review一下|解释.*代码|架构.*说明|代码.*说明|不改代码|只分析|只读分析)/i,
-  ],
-  coding: [
-    /(改|修改|修复|实现|新增|删除|重构|写代码|编辑|patch|fix|implement|edit|write|delete|refactor)/i,
-  ],
-  debugging: [
-    /(报错|错误|失败|日志|异常|栈|traceback|stack trace|error|failed|exception|debug|调试|定位原因)/i,
-  ],
-  verification: [
-    /(测试|验证|检查|typecheck|build|doctor|lint|smoke|运行测试|跑测试|verify|test|run tests?)/i,
-  ],
-  planning: [
-    /(计划|方案|规划|拆解|路线图|继续|下一步|完成所有|所有目标|active plan|phase|plan|roadmap|strategy|continue|next step)/i,
-  ],
-  permission: [
-    /(权限|授权|Full Access|Auto-review|secrets?|token|cookie|ssh key|credential|凭据|密钥|钥匙串)/i,
-  ],
-  multimodal: [
-    /(截图|图片|图表|流程图|视频|音频|screenshot|image|photo|chart|flowchart|video|audio|\.(?:png|jpg|jpeg|gif|webp|mp4|mov|mp3|wav)\b)/i,
-  ],
-  highRisk: [
-    /(provider|routing|route|gate|evidence|result ledger|dedup|permission|secrets?|auth|model switching|role model|doctor failed|quota|cost policy|MCP runtime|git push|sudo|rm\s+-rf|reset\s+--hard|clean\s+-fdx|release|upload|上游同步|远程发布|删除|覆盖|破坏性|权限|凭据|模型切换|结果账本|证据|审查路由)/i,
-  ],
-} as const
+  greetings: [],
+  informational: [],
+  lightEngineeringAnalysis: [],
+  coding: [],
+  debugging: [],
+  verification: [],
+  planning: [],
+  permission: [],
+  multimodal: [],
+  highRisk: [],
+} as const satisfies Record<string, readonly RegExp[]>
 
 export type TaskIntakePolicyManifest = Partial<Record<
   | "greetings"
@@ -93,6 +79,30 @@ function hasFileOrPathIntent(text: string) {
 
 function hasCodeBlock(text: string) {
   return /```|(?:^|\n)\s*(?:import|export|const|let|function|class|def|package|SELECT|CREATE TABLE)\b/.test(text)
+}
+
+function hasMultimodalStructuralSignal(text: string) {
+  return /\.(?:png|jpg|jpeg|gif|webp|bmp|svg|mp4|mov|avi|webm|mp3|wav|ogg)\b/i.test(text)
+}
+
+function hasPermissionBoundarySignal(text: string) {
+  return /(?:^|[\s._-])(?:api[_-]?key|secret|token|cookie|credential|credentials|ssh[_-]?key|authorization|\.env|keychain)(?:$|[\s._-])/i.test(text)
+}
+
+function hasHighRiskStructuralSignal(text: string) {
+  return /\b(?:sudo|rm\s+-rf|git\s+push|git\s+reset\s+--hard|git\s+clean\s+-fdx|curl\s+[^|]+?\|\s*(?:sh|bash)|chmod\s+[0-7]{3,4}|chown\s+|brew\s+install|npm\s+install\s+-g|pip\s+install\s+--user|docker\s+run)\b/i.test(text)
+}
+
+function hasDebugArtifactSignal(text: string) {
+  return /```|(?:^|\n)\s*(?:traceback|stack trace|panic:|npm ERR!|error:|exception:|TS\d{4}|exit(?:ed)? with code [1-9])\b/i.test(text)
+}
+
+function hasVerificationCommandSignal(text: string) {
+  return /\b(?:typecheck|tsgo|tsc|bun\s+test|npm\s+test|pytest|go\s+test|cargo\s+test|doctor|lint|smoke|build)\b/i.test(text)
+}
+
+function hasMutationArtifactSignal(text: string) {
+  return /(?:^|\n)\s*(?:\+\+\+|---|@@\s|apply_patch|git\s+apply|cat\s+>|\b(?:write|edit|patch)\()/i.test(text)
 }
 
 function matchRule(text: string, rules: readonly RegExp[]) {
@@ -168,6 +178,7 @@ function baseClassification(input: Partial<TaskIntakeClassification>): TaskIntak
     continuation_allowed: true,
     final_gate_required: true,
     model_classifier_needed: false,
+    finalization_policy: "engineering_verification",
     confidence: "medium",
     reason: "default intake classification",
     matched_rules: [],
@@ -206,8 +217,8 @@ export function classifyTaskIntake(input: {
   if (input.doctorFailed) safetyOverrides.push("doctor_failed")
   if (input.reviewerBlock) safetyOverrides.push("reviewer_block")
 
-  if (input.hasNonTextInput || matchPolicy(text, policy.multimodal) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.multimodal)) {
-    matchedRules.push(matchPolicy(text, policy.multimodal) ? "policy:multimodal" : "multimodal")
+  if (input.hasNonTextInput || hasMultimodalStructuralSignal(text) || matchPolicy(text, policy.multimodal)) {
+    matchedRules.push(input.hasNonTextInput ? "structural:non_text_input" : hasMultimodalStructuralSignal(text) ? "structural:multimodal_file" : "policy:multimodal")
     return baseClassification({
       task_kind: "multimodal",
       interaction_level: "L3",
@@ -215,6 +226,7 @@ export function classifyTaskIntake(input: {
       reviewer_required: !!input.hasNonTextInput,
       verification_required: false,
       repo_doctor_allowed: false,
+      finalization_policy: "engineering_verification",
       confidence: input.hasNonTextInput ? "high" : "medium",
       reason: "user-origin multimodal input or multimodal request detected",
       matched_rules: matchedRules,
@@ -222,8 +234,8 @@ export function classifyTaskIntake(input: {
     })
   }
 
-  if (matchPolicy(text, policy.high_risk) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.highRisk)) {
-    matchedRules.push(matchPolicy(text, policy.high_risk) ? "policy:high_risk" : "high_risk")
+  if (hasHighRiskStructuralSignal(text) || matchPolicy(text, policy.high_risk)) {
+    matchedRules.push(hasHighRiskStructuralSignal(text) ? "structural:high_risk_command" : "policy:high_risk")
     return baseClassification({
       task_kind: "high_risk",
       interaction_level: "L4",
@@ -231,6 +243,7 @@ export function classifyTaskIntake(input: {
       reviewer_required: true,
       verification_required: true,
       repo_doctor_allowed: true,
+      finalization_policy: "high_risk_governance",
       confidence: "high",
       reason: "user-origin high-risk governance, permission, provider, release, or destructive operation signal",
       matched_rules: matchedRules,
@@ -238,8 +251,8 @@ export function classifyTaskIntake(input: {
     })
   }
 
-  if (matchPolicy(text, policy.permission) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.permission)) {
-    matchedRules.push(matchPolicy(text, policy.permission) ? "policy:permission" : "permission")
+  if (hasPermissionBoundarySignal(text) || matchPolicy(text, policy.permission)) {
+    matchedRules.push(hasPermissionBoundarySignal(text) ? "structural:permission_boundary" : "policy:permission")
     return baseClassification({
       task_kind: "permission",
       interaction_level: "L4",
@@ -247,6 +260,7 @@ export function classifyTaskIntake(input: {
       reviewer_required: true,
       verification_required: false,
       repo_doctor_allowed: false,
+      finalization_policy: "high_risk_governance",
       confidence: "high",
       reason: "user-origin permission or secret boundary request",
       matched_rules: matchedRules,
@@ -254,8 +268,8 @@ export function classifyTaskIntake(input: {
     })
   }
 
-  if ((matchPolicy(text, policy.greetings) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.greetings)) && text.length <= 40) {
-    matchedRules.push(matchPolicy(text, policy.greetings) ? "policy:greeting" : "greeting")
+  if (matchPolicy(text, policy.greetings) && text.length <= 40) {
+    matchedRules.push("policy:greeting")
     return baseClassification({
       task_kind: "greeting",
       interaction_level: "L0",
@@ -263,6 +277,7 @@ export function classifyTaskIntake(input: {
       repo_doctor_allowed: false,
       continuation_allowed: false,
       final_gate_required: false,
+      finalization_policy: "stateless_answer",
       confidence: "high",
       reason: "stateless greeting or acknowledgement from user-origin input",
       matched_rules: matchedRules,
@@ -270,8 +285,29 @@ export function classifyTaskIntake(input: {
     })
   }
 
-  if (!hasFileOrPathIntent(text) && !hasCodeBlock(text) && (matchPolicy(text, policy.informational) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.informational))) {
-    matchedRules.push(matchPolicy(text, policy.informational) ? "policy:informational" : "informational")
+  if (matchPolicy(text, policy.light_engineering_analysis) && !hasCodeBlock(text)) {
+    const engineeringReadOnly = hasFileOrPathIntent(text) || matchPolicy(text, policy.light_engineering_analysis)
+    matchedRules.push("policy:light_engineering_analysis")
+    return baseClassification({
+      task_kind: engineeringReadOnly ? "light_engineering_analysis" : "informational",
+      interaction_level: engineeringReadOnly ? "L2" : "L1",
+      tool_required: hasFileOrPathIntent(text),
+      reviewer_required: false,
+      verification_required: false,
+      goal_contract_required: false,
+      repo_doctor_allowed: hasFileOrPathIntent(text),
+      continuation_allowed: false,
+      final_gate_required: false,
+      finalization_policy: engineeringReadOnly ? "read_only_answer" : "informational_answer",
+      confidence: "high",
+      reason: "project policy classified user-origin input as read-only answer without mutation or verification",
+      matched_rules: matchedRules,
+      safety_overrides: safetyOverrides,
+    })
+  }
+
+  if (!hasFileOrPathIntent(text) && !hasCodeBlock(text) && matchPolicy(text, policy.informational)) {
+    matchedRules.push("policy:informational")
     return baseClassification({
       task_kind: "informational",
       interaction_level: "L1",
@@ -279,15 +315,16 @@ export function classifyTaskIntake(input: {
       repo_doctor_allowed: false,
       continuation_allowed: false,
       final_gate_required: false,
+      finalization_policy: "informational_answer",
       confidence: "high",
-      reason: "stateless informational question without file, tool, verification, or mutation intent",
+      reason: "project policy classified user-origin input as informational answer",
       matched_rules: matchedRules,
       safety_overrides: safetyOverrides,
     })
   }
 
-  if (matchPolicy(text, policy.debugging) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.debugging)) {
-    matchedRules.push(matchPolicy(text, policy.debugging) ? "policy:debugging" : "debugging")
+  if (hasDebugArtifactSignal(text) || matchPolicy(text, policy.debugging)) {
+    matchedRules.push(hasDebugArtifactSignal(text) ? "structural:debug_artifact" : "policy:debugging")
     return baseClassification({
       task_kind: "debugging",
       interaction_level: "L3",
@@ -295,6 +332,7 @@ export function classifyTaskIntake(input: {
       reviewer_required: false,
       verification_required: true,
       repo_doctor_allowed: true,
+      finalization_policy: "engineering_verification",
       confidence: "high",
       reason: "user-origin debugging or failure signal",
       matched_rules: matchedRules,
@@ -302,8 +340,8 @@ export function classifyTaskIntake(input: {
     })
   }
 
-  if (matchPolicy(text, policy.coding) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.coding)) {
-    matchedRules.push(matchPolicy(text, policy.coding) ? "policy:coding" : "coding")
+  if (hasMutationArtifactSignal(text) || matchPolicy(text, policy.coding)) {
+    matchedRules.push(hasMutationArtifactSignal(text) ? "structural:mutation_artifact" : "policy:coding")
     return baseClassification({
       task_kind: "coding",
       interaction_level: "L3",
@@ -311,6 +349,7 @@ export function classifyTaskIntake(input: {
       reviewer_required: false,
       verification_required: true,
       repo_doctor_allowed: true,
+      finalization_policy: "engineering_verification",
       confidence: "high",
       reason: "user-origin code mutation intent",
       matched_rules: matchedRules,
@@ -318,8 +357,8 @@ export function classifyTaskIntake(input: {
     })
   }
 
-  if (matchPolicy(text, policy.verification) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.verification)) {
-    matchedRules.push(matchPolicy(text, policy.verification) ? "policy:verification" : "verification")
+  if (hasVerificationCommandSignal(text) || matchPolicy(text, policy.verification)) {
+    matchedRules.push(hasVerificationCommandSignal(text) ? "structural:verification_command" : "policy:verification")
     return baseClassification({
       task_kind: "verification",
       interaction_level: "L3",
@@ -327,6 +366,7 @@ export function classifyTaskIntake(input: {
       reviewer_required: false,
       verification_required: true,
       repo_doctor_allowed: true,
+      finalization_policy: "engineering_verification",
       confidence: "high",
       reason: "user-origin verification or repo-health request",
       matched_rules: matchedRules,
@@ -334,8 +374,8 @@ export function classifyTaskIntake(input: {
     })
   }
 
-  if (matchPolicy(text, policy.light_engineering_analysis) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.lightEngineeringAnalysis) || hasFileOrPathIntent(text)) {
-    matchedRules.push(matchPolicy(text, policy.light_engineering_analysis) ? "policy:light_engineering_analysis" : hasFileOrPathIntent(text) ? "file_or_path_reference" : "light_engineering_analysis")
+  if (hasFileOrPathIntent(text)) {
+    matchedRules.push("structural:file_or_path_reference")
     return baseClassification({
       task_kind: "light_engineering_analysis",
       interaction_level: "L2",
@@ -343,15 +383,17 @@ export function classifyTaskIntake(input: {
       reviewer_required: false,
       verification_required: false,
       repo_doctor_allowed: true,
-      confidence: "medium",
-      reason: "user-origin light engineering analysis or file/path reference without mutation",
+      model_classifier_needed: true,
+      finalization_policy: "engineering_verification",
+      confidence: "low",
+      reason: "user-origin file/path reference requires semantic intent judgement before assuming read-only or mutation",
       matched_rules: matchedRules,
       safety_overrides: safetyOverrides,
     })
   }
 
-  if (matchPolicy(text, policy.planning) || matchRule(text, DEFAULT_TASK_INTAKE_RULES.planning)) {
-    matchedRules.push(matchPolicy(text, policy.planning) ? "policy:planning" : "planning")
+  if (matchPolicy(text, policy.planning)) {
+    matchedRules.push("policy:planning")
     return baseClassification({
       task_kind: "planning",
       interaction_level: "L2",
@@ -359,6 +401,7 @@ export function classifyTaskIntake(input: {
       reviewer_required: false,
       verification_required: false,
       repo_doctor_allowed: false,
+      finalization_policy: "read_only_answer",
       confidence: "medium",
       reason: "user-origin planning request",
       matched_rules: matchedRules,
@@ -366,8 +409,8 @@ export function classifyTaskIntake(input: {
     })
   }
 
-  if (text.length <= 120 && !hasFileOrPathIntent(text) && !hasCodeBlock(text)) {
-    matchedRules.push("short_stateless_chat")
+  if (text.length <= 40 && !hasFileOrPathIntent(text) && !hasCodeBlock(text)) {
+    matchedRules.push("structural:short_no_artifact_input")
     return baseClassification({
       task_kind: "stateless_chat",
       interaction_level: "L1",
@@ -375,8 +418,10 @@ export function classifyTaskIntake(input: {
       repo_doctor_allowed: false,
       continuation_allowed: false,
       final_gate_required: false,
-      confidence: "medium",
-      reason: "short user-origin chat without tool, file, code, verification, or mutation intent",
+      finalization_policy: "informational_answer",
+      model_classifier_needed: true,
+      confidence: "low",
+      reason: "short user-origin input has no structural engineering, verification, mutation, permission, or multimodal signal",
       matched_rules: matchedRules,
       safety_overrides: safetyOverrides,
     })
@@ -398,6 +443,31 @@ export function canSuppressRoutineReview(classification: TaskIntakeClassificatio
   if (classification.safety_overrides.length > 0) return false
   if (classification.reviewer_required || classification.tool_required || classification.verification_required) return false
   return classification.interaction_level === "L0" || classification.interaction_level === "L1"
+}
+
+export function canUseReadOnlyAnswerFinalization(classification: TaskIntakeClassification | undefined) {
+  if (!classification) return false
+  if (classification.safety_overrides.length > 0) return false
+  if (classification.reviewer_required || classification.verification_required) return false
+  if (classification.task_kind !== "light_engineering_analysis") return false
+  if (classification.finalization_policy !== "read_only_answer") return false
+  return classification.interaction_level === "L2"
+}
+
+export function canUseAnswerOnlyFinalization(classification: TaskIntakeClassification | undefined) {
+  if (!classification) return false
+  if (classification.safety_overrides.length > 0) return false
+  if (classification.reviewer_required || classification.verification_required) return false
+  if (classification.finalization_policy === "stateless_answer") return classification.interaction_level === "L0"
+  if (classification.finalization_policy === "informational_answer") return classification.interaction_level === "L1"
+  return canUseReadOnlyAnswerFinalization(classification)
+}
+
+export function canTreatReadOnlyToolFailureAsInformational(classification: TaskIntakeClassification | undefined) {
+  if (!classification) return false
+  if (classification.safety_overrides.length > 0) return false
+  if (classification.interaction_level === "L1" && classification.finalization_policy === "informational_answer") return true
+  return canUseReadOnlyAnswerFinalization(classification)
 }
 
 export * as TaskIntakeClassifier from "./task-intake-classifier"

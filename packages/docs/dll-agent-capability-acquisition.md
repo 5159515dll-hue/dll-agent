@@ -1,8 +1,8 @@
 # dll-agent Autonomous Capability Acquisition
 
-Status: `Phase B1 implemented_runtime_verified` for local fixture quarantine/sandbox/rollback substrate.
+Status: `Phase B2/C/D1/D2 implemented_runtime_verified` for controlled local-fixture acquisition flow.
 
-This system is the controlled path for future autonomous skill, MCP, tool, and software acquisition. Phase A defines the schema, risk classifier, audit packet shape, evidence hooks, and doctor checks. Phase B1 adds only a local fixture quarantine/sandbox/rollback substrate. It does **not** download external software, install real packages, execute unknown binaries, start MCP, activate capabilities, or call a live model.
+This system is the controlled path for future autonomous skill, MCP, tool, and software acquisition. Phase A defines the schema, risk classifier, audit packet shape, evidence hooks, and doctor checks. Phase B1 adds only a local fixture quarantine/sandbox/rollback substrate. Phase B2/C/D1/D2 add a static-download pipeline, mock final-auditor policy gate, fixture sandbox smoke, and MCP metadata discovery. This checkpoint does **not** download arbitrary external software, install real packages, execute downloaded content, start MCP, activate capabilities, read GitHub tokens, or call a live model.
 
 ## Risk Levels
 
@@ -87,4 +87,52 @@ Rollback rules:
 - session/evidence/cache/secrets and unmanaged paths are refused;
 - missing rollback plan prevents activation in later phases.
 
-Phase B2 may consider a low-risk real download pilot only after explicit authorization and a separate checkpoint.
+## Phase B2 Static Download Trial
+
+Implemented:
+
+- `capability-download.ts`: validates http(s) URL, blocks executable extensions, blocks binary magic, enforces max size, computes sha256, writes static content under quarantine, creates rollback dry-run, and writes evidence.
+- Tests use local fixture HTTP only when no user-provided GitHub raw URL is supplied.
+- Static `SKILL.md`, `README.md`, `manifest.json`, and `schema.json` are treated as R0/R1 quarantine candidates only.
+
+Boundary:
+
+- no random GitHub repository selection;
+- no private GitHub URL or token usage;
+- no binary download;
+- no dependency install;
+- no execution;
+- no activation.
+
+## Phase C Mock Final-Auditor Policy Gate
+
+Implemented:
+
+- `capability-audit-runtime.ts`: builds structured audit packets and enforces mock final-auditor decisions.
+- R2 can proceed to fixture sandbox only after mock auditor pass.
+- R3 always requires user authorization even if mock auditor passes.
+- R4 hard-block cannot be overridden.
+
+Boundary: no live final-auditor model call in this checkpoint.
+
+## Phase D1 Fixture Sandbox Smoke
+
+Implemented:
+
+- R2 fixture candidates can be copied into sandbox and checked with non-executing required-file smoke tests.
+- Rollback dry-run and fixture rollback remove only managed quarantine/sandbox paths.
+
+Boundary: no GitHub package execution, no real install, no MCP start, no activation.
+
+## Phase D2 MCP Metadata Discovery Only
+
+Implemented:
+
+- `capability-discovery.ts` classifies public MCP metadata candidates without fetching private data or using tokens.
+- GitHub MCP is R3 when token/private repo/issue/PR/release/repo mutation capabilities are involved.
+- Playwright/browser MCP metadata is R3 and remains on-demand/user-authorized.
+- `modelcontextprotocol/servers` metadata is treated as reference/community mixed; individual servers need later risk assessment.
+
+Boundary: metadata only; no MCP install/start, no Docker, no npm install, no token read.
+
+Next phase requires explicit authorization before any real external GitHub raw URL download or low-risk package pilot.

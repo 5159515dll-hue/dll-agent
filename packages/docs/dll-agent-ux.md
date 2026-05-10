@@ -1,6 +1,6 @@
 # dll-agent UX / Doctor / Observability
 
-Phase 8 adds a conservative runtime observability slice. It does not redesign the TUI and does not add new model calls.
+Phase 8 adds a conservative runtime observability slice. The TUI layout slice keeps this strictly read-only: it reorganizes existing state without changing routing, gates, recovery, permissions, provider behavior, MCP runtime, LSP, multimodal handling, or Capability Acquisition semantics.
 
 ## Implemented Runtime Verified
 
@@ -14,7 +14,7 @@ Phase 8 adds a conservative runtime observability slice. It does not redesign th
 | Routing visibility | implemented_runtime_verified | `model.routing_decision` entries are summarized as selected models and skipped reviewers |
 | Result visibility | implemented_runtime_verified | Result Ledger totals distinguish verified, partial, failed, blocked, unverified, stale, missing-evidence, reusable, and low-confidence results |
 | Doctor observability check | implemented_runtime_verified | `dll-doctor.ts` includes `task-observability` health check |
-| TUI status panel visibility | implemented_runtime_verified | The existing panel shows bounded task/final status, verification/doctor, and Result Ledger/continuation lines; it keeps terminal foreground colors |
+| TUI status panel visibility | implemented_runtime_verified | The panel shows bounded task/final status, verification/doctor, Result Ledger/continuation, active model/role, capability summary, and command activity lines; it keeps terminal foreground/background colors |
 | Safe cleanup next action | implemented_runtime_verified | evidence-session pressure points to `dll-agent doctor --repair-safe` |
 
 ## Output Contract
@@ -40,7 +40,7 @@ The renderer redacts secrets through the shared evidence redaction path. It is a
 
 | Capability | Status | Reason |
 |---|---|---|
-| TUI visual redesign | missing | Not in Phase 8.1 scope; current change is bounded state visibility only |
+| TUI layout redesign | implemented_runtime_verified | The session panel is organized as global status, task overview, model/capability summary, and command activity mini window |
 | Regression dashboard | implemented_runtime_verified | `scenario-evaluation.ts` defines and evaluates 20 real-world acceptance scenarios; doctor reports the suite health |
 | Cross-session trajectory comparison | missing | Current trajectory is session-scoped to avoid stale or unsafe reuse |
 
@@ -101,3 +101,36 @@ surfaces do not trigger models, reviewers, MCP, MiMo, quota refresh, or repair.
 Unknown or unavailable data is rendered explicitly as `unknown` or
 `not_available`; summaries never claim `passed` without a recorded scenario
 result.
+
+## TUI Layout Slice
+
+The dll-agent session panel uses three read-only regions:
+
+- Global status bar: project/session, final status, commander model/source, active role, doctor, quota/cost.
+- Task overview: goal, phase/risk, plan blockers, next action, verification, Result Ledger, continuation status.
+- Model/capability summary: reviewer state, routing count/model summary, tools/skills/MCP/software counts, running/on-demand/blocked status.
+
+Default TUI language is Chinese for dll-agent-owned labels. Runtime role names,
+model ids, provider ids, and evidence refs stay literal so the displayed value
+matches runtime state exactly.
+
+For stateless chat or greeting sessions where no Goal Contract, required
+verification, Result Ledger packet, reviewer, continuation, or blocker exists,
+the panel displays `待命` / `普通对话/待命` / `计划：未建立` instead of showing
+engineering completion states such as `UNVERIFIED_PARTIAL`. Detailed state is
+still available through `/task-status`.
+
+The command activity mini window is a read-only view over evidence, task trajectory, and Result Ledger command refs. It defaults to compact mode with the latest 3-5 command/tool summaries. Mouse click expands it; `Esc` collapses it. Expanded mode supports scrolling recent command rows and still hides long output and secret values.
+
+Theme policy:
+
+- no forced dll-agent background;
+- no global foreground override;
+- semantic emphasis only where needed;
+- blocked/failed/warn/unknown states remain visible as text;
+- no model call, MCP start, command execution, quota refresh, or state mutation during render.
+
+Partial:
+
+- mouse click is the supported expand path; keyboard Enter/Space expansion is intentionally not used to avoid prompt-submit conflicts.
+- detailed evidence/result ledger inspection remains in the existing slash commands rather than the default panel.

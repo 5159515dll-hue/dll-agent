@@ -1,5 +1,6 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createMemo, For, Match, Show, Switch, createSignal } from "solid-js"
+import { enabled as dllEnabled } from "@/dll-agent/profile"
 
 const id = "internal:sidebar-mcp"
 
@@ -26,7 +27,7 @@ function View(props: { api: TuiPluginApi }) {
   }
 
   return (
-    <Show when={list().length > 0}>
+    <Show when={!dllEnabled() && list().length > 0}>
       <box>
         <box flexDirection="row" gap={1} onMouseDown={() => list().length > 2 && setOpen((x) => !x)}>
           <Show when={list().length > 2}>

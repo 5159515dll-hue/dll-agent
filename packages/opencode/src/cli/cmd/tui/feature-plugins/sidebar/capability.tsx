@@ -58,7 +58,7 @@ function View(props: { api: TuiPluginApi; session_id: string; title?: string }) 
   })
 
   return (
-    <Show when={dllEnabled()}>
+    <Show when={!dllEnabled()}>
       <box>
         <box flexDirection="row" gap={1} onMouseDown={() => setOpen((x) => !x)}>
           <text fg={theme().text}>{open() ? "▼" : "▶"}</text>

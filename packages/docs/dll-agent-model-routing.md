@@ -56,6 +56,12 @@ Implemented runtime rules:
   - `L2`: light engineering analysis. Read-only analysis, code structure explanation, or planning; may read files but does not write by default.
   - `L3`: coding / debugging / verification. Uses Goal Contract, Recovery Loop, Result Ledger, and required verification.
   - `L4`: high risk. Provider/routing/gate/evidence/permission, secrets/auth, destructive commands, push/release, system/global mutation, large refactors, MCP runtime, doctor failed, or high-cost provider work. Reviewer and strict permission/final/evidence gates are required and cannot be downgraded by model classification.
+- Intent judgement is category-based, not phrase-based:
+  - deterministic intake first checks intent category, subject type, requested side effects, verification needs, and hard safety signals;
+  - if deterministic confidence is low, the runtime plan is `single_model_judge` using the primary non-OpenAI commander model;
+  - if that single-model judgement is still low confidence, the plan escalates to `multi_model_consensus` across all distinct configured `/role-model-set` effective models except OpenAI, TTS, VoiceClone, and speech/audio models;
+  - L4 hard safety rules always win before model judgement and cannot be downgraded by consensus.
+- `read_only_answer` finalization applies to user-origin read-only engineering analysis/explanation categories, not to exact sentences. It suppresses task-completion-archivist, final-auditor, and executor auto-verifier only when there is no mutation request, no verification request, no failure, no correction, no reviewer block, no doctor failure, no multimodal input, and no high-risk signal.
 - User-origin-only source filtering is mandatory. `/role-model-set`, `/role-models`, `/task-status`, TUI/status text, doctor reports, verification reports, reviewer outputs, fallback reviewer summaries, Result Ledger summaries, routing evidence summaries, rendered ContextHandoffPacket text, `<task_result>`, subtask resume text, model usage reports, and regression reports may be recorded as evidence/trajectory, but they cannot create user-origin routing triggers.
 - Policy manifests can extend deterministic intake rules without source changes:
   - global: `~/.dll-agent/config/task-intake-policy.jsonc`;
