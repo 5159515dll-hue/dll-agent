@@ -567,6 +567,22 @@ Supported keys: `greetings`, `informational`, `light_engineering_analysis`, `cod
 
 Model classifier status: `partial_runtime` placeholder only. The deterministic classifier is runtime verified; live model classification is intentionally not called every turn and cannot override L4 safety rules.
 
+## Autonomous Capability Acquisition Phase A
+
+Status: `implemented_runtime_verified` for design/schema/risk-classifier/doctor skeleton. This phase does not download, install, execute, start MCP, or call a live final-auditor model.
+
+| Capability | Status | Notes |
+|---|---|---|
+| R0-R4 risk model | implemented_runtime_verified | `capability-risk-classifier.ts` classifies metadata/static/executable/high-risk/hard-block capability acquisition requests with deterministic hard rules |
+| acquisition manifest schema | implemented_runtime_verified | `capability-acquisition.ts` validates source, risk, permissions, activation, commands, smoke tests, and rollback |
+| final-auditor packet shape | implemented_config_verified | `buildCapabilityAuditPacket()` produces structured audit input; live final-auditor integration is later-phase |
+| acquisition evidence hooks | implemented_runtime_verified | `capability.*` evidence types use shared redaction path |
+| doctor acquisition checks | implemented_runtime_verified | doctor reports acquisition store/directories/manifests without mutating files |
+| quarantine/sandbox/rollback execution | partial_runtime | schema and validation exist; runtime install/smoke/rollback execution belongs to later phases |
+| commands/UX | missing | `/capability-install` and related commands are not wired in Phase A |
+
+Safety boundary: R2+ requires rollback before activation; R3 requires user authorization; R4 (`curl | sh`, `sudo`, global install, secrets, destructive delete, git push/release/upload, real browser profile, unknown binary) is hard-blocked by deterministic policy and cannot be auto-approved by final-auditor.
+
 ### ❌ 尚未实现
 
 | 特性 | 说明 |

@@ -35,6 +35,7 @@ import { doctorCheckGoalContracts } from "./goal-contract"
 import { checkObservabilityHealth, checkScenarioEvaluationHealth } from "./doctor-checks"
 import { getPermissionMode, permissionModeDescription } from "./permission-mode"
 import { loadStatus } from "./mcp-manager"
+import { doctorCheckCapabilityAcquisition } from "./capability-acquisition"
 import type { RiskLevel } from "./interfaces"
 import { write as writeEvidence } from "./evidence"
 import { execSync } from "child_process"
@@ -1158,6 +1159,7 @@ export function runDoctor(projectRoot?: string, options: { recordEvidence?: bool
 
   // Capability system checks
   allChecks.push(...checkCapabilityHealth(root))
+  allChecks.push(...doctorCheckCapabilityAcquisition())
 
   // UX / observability checks
   allChecks.push(...checkObservabilityHealth(root))
