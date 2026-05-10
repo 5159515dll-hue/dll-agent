@@ -28,6 +28,14 @@ export type Metrics = {
   multimodalSignal: boolean
   /** High-risk governance/runtime area touched: provider/routing/gate/evidence/permission/quota/MCP/etc. */
   highRiskTaskSignal: boolean
+  /**
+   * True only for short, explicit no-tool answer requests such as
+   * "只回答 OK，不要执行工具。". This suppresses reviewer/verifier triggers for
+   * stateless acknowledgement tasks without weakening correctness-required
+   * paths such as corrections, failures, final claims, high-risk changes, or
+   * multimodal input.
+   */
+  trivialNoToolTask: boolean
 }
 
 function textOf(parts: MessageV2.Part[]) {
@@ -53,6 +61,13 @@ function stripSelfInjections(text: string) {
   ]
   if (tagPrefixes.some((p) => firstNonEmpty.startsWith(p))) return ""
 
+  // Local dll-agent slash commands are handled without an LLM but are still
+  // persisted as session messages. Do not let their status text pollute the
+  // next user prompt's routing scan (for example /role-models mentions
+  // "long-context-archivist" and "role model", which would otherwise look like
+  // a long-context/high-risk governance task).
+  if (isLocalCommandEchoOrResponse(firstNonEmpty, text)) return ""
+
   // 检测 reviewer output JSON 结构：若消息同时包含 version/reviewer/findings/verdict
   // 等典型字段（≥3 个命中），则视为 supervisor 注入的 reviewer 输出，避免其内的
   // "reviewer conflict" / "证据不足" 等文本被误判为新的 conflict / correction 信号。
@@ -74,6 +89,33 @@ function stripSelfInjections(text: string) {
     .join("\n")
 }
 
+function isLocalCommandEchoOrResponse(firstLine: string, text: string) {
+  if (/^\/(?:role-models|role-model-set|role-model-reset|dll-status|task-status|model-usage|routing-report|doctor-next|regression-status|capability-status|permissions)\b/.test(firstLine)) return true
+  if (firstLine === "dll-agent role models:") return true
+  if (/^Updated\s+[\w-]+\s+model\./.test(firstLine)) return true
+  if (/^dll-agent (?:status|task status|capability status|permissions|routing report|model usage)/i.test(firstLine)) return true
+  if (text.includes("source=session") && text.includes("fallback=") && text.includes("hint=configured")) return true
+  return false
+}
+
+function hasFileOrPathIntent(text: string) {
+  return /(?:^|\s)(?:\.{0,2}\/|~\/|\/Users\/|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|md|json|jsonc|yaml|yml|toml|sh|sql|html|css|png|jpg|jpeg|pdf|docx|pptx|xlsx))\b/.test(text)
+}
+
+export function isTrivialNoToolPromptText(text: string) {
+  const normalized = text.trim().replace(/^["'“”]+|["'“”]+$/g, "").trim()
+  if (!normalized || normalized.length > 80) return false
+  if (hasFileOrPathIntent(normalized)) return false
+  if (/(改|修改|修复|实现|新增|删除|重构|检查|分析|读取|打开|执行命令|运行(?:命令|测试|脚本|程序)|测试|typecheck|build|doctor|报错|错误|失败|日志|stack trace|traceback|error|failed|fix|implement|edit|write|delete|refactor|inspect|analyze|run\s+(?:command|test|build)|test)/i.test(normalized)) return false
+
+  const simpleAnswer =
+    /(只|仅|就|直接)?\s*(回答|回复|输出|说|answer|reply|respond|say)\s*[：:]?\s*["'“”]?\s*(OK|ok|好的|是|否|yes|no|收到|done|pass|fail)\s*["'“”]?/i.test(normalized)
+  const noTools =
+    /(不要|别|无需|不需要|禁止|do\s*not|don't|without|no)\s*(执行|使用|调用|运行|use|call|run)?\s*(工具|命令|tool|tools|command|commands|bash|shell)/i.test(normalized)
+
+  return simpleAnswer && noTools
+}
+
 export function messageText(message: MessageV2.WithParts | undefined) {
   if (!message) return ""
   return stripSelfInjections(textOf(message.parts))
@@ -92,6 +134,7 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
   const lastAssistant = [...messages].reverse().find((message) => message.info.role === "assistant")
   const lastAssistantText = messageText(lastAssistant)
   const allText = recent.map(messageText).join("\n")
+  const lastUserText = messageText(lastUser)
 
   // 只把真正的方向/需求纠偏计入 requirements-inspector 触发。
   // "再次检查/仔细检查/有问题/失败/报错/Permission denied" 这类复查或运行时问题
@@ -150,52 +193,74 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     : 0
   const contextPercent = contextLimit ? Math.round((contextTokens / contextLimit) * 100) : 0
 
+  const userCorrections = recent.filter((message) => message.info.role === "user" && correctionPattern.test(messageText(message))).length
+  const recentUserCorrection = !!lastUser && correctionPattern.test(lastUserText)
+  const finalClaim = finalClaimPattern.test(lastAssistantText)
+  const verificationEvidence = evidencePattern.test(allText)
+  const realToolEvidence = verifiedToolEvidence(messages)
+  const reviewerConflictSignal = conflictPattern.test(allText)
+  const longContextSignal = (() => {
+    // 防止审查员名称导致误触发：
+    // 当文本以 [dll-agent supervisor auto-trigger] 或 [dll-agent finalization 开头，
+    // 说明这是系统注入的 compact context / reviewer prompt，不应触发长上下文审查。
+    // 额外的保护：当 allText 很短（< 200 字符）且无非上下文关键词（排除单独出现 "context"），
+    // 不触发，避免指挥官回复"审查员确认了 context..."一行触发无限循环。
+    if (contextPercent >= 40) return true
+    if (longContextPattern.test(allText)) {
+      // "context" 单独出现且文本很短 → 很可能是对审查员的引用，不是真正的长上下文任务
+      const isBareContextWord = /^context$/im.test(allText) && allText.length < 500
+      if (isBareContextWord) return false
+      // "长上下文" + "审查员" 同时出现 → 是对审查员的引用
+      if (/长上下文.*审查员/i.test(allText)) return false
+      return true
+    }
+    return false
+  })()
+  const highRiskTaskSignal = highRiskTaskPattern.test(allText)
+  const multimodalSignal = multimodalPattern.test(allText)
+  const trivialNoToolTask =
+    isTrivialNoToolPromptText(lastUserText) &&
+    !recentUserCorrection &&
+    userCorrections === 0 &&
+    toolErrors.length === 0 &&
+    ![...repeated.values()].some((count) => count >= 2) &&
+    !finalClaim &&
+    !reviewerConflictSignal &&
+    !longContextSignal &&
+    !highRiskTaskSignal &&
+    !multimodalSignal
+
   return {
-    userCorrections: recent.filter((message) => message.info.role === "user" && correctionPattern.test(messageText(message))).length,
-    recentUserCorrection: !!lastUser && correctionPattern.test(messageText(lastUser)),
+    userCorrections,
+    recentUserCorrection,
     toolFailures: toolErrors.length,
     permissionDenied,
     repeatedToolFailure: [...repeated.values()].some((count) => count >= 2),
     contextTokens,
     contextPercent,
-    longContextSignal: (() => {
-      // 防止审查员名称导致误触发：
-      // 当文本以 [dll-agent supervisor auto-trigger] 或 [dll-agent finalization 开头，
-      // 说明这是系统注入的 compact context / reviewer prompt，不应触发长上下文审查。
-      // 额外的保护：当 allText 很短（< 200 字符）且无非上下文关键词（排除单独出现 "context"），
-      // 不触发，避免指挥官回复"审查员确认了 context..."一行触发无限循环。
-      if (contextPercent >= 40) return true
-      if (longContextPattern.test(allText)) {
-        // "context" 单独出现且文本很短 → 很可能是对审查员的引用，不是真正的长上下文任务
-        const isBareContextWord = /^context$/im.test(allText) && allText.length < 500
-        if (isBareContextWord) return false
-        // "长上下文" + "审查员" 同时出现 → 是对审查员的引用
-        if (/长上下文.*审查员/i.test(allText)) return false
-        return true
-      }
-      return false
-    })(),
-    finalClaim: finalClaimPattern.test(lastAssistantText),
-    verificationEvidence: evidencePattern.test(allText),
-    realToolEvidence: verifiedToolEvidence(messages),
-    reviewerConflictSignal: conflictPattern.test(allText),
+    longContextSignal,
+    finalClaim,
+    verificationEvidence,
+    realToolEvidence,
+    reviewerConflictSignal,
 
     // Phase 6: New trigger signals
     // Kimi completion check: final claim + any unfinished indicator
     kimiCompletionCheckSignal: finalClaimPattern.test(lastAssistantText) && unfinishedPattern.test(lastAssistantText),
     // GLM completion claim check: final claim + (no real tool evidence OR medium+ risk implied)
     glmCompletionClaimSignal:
-      finalClaimPattern.test(lastAssistantText) &&
-      (!verifiedToolEvidence(messages) || correctionPattern.test(lastAssistantText)),
+      finalClaim &&
+      (!realToolEvidence || correctionPattern.test(lastAssistantText)),
     // Kimi pre-report: context >=30% AND final claim (proactive compression before report)
-    kimiPreReportSignal: contextPercent >= 30 && finalClaimPattern.test(lastAssistantText),
+    kimiPreReportSignal: contextPercent >= 30 && finalClaim,
     // Scope expansion: detected only via explicit scope expansion patterns (not generic corrections)
     scopeExpandedSignal: scopeExpansionPattern.test(allText),
     // Phase switch: user changes direction explicitly
-    phaseSwitchSignal: phaseSwitchPattern.test(messageText(lastUser)),
+    phaseSwitchSignal: phaseSwitchPattern.test(lastUserText),
     // Phase 8: Multimodal input signal
-    multimodalSignal: multimodalPattern.test(allText),
-    highRiskTaskSignal: highRiskTaskPattern.test(allText),
+    multimodalSignal,
+    highRiskTaskSignal,
+    trivialNoToolTask,
   }
 }
 

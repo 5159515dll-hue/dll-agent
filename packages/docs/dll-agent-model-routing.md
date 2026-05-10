@@ -48,6 +48,7 @@ Routing evidence uses these actions:
 Implemented runtime rules:
 
 - Ordinary low-risk tasks write `commander_only` routing evidence and trigger zero reviewers.
+- `trivial_no_tool_task` covers short, explicit answer-only prompts such as "只回答 OK，不要执行工具。"; it stays commander-only, suppresses reviewer/verifier/task-completion/final-auditor dispatch, and writes `model.routing_decision` with `trigger_reason=trivial_no_tool_task`.
 - User correction triggers `requirements-inspector`.
 - Repeated failure escalates from commander repair to `chief-engineer`, then role-cross/cross-review decision.
 - Final claim without evidence is blocked by evidence/final gate and may trigger verifier/final audit.
@@ -57,6 +58,24 @@ Implemented runtime rules:
 - MiMo-V2.5 is not routed into pure text/code tasks.
 - TTS/VoiceClone models are excluded from coding routes.
 - OpenAI is not default for ordinary tasks; it is on-demand final/high-risk audit only.
+
+## Trivial No-tool Guard
+
+`trivial_no_tool_task` is a narrow live-smoke guard, not a general cost reduction rule.
+
+It can suppress reviewers only when the latest user message is short, explicitly asks for a simple text answer, explicitly says not to use tools/commands, and the recent session has no file path, code-change request, verification request, error log, user correction, repeated failure, high-risk operation, multimodal input, final completion claim, doctor failure, or unresolved blocking reviewer state.
+
+It never suppresses correctness-required review for:
+
+- user correction or scope drift;
+- repeated failure;
+- active blocking plan or unresolved reviewer block;
+- continuation required;
+- final claim missing evidence;
+- doctor failed;
+- high-risk provider/routing/gate/evidence/result-ledger/permission/model-switching work;
+- code modification, file analysis, command execution, or verification requests;
+- secrets, permission, or destructive-operation boundaries.
 
 ## Routing Evidence
 
@@ -105,6 +124,7 @@ The cost guard must not skip:
 Implemented_runtime_verified:
 
 - low-risk commander-only evidence;
+- live-smoke false-positive guard for explicit short no-tool prompts;
 - high-risk multi-reviewer routing within budget;
 - unresolved correctness-required skip risk;
 - final gate visibility for unresolved routing risk;
@@ -120,4 +140,3 @@ Missing:
 
 - cross-session routing memory;
 - provider live health probing inside routing itself.
-

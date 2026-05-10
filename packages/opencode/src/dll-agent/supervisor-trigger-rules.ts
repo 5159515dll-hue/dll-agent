@@ -18,6 +18,8 @@ export function applySupervisorTriggerRules(input: {
 }, callbacks: SupervisorTriggerRuleCallbacks) {
   const metrics = input.metrics
 
+  if (canSuppressForTrivialNoToolTask(metrics)) return
+
   if (metrics.recentUserCorrection || metrics.userCorrections >= 1) {
     callbacks.addReviewer(
       "requirements-inspector",
@@ -112,7 +114,21 @@ export function applySupervisorTriggerRules(input: {
 }
 
 export function needsAutoVerifier(metrics: Metrics) {
+  if (canSuppressForTrivialNoToolTask(metrics)) return false
   return metrics.finalClaim && !metrics.realToolEvidence && metrics.toolFailures === 0
+}
+
+function canSuppressForTrivialNoToolTask(metrics: Metrics) {
+  if (!metrics.trivialNoToolTask) return false
+  if (metrics.recentUserCorrection || metrics.userCorrections > 0) return false
+  if (metrics.repeatedToolFailure || metrics.toolFailures > 0) return false
+  if (metrics.permissionDenied > 0) return false
+  if (metrics.finalClaim) return false
+  if (metrics.reviewerConflictSignal) return false
+  if (metrics.highRiskTaskSignal) return false
+  if (metrics.multimodalSignal) return false
+  if (metrics.scopeExpandedSignal || metrics.phaseSwitchSignal) return false
+  return true
 }
 
 export * as SupervisorTriggerRules from "./supervisor-trigger-rules"

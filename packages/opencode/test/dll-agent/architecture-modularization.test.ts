@@ -21,11 +21,15 @@ import {
   drainSupervisorDispatchBatch,
   planReviewerDispatchGroups,
 } from "../../src/dll-agent/reviewer-dispatch"
-import { buildContinuationRuntimeActions } from "../../src/dll-agent/session-runtime-adapter"
+import {
+  buildContinuationRuntimeActions,
+  shouldStopAfterTrivialNoToolAnswer,
+} from "../../src/dll-agent/session-runtime-adapter"
 import { buildReviewerResultPacket, writeReviewerResult } from "../../src/dll-agent/reviewer-result-bridge"
 import { loadResults } from "../../src/dll-agent/result-ledger"
 import type { CapabilityOrchestrationResult } from "../../src/dll-agent/capability-orchestrator"
 import type { ContinuationGateResult, ContinuationPacket, EvidenceGateResult, ReviewerOutput, SupervisorState } from "../../src/dll-agent/interfaces"
+import type { Metrics } from "../../src/dll-agent/triggers"
 import type { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 
@@ -106,6 +110,32 @@ function supervisorState(overrides: Partial<SupervisorState> = {}): SupervisorSt
       real_tool_evidence: false,
     },
     updated_at: "2026-05-09T00:00:00.000Z",
+    ...overrides,
+  }
+}
+
+function triggerMetrics(overrides: Partial<Metrics> = {}): Metrics {
+  return {
+    userCorrections: 0,
+    recentUserCorrection: false,
+    toolFailures: 0,
+    permissionDenied: 0,
+    repeatedToolFailure: false,
+    contextTokens: 1000,
+    contextPercent: 10,
+    longContextSignal: false,
+    finalClaim: false,
+    verificationEvidence: false,
+    realToolEvidence: false,
+    reviewerConflictSignal: false,
+    kimiCompletionCheckSignal: false,
+    glmCompletionClaimSignal: false,
+    kimiPreReportSignal: false,
+    scopeExpandedSignal: false,
+    phaseSwitchSignal: false,
+    multimodalSignal: false,
+    highRiskTaskSignal: false,
+    trivialNoToolTask: false,
     ...overrides,
   }
 }
@@ -328,6 +358,26 @@ describe("Phase 9 architecture modularization helpers", () => {
       type: "continuation_budget_exhausted",
       reason: expect.stringContaining("Maximum continuation count"),
     })
+  })
+
+  test("session-runtime-adapter stops after trivial no-tool answer only when no blocking state exists", () => {
+    expect(shouldStopAfterTrivialNoToolAnswer({
+      metrics: triggerMetrics({ trivialNoToolTask: true }),
+      state: supervisorState(),
+    })).toBe(true)
+    expect(shouldStopAfterTrivialNoToolAnswer({
+      metrics: triggerMetrics(),
+      explicitNoToolPrompt: true,
+      state: supervisorState(),
+    })).toBe(true)
+    expect(shouldStopAfterTrivialNoToolAnswer({
+      metrics: triggerMetrics({ trivialNoToolTask: true, highRiskTaskSignal: true }),
+      state: supervisorState(),
+    })).toBe(false)
+    expect(shouldStopAfterTrivialNoToolAnswer({
+      metrics: triggerMetrics({ trivialNoToolTask: true }),
+      state: supervisorState({ required_reviews: ["requirements-inspector"] }),
+    })).toBe(false)
   })
 
   test("drainSupervisorDispatchBatch drains only trailing supervisor subtasks", () => {

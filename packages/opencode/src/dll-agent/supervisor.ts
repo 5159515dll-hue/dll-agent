@@ -300,7 +300,18 @@ export function decide(
   contextLimit?: number,
   availableAgents?: string[],
 ): TriggerDecision {
-  const metrics = computeMetrics(messages, contextLimit)
+  const rawMetrics = computeMetrics(messages, contextLimit)
+  const initialState = loadState(sessionID)
+  const hasUnresolvedSupervisorState = Boolean(
+    initialState.blocked_completion ||
+      initialState.reviewer_conflict ||
+      initialState.required_reviews.length > 0 ||
+      (initialState.queued_reviewers ?? []).length > 0 ||
+      (initialState.running_reviewers ?? []).length > 0,
+  )
+  const metrics = rawMetrics.trivialNoToolTask && hasUnresolvedSupervisorState
+    ? { ...rawMetrics, trivialNoToolTask: false }
+    : rawMetrics
   const reasons: Record<ReviewerRole, string> = {} as Record<ReviewerRole, string>
   const reviewers: ReviewerRole[] = []
   const fingerprints: Partial<Record<ReviewerRole, string>> = {}
@@ -494,10 +505,16 @@ export function decide(
       selectedModel: `${commanderModel.providerID}/${commanderModel.modelID}`,
       candidateModels: [`${commanderModel.providerID}/${commanderModel.modelID}`],
       riskLevel: risk,
-      triggerReason: "ordinary low-risk task or no correctness-required reviewer trigger",
+      triggerReason: metrics.trivialNoToolTask
+        ? "trivial_no_tool_task"
+        : "ordinary low-risk task or no correctness-required reviewer trigger",
       skippedReviewers: [],
-      correctnessReason: "commander can proceed alone because no correction, repeated failure, evidence gap, high-risk, conflict, long-context, or multimodal trigger was present",
-      costReason: "avoid unnecessary multi-model review when correctness does not require it",
+      correctnessReason: metrics.trivialNoToolTask
+        ? "no stateful task, no tool use, no file mutation, no verification requirement, and no blocking supervisor state"
+        : "commander can proceed alone because no correction, repeated failure, evidence gap, high-risk, conflict, long-context, or multimodal trigger was present",
+      costReason: metrics.trivialNoToolTask
+        ? "avoid unnecessary reviewer/verifier for explicit short no-tool answer"
+        : "avoid unnecessary multi-model review when correctness does not require it",
       evidenceRefs: [],
       requiredForCorrectness: false,
     })
@@ -535,6 +552,7 @@ export function decide(
       phase_switch_signal: metrics.phaseSwitchSignal,
       multimodal_signal: metrics.multimodalSignal,
       high_risk_task_signal: metrics.highRiskTaskSignal,
+      trivial_no_tool_task: metrics.trivialNoToolTask,
     },
   }
 }

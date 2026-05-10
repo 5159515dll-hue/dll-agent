@@ -238,6 +238,38 @@ describe("DllAgentTriggers.metrics self-injection filter (P0)", () => {
     expect(m.finalClaim).toBe(false)
     expect(m.userCorrections).toBe(0)
   })
+
+  test("ignores local role-model command output before a trivial no-tool prompt", () => {
+    const roleModelsOutput = asstMsg([
+      "dll-agent role models:",
+      "- commander: deepseek/deepseek-v4-pro | source=session | fallback=- | enabled=true | hint=configured",
+      "- long-context-archivist: kimi/kimi-k2.6 | source=global | fallback=- | enabled=true | hint=configured",
+      "- final-auditor: openai/gpt-5.5-pro | source=global | fallback=- | enabled=true | hint=configured",
+    ].join("\n"))
+    const m = metrics([
+      userMsg("/role-model-set commander deepseek/deepseek-v4-pro --scope session"),
+      asstMsg("Updated commander model.\nprevious=mimo/mimo-v2.5-pro\ncurrent=deepseek/deepseek-v4-pro\nsource=session"),
+      userMsg("/role-models"),
+      roleModelsOutput,
+      userMsg("只回答 OK，不要执行工具。"),
+    ])
+    expect(messageText(roleModelsOutput)).toBe("")
+    expect(m.longContextSignal).toBe(false)
+    expect(m.highRiskTaskSignal).toBe(false)
+    expect(m.trivialNoToolTask).toBe(true)
+  })
+
+  test("plain no-tool instruction is not high-risk by itself", () => {
+    const m = metrics([userMsg("只回答 OK，不要执行工具。")])
+    expect(m.highRiskTaskSignal).toBe(false)
+    expect(m.trivialNoToolTask).toBe(true)
+  })
+
+  test("quoted run prompt remains a trivial no-tool task", () => {
+    const m = metrics([userMsg("\"只回答 OK，不要执行工具。\"")])
+    expect(m.highRiskTaskSignal).toBe(false)
+    expect(m.trivialNoToolTask).toBe(true)
+  })
 })
 
 describe("DllAgentTriggers.metrics read-tool false positive (P0-2)", () => {

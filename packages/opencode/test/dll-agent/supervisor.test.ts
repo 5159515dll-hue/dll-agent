@@ -751,6 +751,45 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
     expect(entries.find((entry) => entry.payload.action === "commander_only")?.payload.role).toBe("commander")
   })
 
+  test("live smoke equivalent role-model command session then trivial no-tool prompt stays commander-only", () => {
+    const evidence = useEvidenceFile("routing-trivial-no-tool")
+    const sid = sessionID("routing_trivial_no_tool")
+    const messages = [
+      userMsg("msg_role_set", "/role-model-set commander deepseek/deepseek-v4-pro --scope session"),
+      asstMsg("Updated commander model.\nprevious=mimo/mimo-v2.5-pro\ncurrent=deepseek/deepseek-v4-pro\nsource=session"),
+      userMsg("msg_role_models", "/role-models"),
+      asstMsg([
+        "dll-agent role models:",
+        "- commander: deepseek/deepseek-v4-pro | source=session | fallback=- | enabled=true | hint=configured",
+        "- long-context-archivist: kimi/kimi-k2.6 | source=global | fallback=- | enabled=true | hint=configured",
+        "- final-auditor: openai/gpt-5.5-pro | source=global | fallback=- | enabled=true | hint=configured",
+      ].join("\n")),
+      userMsg("msg_user_no_tool_ok", "只回答 OK，不要执行工具。"),
+    ]
+    const decision = decide(messages, sid, 1)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.trivial_no_tool_task).toBe(true)
+    expect(decision.metrics.high_risk_task_signal).toBe(false)
+    const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
+    const commanderOnly = entries.find((entry) => entry.payload.action === "commander_only")
+    expect(commanderOnly?.payload.trigger_reason).toBe("trivial_no_tool_task")
+  })
+
+  test("trivial no-tool prompt does not hide unresolved supervisor state", () => {
+    const sid = sessionID("routing_trivial_blocked_state")
+    const state = loadState(sid)
+    state.required_reviews = ["requirements-inspector"]
+    state.blocked_completion = true
+    state.block_reason = "blocking reviewer not reconciled"
+    saveState(sid, state)
+
+    const decision = decide([userMsg("msg_user_no_tool_blocked", "只回答 OK，不要执行工具。")], sid, 1)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.trivial_no_tool_task).toBe(false)
+  })
+
   test("high-risk provider/routing/gate task allows multiple reviewers", () => {
     const sid = sessionID("routing_high_risk_governance")
     const decision = decide([

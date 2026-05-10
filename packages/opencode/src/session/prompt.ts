@@ -49,7 +49,7 @@ import { decide as supervisorDecide, updateState as supervisorUpdateState, loadS
 import { checkEvidenceGate, checkReconciliationGate, finalGate, isGateRetryExhausted, buildGateBlockSummary } from "@/dll-agent/gates"
 import { checkCap as checkCostCap, trackLastCall } from "@/dll-agent/cost-cap"
 import { checkCrossReviewTrigger } from "@/dll-agent/cross-review-bridge"
-import { metrics as computeTriggerMetrics, messageText } from "@/dll-agent/triggers"
+import { metrics as computeTriggerMetrics, messageText, isTrivialNoToolPromptText } from "@/dll-agent/triggers"
 import { activate as activateSkills, loadActive as loadActiveSkills, persist as persistSkills } from "@/dll-agent/skills"
 import type { SkillSignal } from "@/dll-agent/skill-registry"
 import { write as evidenceWrite } from "@/dll-agent/evidence"
@@ -85,6 +85,7 @@ import {
 } from "@/dll-agent/session-gate-orchestrator"
 import {
   buildContinuationRuntimeActions,
+  shouldStopAfterTrivialNoToolAnswer,
   type SessionRuntimeAction,
 } from "@/dll-agent/session-runtime-adapter"
 import { drainSupervisorDispatchBatch, planReviewerDispatchGroups } from "@/dll-agent/reviewer-dispatch"
@@ -1648,6 +1649,24 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
+          if (
+            profileEnabled() &&
+            !session.parentID &&
+            lastFinished &&
+            lastFinished.parentID === lastUser.id &&
+            lastFinished.finish &&
+            !["tool-calls", "unknown"].includes(lastFinished.finish) &&
+            tasks.length === 0 &&
+            gatePendingHints.length === 0 &&
+            supervisorPendingSubtasks.length === 0
+          ) {
+            const metrics = computeTriggerMetrics(msgs)
+            const state = supervisorLoadState(sessionID)
+            const lastUserMsg = msgs.find((msg) => msg.info.id === lastUser.id)
+            const explicitNoToolPrompt = isTrivialNoToolPromptText(messageText(lastUserMsg))
+            if (shouldStopAfterTrivialNoToolAnswer({ metrics, state, explicitNoToolPrompt })) break
+          }
+
           const applyContinuationRuntimeActions = Effect.fn(
             "SessionPrompt.applyContinuationRuntimeActions",
           )(function* (actions: SessionRuntimeAction[]) {
@@ -2684,6 +2703,20 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
 
+            if (profileEnabled() && !session.parentID && result !== "compact" && handle.message.finish !== "tool-calls") {
+              const metrics = computeTriggerMetrics(msgs)
+              const state = supervisorLoadState(sessionID)
+              const lastUserMsg = msgs.find((msg) => msg.info.id === lastUser.id)
+              const explicitNoToolPrompt = isTrivialNoToolPromptText(messageText(lastUserMsg))
+              if (shouldStopAfterTrivialNoToolAnswer({ metrics, state, explicitNoToolPrompt })) {
+                evidenceWrite("supervisor.trivial_no_tool_finished", {
+                  reason: "commander finished explicit no-tool answer; no continuation/reviewer/verifier required",
+                  finish: handle.message.finish ?? result,
+                }, sessionID)
+                return "break" as const
+              }
+            }
+
             if (structured !== undefined) {
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
@@ -2700,6 +2733,17 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                 }).toObject()
                 yield* sessions.updateMessage(handle.message)
                 return "break" as const
+              }
+              if (profileEnabled() && !session.parentID) {
+                const metrics = computeTriggerMetrics(msgs)
+                const state = supervisorLoadState(sessionID)
+                if (shouldStopAfterTrivialNoToolAnswer({ metrics, state })) {
+                  evidenceWrite("supervisor.trivial_no_tool_finished", {
+                    reason: "commander finished explicit no-tool answer; no continuation/reviewer/verifier required",
+                    finish: handle.message.finish,
+                  }, sessionID)
+                  return "break" as const
+                }
               }
             }
 
@@ -2729,6 +2773,17 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                 const lastAsstText = messageText(lastAsst)
                 const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
                 const currentTaskGoal = lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : ""
+                if (shouldStopAfterTrivialNoToolAnswer({
+                  metrics,
+                  state,
+                  explicitNoToolPrompt: isTrivialNoToolPromptText(currentTaskGoal),
+                })) {
+                  evidenceWrite("supervisor.trivial_no_tool_finished", {
+                    reason: "commander finished explicit no-tool answer; skip final/continuation gates for stateless answer",
+                    path: "second-break",
+                  }, sessionID)
+                  break
+                }
                 const costCheck = checkCostCap(sessionID, msgs)
 
                 const continuationResult = checkContinuationGate({

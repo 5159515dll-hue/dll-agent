@@ -177,6 +177,8 @@ export interface SupervisorMetricsSnapshot {
   multimodal_signal?: boolean
   /** Phase 5: high-risk governance/runtime task signal */
   high_risk_task_signal?: boolean
+  /** Live smoke P0: short explicit no-tool answer task */
+  trivial_no_tool_task?: boolean
 }
 
 // ─── Trigger 决策 ───────────────────────────────────────────────────────────

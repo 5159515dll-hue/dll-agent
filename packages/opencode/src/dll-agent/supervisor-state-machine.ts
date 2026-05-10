@@ -71,6 +71,7 @@ export function metricsFromSupervisorSnapshot(snapshot: SupervisorMetricsSnapsho
     phaseSwitchSignal: snapshot.phase_switch_signal ?? false,
     multimodalSignal: snapshot.multimodal_signal ?? false,
     highRiskTaskSignal: snapshot.high_risk_task_signal ?? false,
+    trivialNoToolTask: snapshot.trivial_no_tool_task ?? false,
   }
 }
 
