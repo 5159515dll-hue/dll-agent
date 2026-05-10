@@ -65,6 +65,15 @@ export function metricsFromSupervisorSnapshot(snapshot: SupervisorMetricsSnapsho
         continuation_allowed: snapshot.interaction_level !== "L0" && snapshot.interaction_level !== "L1",
         final_gate_required: snapshot.interaction_level !== "L0" && snapshot.interaction_level !== "L1",
         model_classifier_needed: false,
+        finalization_policy: snapshot.read_only_answer_task
+          ? "read_only_answer"
+          : snapshot.interaction_level === "L0"
+          ? "stateless_answer"
+          : snapshot.interaction_level === "L1"
+          ? "informational_answer"
+          : snapshot.interaction_level === "L4"
+          ? "high_risk_governance"
+          : "engineering_verification",
         confidence: snapshot.interaction_level === "L0" || snapshot.interaction_level === "L1" ? "high" : "medium",
         reason: "restored from supervisor metrics snapshot",
         matched_rules: ["snapshot"],
@@ -94,6 +103,8 @@ export function metricsFromSupervisorSnapshot(snapshot: SupervisorMetricsSnapsho
     trivialNoToolTask: snapshot.trivial_no_tool_task ?? false,
     statelessGreetingTask: snapshot.stateless_greeting_task ?? false,
     statelessChatTask: snapshot.stateless_chat_task ?? false,
+    readOnlyAnswerTask: snapshot.read_only_answer_task ?? false,
+    readOnlyToolAnswerTask: snapshot.read_only_tool_answer_task ?? false,
     taskClassification,
   }
 }

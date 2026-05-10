@@ -24,6 +24,8 @@ import { execSync } from "child_process"
 import type { CapabilityEntry, CapabilitySourceType } from "./capability-schema"
 import { createMinimalEntry } from "./capability-schema"
 import { addDiscovered } from "./capability-registry"
+import type { CapabilityAcquisitionRiskLevel } from "./capability-acquisition"
+import { writeCapabilityEvidence } from "./capability-acquisition"
 
 // ─── Cache & TTL ────────────────────────────────────────────────────────────────
 
@@ -394,4 +396,69 @@ export function clearDiscoveryCache() {
   } catch {
     // Best-effort
   }
+}
+
+export interface McpMetadataCandidate {
+  candidate_id: string
+  source_url: string
+  source_trust: "official" | "verified" | "unknown" | "untrusted"
+  metadata_only: true
+  risk_guess: CapabilityAcquisitionRiskLevel
+  reasons: string[]
+  requires_user_authorization: boolean
+  install_allowed: false
+  start_allowed: false
+  token_required: boolean
+  evidence_ref: string
+}
+
+function redactUrl(value: string) {
+  try {
+    const parsed = new URL(value)
+    for (const key of [...parsed.searchParams.keys()]) parsed.searchParams.set(key, "REDACTED")
+    if (parsed.hash) parsed.hash = parsed.hash.replace(/(token|key|password|auth|secret)=([^&]+)/gi, "$1=REDACTED")
+    return parsed.toString()
+  } catch {
+    return "invalid-url"
+  }
+}
+
+export function classifyMcpMetadataCandidate(input: {
+  sourceUrl: string
+  name?: string
+  sessionID?: string
+}): McpMetadataCandidate {
+  const normalized = `${input.name ?? ""} ${input.sourceUrl}`.toLowerCase()
+  const githubMutation = /github-mcp|github\/github-mcp-server|github api|\bissue\b|\bpull request\b|\bpr\b|\brelease\b/.test(normalized)
+  const browser = /playwright|browser|chrome|screenshot/.test(normalized)
+  const referenceCommunity = /modelcontextprotocol\/servers|modelcontextprotocol/.test(normalized)
+  const riskGuess: CapabilityAcquisitionRiskLevel = githubMutation || browser ? "R3" : referenceCommunity ? "R2" : "R2"
+  const reasons = [
+    "metadata discovery only",
+    ...(githubMutation ? ["GitHub MCP can access tokens, private repos, issues, PRs, releases, and repo mutation paths"] : []),
+    ...(browser ? ["browser automation must stay isolated and user-authorized"] : []),
+    ...(referenceCommunity ? ["community/reference MCP collection; individual servers require separate risk assessment"] : []),
+  ]
+  const evidenceRef = `capability.discovered:${input.name ?? "mcp-metadata"}`
+  const candidate: McpMetadataCandidate = {
+    candidate_id: (input.name ?? "mcp-metadata").replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 120),
+    source_url: redactUrl(input.sourceUrl),
+    source_trust: normalized.includes("github.com") || normalized.includes("modelcontextprotocol") ? "official" : "unknown",
+    metadata_only: true,
+    risk_guess: riskGuess,
+    reasons,
+    requires_user_authorization: riskGuess === "R3",
+    install_allowed: false,
+    start_allowed: false,
+    token_required: githubMutation,
+    evidence_ref: evidenceRef,
+  }
+  writeCapabilityEvidence("capability.discovered", candidate, input.sessionID)
+  return candidate
+}
+
+export function discoverMcpMetadataCandidates(input: { sources: Array<{ name: string; url: string }>; sessionID?: string }) {
+  return input.sources.map((source) =>
+    classifyMcpMetadataCandidate({ name: source.name, sourceUrl: source.url, sessionID: input.sessionID })
+  )
 }

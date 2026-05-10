@@ -122,6 +122,14 @@ const FAILURE_OUTPUT_PATTERNS = [
   /build.*(failed|error)|webpack|vite|rollup/i,
 ]
 
+function isReadOnlyTool(tool: string) {
+  return tool === "read" || tool === "glob" || tool === "grep" || tool === "list" || tool === "webfetch"
+}
+
+function isPermissionOrSecretFailure(text: string) {
+  return /permission denied|not allowed|could not request permission|denied|secret|token|cookie|ssh key|\.env|credential/i.test(text)
+}
+
 function needsUserInput(text: string) {
   return USER_REQUIRED_PATTERNS.some((pattern) => pattern.test(text))
 }
@@ -249,7 +257,10 @@ function buildBudgetState(params: {
   }
 }
 
-export function extractLatestFailure(messages: MessageV2.WithParts[]): LatestFailure | null {
+export function extractLatestFailure(
+  messages: MessageV2.WithParts[],
+  options?: { ignoreReadOnlyToolFailures?: boolean },
+): LatestFailure | null {
   for (const message of [...messages].reverse()) {
     for (const part of [...message.parts].reverse()) {
       if (part.type !== "tool") continue
@@ -257,6 +268,11 @@ export function extractLatestFailure(messages: MessageV2.WithParts[]): LatestFai
       const input = state.status === "pending" ? {} : state.input as Record<string, unknown> | undefined
       const command = typeof input?.command === "string" ? input.command : part.tool
       if (state.status === "error") {
+        if (
+          options?.ignoreReadOnlyToolFailures &&
+          isReadOnlyTool(part.tool) &&
+          !isPermissionOrSecretFailure(state.error)
+        ) continue
         return {
           whatFailed: command,
           stderr: state.error,

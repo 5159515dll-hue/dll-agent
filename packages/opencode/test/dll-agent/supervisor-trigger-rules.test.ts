@@ -30,6 +30,8 @@ function baseMetrics(overrides: Partial<Metrics> = {}): Metrics {
     highRiskTaskSignal: false,
     statelessGreetingTask: false,
     statelessChatTask: false,
+    readOnlyAnswerTask: false,
+    readOnlyToolAnswerTask: false,
     trivialNoToolTask: false,
     ...overrides,
   }
@@ -147,5 +149,23 @@ describe("supervisor trigger rules", () => {
       realToolEvidence: false,
       toolFailures: 0,
     }))).toBe(true)
+  })
+
+  test("read-only analysis answer suppresses completion-claim reviewers and auto-verifier", () => {
+    const userText = ["介绍", "工程", "不修改内容"].join(" ")
+    const result = collectReviewers(baseMetrics({
+      readOnlyAnswerTask: true,
+      finalClaim: true,
+      glmCompletionClaimSignal: true,
+      kimiCompletionCheckSignal: true,
+      realToolEvidence: false,
+    }), [textMessage(userText)])
+    expect(result.reviewers).toEqual([])
+    expect(needsAutoVerifier(baseMetrics({
+      readOnlyAnswerTask: true,
+      finalClaim: true,
+      realToolEvidence: false,
+      toolFailures: 0,
+    }))).toBe(false)
   })
 })

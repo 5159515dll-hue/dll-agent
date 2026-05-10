@@ -137,6 +137,8 @@ function triggerMetrics(overrides: Partial<Metrics> = {}): Metrics {
     highRiskTaskSignal: false,
     statelessGreetingTask: false,
     statelessChatTask: false,
+    readOnlyAnswerTask: false,
+    readOnlyToolAnswerTask: false,
     trivialNoToolTask: false,
     ...overrides,
   }

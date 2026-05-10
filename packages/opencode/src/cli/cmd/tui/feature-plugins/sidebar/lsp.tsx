@@ -1,5 +1,6 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createMemo, For, Show, createSignal } from "solid-js"
+import { enabled as dllEnabled } from "@/dll-agent/profile"
 
 const id = "internal:sidebar-lsp"
 
@@ -10,7 +11,8 @@ function View(props: { api: TuiPluginApi }) {
   const off = createMemo(() => props.api.state.config.lsp === false)
 
   return (
-    <box>
+    <Show when={!dllEnabled()}>
+      <box>
       <box flexDirection="row" gap={1} onMouseDown={() => list().length > 2 && setOpen((x) => !x)}>
         <Show when={list().length > 2}>
           <text fg={theme().text}>{open() ? "▼" : "▶"}</text>
@@ -43,7 +45,8 @@ function View(props: { api: TuiPluginApi }) {
           )}
         </For>
       </Show>
-    </box>
+      </box>
+    </Show>
   )
 }
 

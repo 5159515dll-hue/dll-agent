@@ -2,7 +2,7 @@ import type { MessageV2 } from "@/session/message-v2"
 import type { ReviewerRole, RiskLevel } from "./interfaces"
 import type { Metrics } from "./triggers"
 import { hasNonTextInput } from "./routing-policy"
-import { canSuppressRoutineReview } from "./task-intake-classifier"
+import { canSuppressRoutineReview, canUseReadOnlyAnswerFinalization } from "./task-intake-classifier"
 
 export interface SupervisorTriggerRuleCallbacks {
   addReviewer: (reviewer: ReviewerRole, reason: string) => void
@@ -115,11 +115,12 @@ export function applySupervisorTriggerRules(input: {
 }
 
 export function needsAutoVerifier(metrics: Metrics) {
-  if (canSuppressForStatelessTask(metrics)) return false
+  if (canSuppressForRoutineAnswer(metrics)) return false
   return metrics.finalClaim && !metrics.realToolEvidence && metrics.toolFailures === 0
 }
 
 function canSuppressForStatelessTask(metrics: Metrics) {
+  if (canSuppressReadOnlyAnswer(metrics)) return true
   if (
     !metrics.trivialNoToolTask &&
     !metrics.statelessGreetingTask &&
@@ -130,6 +131,22 @@ function canSuppressForStatelessTask(metrics: Metrics) {
   if (metrics.repeatedToolFailure || metrics.toolFailures > 0) return false
   if (metrics.permissionDenied > 0) return false
   if (metrics.finalClaim) return false
+  if (metrics.reviewerConflictSignal) return false
+  if (metrics.highRiskTaskSignal) return false
+  if (metrics.multimodalSignal) return false
+  if (metrics.scopeExpandedSignal || metrics.phaseSwitchSignal) return false
+  return true
+}
+
+function canSuppressForRoutineAnswer(metrics: Metrics) {
+  return canSuppressForStatelessTask(metrics)
+}
+
+function canSuppressReadOnlyAnswer(metrics: Metrics) {
+  if (!metrics.readOnlyAnswerTask && !canUseReadOnlyAnswerFinalization(metrics.taskClassification)) return false
+  if (metrics.recentUserCorrection || metrics.userCorrections > 0) return false
+  if (metrics.repeatedToolFailure || metrics.toolFailures > 0) return false
+  if (metrics.permissionDenied > 0) return false
   if (metrics.reviewerConflictSignal) return false
   if (metrics.highRiskTaskSignal) return false
   if (metrics.multimodalSignal) return false

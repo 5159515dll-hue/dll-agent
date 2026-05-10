@@ -64,6 +64,19 @@ Expected route:
 
 Regression status: `deterministic_passed`. Covered by `task-intake-classifier.test.ts`, `triggers.test.ts`, and `supervisor.test.ts`. Live retest remains recommended before claiming a new live S0b pass.
 
+### S0c Read-only Engineering Explanation
+
+Purpose: prevent read-only engineering explanations from being treated as verified engineering completion just because the assistant answer contains completion words or copied project TODOs.
+
+Expected route:
+
+- intent is classified by category: explanation/summary intent + engineering subject + no mutation/verification command;
+- route remains commander-only after the answer;
+- generated answer text cannot trigger task-completion-archivist, final-auditor, requirements-inspector, chief-engineer, cross-review, or executor auto-verifier by itself;
+- real correction, repeated failure, doctor failed, reviewer block, high-risk work, code mutation, explicit verification, secrets, destructive operations, or multimodal input still override the read-only finalization path.
+
+Regression status: `deterministic_passed`. Covered by category-combination tests, trigger metrics tests, supervisor routing tests, and intent-consensus participant tests.
+
 ## Phase 10.2 Required Live/Manual Status
 
 | Scenario | Status | Evidence |

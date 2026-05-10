@@ -183,6 +183,10 @@ export interface SupervisorMetricsSnapshot {
   stateless_greeting_task?: boolean
   /** Live smoke P0: stateless short chat that should not trigger reviewers */
   stateless_chat_task?: boolean
+  /** L2 read-only analysis answer that should not be treated as verified engineering completion */
+  read_only_answer_task?: boolean
+  /** Observed execution used only read-only tools and no failures/writes/commands/MCP/subtasks */
+  read_only_tool_answer_task?: boolean
   /** Task intake classifier output summary */
   task_kind?: string
   interaction_level?: "L0" | "L1" | "L2" | "L3" | "L4"

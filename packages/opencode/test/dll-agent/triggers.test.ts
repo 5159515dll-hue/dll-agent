@@ -97,15 +97,42 @@ function readTool(output: string, filePath?: string): MessageV2.WithParts {
   }
 }
 
-describe("DllAgentTriggers.metrics", () => {
-  test("detects EN user correction", () => {
-    const m = metrics([userMsg("That's wrong, let's redo it")])
-    expect(m.recentUserCorrection).toBe(true)
-  })
+function readToolError(error: string, filePath?: string): MessageV2.WithParts {
+  const input: Record<string, unknown> = {}
+  if (filePath) input.filePath = filePath
+  return {
+    info: {
+      id: "msg_read_err",
+      sessionID: "ses_test",
+      role: "assistant",
+      time: { created: 0 },
+      agent: "dll-agent-commander",
+      model: { providerID: "test", modelID: "test" },
+    } as any,
+    parts: [
+      {
+        type: "tool",
+        callID: "rec",
+        tool: "read",
+        state: {
+          status: "error",
+          input,
+          error,
+          time: { start: 0, end: 1 },
+        },
+        id: "rep",
+        messageID: "rem",
+        sessionID: "ses_test",
+      } as any,
+    ],
+  }
+}
 
-  test("detects 中文 user correction", () => {
-    const m = metrics([userMsg("不对，跑偏了，重新检查")])
-    expect(m.recentUserCorrection).toBe(true)
+describe("DllAgentTriggers.metrics", () => {
+  test("does not infer user correction from hard-coded natural-language phrases", () => {
+    const m = metrics([userMsg("That's wrong, let's redo it")])
+    expect(m.recentUserCorrection).toBe(false)
+    expect(m.taskClassification?.model_classifier_needed).toBe(true)
   })
 
   test("does not treat ordinary recheck wording as requirement correction", () => {
@@ -114,9 +141,9 @@ describe("DllAgentTriggers.metrics", () => {
     expect(m.userCorrections).toBe(0)
   })
 
-  test("detects mixed-language final claim", () => {
+  test("does not infer final claim from assistant natural-language prose", () => {
     const m = metrics([asstMsg("已经完成 implementation, all tests pass")])
-    expect(m.finalClaim).toBe(true)
+    expect(m.finalClaim).toBe(false)
   })
 
   test("does not flag plain conversation as final claim", () => {
@@ -124,9 +151,9 @@ describe("DllAgentTriggers.metrics", () => {
     expect(m.finalClaim).toBe(false)
   })
 
-  test("detects long context intent", () => {
+  test("does not infer long-context intent from hard-coded natural-language phrases", () => {
     const m = metrics([userMsg("Please summarize the long log baseline document")])
-    expect(m.longContextSignal).toBe(true)
+    expect(m.longContextSignal).toBe(false)
   })
 })
 
@@ -227,9 +254,9 @@ describe("DllAgentTriggers.metrics self-injection filter (P0)", () => {
     expect(m.reviewerConflictSignal).toBe(false)
   })
 
-  test("real user-origin reviewer conflict text still triggers", () => {
+  test("real user-origin reviewer conflict text no longer triggers without structured/model judgement", () => {
     const m = metrics([userMsg("两个 reviewer 给出相互矛盾的判断，证据不足。")])
-    expect(m.reviewerConflictSignal).toBe(true)
+    expect(m.reviewerConflictSignal).toBe(false)
   })
 
   test("ignores [dll-agent-evidence-gate] hint for finalClaim/correction", () => {
@@ -277,12 +304,12 @@ describe("DllAgentTriggers.metrics self-injection filter (P0)", () => {
     expect(m.trivialNoToolTask).toBe(true)
   })
 
-  test("detects stateless greetings and acknowledgements", () => {
+  test("short no-artifact inputs remain commander-only without source phrase matching", () => {
     for (const text of ["你好", "hello", "hi", "在吗", "谢谢", "thanks", "好的"]) {
       expect(isStatelessGreetingPromptText(text)).toBe(true)
       expect(isStatelessChatPromptText(text)).toBe(true)
       const m = metrics([userMsg(text)])
-      expect(m.statelessGreetingTask).toBe(true)
+      expect(m.statelessGreetingTask).toBe(false)
       expect(m.statelessChatTask).toBe(true)
       expect(m.highRiskTaskSignal).toBe(false)
       expect(m.longContextSignal).toBe(false)
@@ -290,31 +317,65 @@ describe("DllAgentTriggers.metrics self-injection filter (P0)", () => {
     }
   })
 
-  test("stateless greeting does not apply to engineering or verification tasks", () => {
-    expect(isStatelessGreetingPromptText("你好，帮我修复 provider routing")).toBe(false)
-    expect(isStatelessGreetingPromptText("hello, run tests")).toBe(false)
+  test("structural file/verification artifacts prevent short-input suppression", () => {
+    expect(isStatelessGreetingPromptText("bun test")).toBe(false)
     expect(isStatelessGreetingPromptText("谢谢，检查 packages/opencode/src/foo.ts")).toBe(false)
   })
 
-  test("ordinary informational request stays L1 without reviewer signals", () => {
+  test("ordinary natural-language request stays low-risk but needs semantic judgement", () => {
     const m = metrics([userMsg("介绍一下dll-agent")])
-    expect(m.taskClassification?.task_kind).toBe("informational")
+    expect(m.taskClassification?.task_kind).toBe("stateless_chat")
     expect(m.taskClassification?.interaction_level).toBe("L1")
+    expect(m.taskClassification?.model_classifier_needed).toBe(true)
     expect(m.statelessChatTask).toBe(true)
     expect(m.highRiskTaskSignal).toBe(false)
     expect(m.longContextSignal).toBe(false)
     expect(m.finalClaim).toBe(false)
   })
 
-  test("assistant generated engineering terms do not turn informational task high-risk", () => {
+  test("assistant generated engineering terms do not turn short user input high-risk", () => {
     const m = metrics([
       userMsg("介绍一下dll-agent"),
       asstMsg("dll-agent 包含 Provider/RoleModel、routing、gate、evidence、Result Ledger 等模块。"),
     ])
-    expect(m.taskClassification?.task_kind).toBe("informational")
+    expect(m.taskClassification?.task_kind).toBe("stateless_chat")
     expect(m.highRiskTaskSignal).toBe(false)
     expect(m.longContextSignal).toBe(false)
     expect(m.finalClaim).toBe(false)
+  })
+
+  test("read-only project introduction does not convert answer text into governance completion triggers", () => {
+    const userText = ["介绍", "工程", "不修改内容"].join(" ")
+    const assistantText = [
+      ["完整", "介绍"].join(""),
+      ["未修改", "源文件"].join(""),
+      ["待完成", "后续实验"].join("："),
+    ].join("\n")
+    const m = metrics([
+      userMsg(userText),
+      asstMsg(assistantText),
+    ])
+    expect(m.taskClassification?.verification_required).toBe(false)
+    expect(m.readOnlyAnswerTask || m.statelessChatTask).toBe(true)
+    expect(m.highRiskTaskSignal).toBe(false)
+    expect(m.kimiCompletionCheckSignal).toBe(false)
+    expect(m.glmCompletionClaimSignal).toBe(false)
+    expect(m.kimiPreReportSignal).toBe(false)
+  })
+
+  test("read-only tool-only answer treats read-tool misses as informational gaps, not recovery failures", () => {
+    const m = metrics([
+      userMsg(["介绍", "工程", "不修改内容"].join(" ")),
+      readToolError("ENOENT: no such file or directory, open 'docs/missing.md'", "docs/missing.md"),
+      asstMsg("以上是该工程的介绍，未修改任何内容。"),
+    ])
+    expect(m.taskClassification?.interaction_level).toBe("L1")
+    expect(m.readOnlyToolAnswerTask).toBe(true)
+    expect(m.readOnlyAnswerTask).toBe(true)
+    expect(m.toolFailures).toBe(0)
+    expect(m.repeatedToolFailure).toBe(false)
+    expect(m.kimiCompletionCheckSignal).toBe(false)
+    expect(m.glmCompletionClaimSignal).toBe(false)
   })
 
   test("self-generated task result and verification reports do not pollute routing signals", () => {
@@ -324,7 +385,7 @@ describe("DllAgentTriggers.metrics self-injection filter (P0)", () => {
       asstMsg("reviewer fallback summary\nblocking risk: supervisor auto-trigger false positive"),
       asstMsg("subtask resume text\n用户说不对，重新检查 provider routing"),
     ])
-    expect(m.statelessGreetingTask).toBe(true)
+    expect(m.statelessChatTask).toBe(true)
     expect(m.highRiskTaskSignal).toBe(false)
     expect(m.longContextSignal).toBe(false)
     expect(m.finalClaim).toBe(false)
@@ -409,9 +470,9 @@ describe("DllAgentTriggers.metrics reviewer output filter (P0-2)", () => {
     expect(m.reviewerConflictSignal).toBe(false)
   })
 
-  test("real user message with '冲突' still triggers conflict signal", () => {
+  test("real user natural-language conflict text waits for semantic judgement", () => {
     const m = metrics([userMsg("两个 reviewer 输出有冲突，无法判断谁对谁错")])
-    expect(m.reviewerConflictSignal).toBe(true)
+    expect(m.reviewerConflictSignal).toBe(false)
   })
 
   test("code containing trigger field names does NOT create false conflict signal", () => {
@@ -426,18 +487,18 @@ describe("DllAgentTriggers.metrics reviewer output filter (P0-2)", () => {
 // ─── Phase 6: New trigger signals ──────────────────────────────────────────
 
 describe("DllAgentTriggers.Phase6.kimiCompletionCheckSignal", () => {
-  test("triggers when completion claim contains unfinished TODO", () => {
+  test("does not trigger from assistant prose without structured completion state", () => {
     const m = metrics([
       asstMsg("全部任务已完成，但仍有 TODO：文档更新"),
       asstMsg("all done, TODO: clean up pending"),
     ])
-    expect(m.finalClaim).toBe(true)
-    expect(m.kimiCompletionCheckSignal).toBe(true)
+    expect(m.finalClaim).toBe(false)
+    expect(m.kimiCompletionCheckSignal).toBe(false)
   })
 
-  test("triggers when completion claim mentions 未完成", () => {
+  test("does not trigger from natural-language unfinished wording alone", () => {
     const m = metrics([asstMsg("任务已完成，但未完成：集成测试未运行")])
-    expect(m.kimiCompletionCheckSignal).toBe(true)
+    expect(m.kimiCompletionCheckSignal).toBe(false)
   })
 
   test("does NOT trigger without completion claim", () => {
@@ -447,15 +508,15 @@ describe("DllAgentTriggers.Phase6.kimiCompletionCheckSignal", () => {
 
   test("does NOT trigger when completion claim has no unfinished indicators", () => {
     const m = metrics([asstMsg("All tasks completed and verified. Ready to merge.")])
-    expect(m.finalClaim).toBe(true)
+    expect(m.finalClaim).toBe(false)
     expect(m.kimiCompletionCheckSignal).toBe(false)
   })
 })
 
 describe("DllAgentTriggers.Phase6.glmCompletionClaimSignal", () => {
-  test("triggers when completion claim has no real tool evidence", () => {
+  test("does not trigger from assistant completion prose without structured gate state", () => {
     const m = metrics([asstMsg("All tasks are done, verified and completed.")])
-    expect(m.glmCompletionClaimSignal).toBe(true)
+    expect(m.glmCompletionClaimSignal).toBe(false)
   })
 
   test("does NOT trigger without completion claim", () => {
@@ -465,7 +526,7 @@ describe("DllAgentTriggers.Phase6.glmCompletionClaimSignal", () => {
 })
 
 describe("DllAgentTriggers.Phase6.kimiPreReportSignal", () => {
-  test("triggers when context is high (>=30%) and final claim detected", () => {
+  test("does not trigger pre-report archivist from context alone without structured final claim", () => {
     // Use lastAssistant tokens to simulate high token count
     const highTokenAsst = {
       info: {
@@ -481,7 +542,7 @@ describe("DllAgentTriggers.Phase6.kimiPreReportSignal", () => {
     }
     const m = metrics([highTokenAsst], 1_000_000)
     expect(m.contextPercent).toBe(40)
-    expect(m.kimiPreReportSignal).toBe(true)
+    expect(m.kimiPreReportSignal).toBe(false)
   })
 
   test("does NOT trigger when context is below 30%", () => {
@@ -503,9 +564,9 @@ describe("DllAgentTriggers.Phase6.kimiPreReportSignal", () => {
 })
 
 describe("DllAgentTriggers.Phase6.scopeExpandedSignal", () => {
-  test("triggers when correction pattern and scope expansion detected", () => {
+  test("does not trigger scope expansion from natural-language wording alone", () => {
     const m = metrics([userMsg("不对，你扩大了范围，增加了额外功能")])
-    expect(m.scopeExpandedSignal).toBe(true)
+    expect(m.scopeExpandedSignal).toBe(false)
   })
 
   test("does NOT trigger in normal flow", () => {
@@ -515,14 +576,14 @@ describe("DllAgentTriggers.Phase6.scopeExpandedSignal", () => {
 })
 
 describe("DllAgentTriggers.Phase6.phaseSwitchSignal", () => {
-  test("triggers when user changes direction explicitly", () => {
+  test("does not trigger phase switch from natural-language wording alone", () => {
     const m = metrics([userMsg("先不要做那个了，换个方向，先修这个bug")])
-    expect(m.phaseSwitchSignal).toBe(true)
+    expect(m.phaseSwitchSignal).toBe(false)
   })
 
-  test("triggers when user says 暂停 + new task", () => {
+  test("structural private-token wording does not become phase switch", () => {
     const m = metrics([userMsg("暂停当前任务，改为检查 token 使用")])
-    expect(m.phaseSwitchSignal).toBe(true)
+    expect(m.phaseSwitchSignal).toBe(false)
   })
 
   test("does NOT trigger in normal continuation", () => {

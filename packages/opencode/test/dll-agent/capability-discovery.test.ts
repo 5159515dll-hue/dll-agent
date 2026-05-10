@@ -1,5 +1,11 @@
 import { describe, test, expect } from "bun:test"
-import { runDiscovery, needsDiscovery, clearDiscoveryCache } from "../../src/dll-agent/capability-discovery"
+import {
+  classifyMcpMetadataCandidate,
+  discoverMcpMetadataCandidates,
+  runDiscovery,
+  needsDiscovery,
+  clearDiscoveryCache,
+} from "../../src/dll-agent/capability-discovery"
 import { loadDiscoveredRegistry } from "../../src/dll-agent/capability-registry"
 import fs from "fs"
 import path from "path"
@@ -57,5 +63,52 @@ describe("discovery TTL", () => {
     clearDiscoveryCache()
     const cachePath = path.join(os.homedir(), ".dll-agent", "capabilities", "discovery-cache.json")
     expect(fs.existsSync(cachePath)).toBe(false)
+  })
+})
+
+describe("MCP metadata discovery only", () => {
+  test("GitHub MCP metadata is classified R3 and requires authorization without reading token", () => {
+    const candidate = classifyMcpMetadataCandidate({
+      name: "github-mcp-server",
+      sourceUrl: "https://github.com/github/github-mcp-server#readme?token=secret-value",
+    })
+    expect(candidate.risk_guess).toBe("R3")
+    expect(candidate.requires_user_authorization).toBe(true)
+    expect(candidate.token_required).toBe(true)
+    expect(candidate.install_allowed).toBe(false)
+    expect(candidate.start_allowed).toBe(false)
+    expect(candidate.source_url).not.toContain("secret-value")
+  })
+
+  test("modelcontextprotocol servers metadata is reference/community mixed and not installable", () => {
+    const candidate = classifyMcpMetadataCandidate({
+      name: "modelcontextprotocol-servers",
+      sourceUrl: "https://github.com/modelcontextprotocol/servers#readme",
+    })
+    expect(candidate.risk_guess).toBe("R2")
+    expect(candidate.reasons.join(" ")).toContain("community/reference")
+    expect(candidate.install_allowed).toBe(false)
+    expect(candidate.start_allowed).toBe(false)
+  })
+
+  test("Playwright browser metadata is R3 on-demand and not started", () => {
+    const candidate = classifyMcpMetadataCandidate({
+      name: "playwright-mcp",
+      sourceUrl: "https://github.com/microsoft/playwright-mcp#readme",
+    })
+    expect(candidate.risk_guess).toBe("R3")
+    expect(candidate.requires_user_authorization).toBe(true)
+    expect(candidate.start_allowed).toBe(false)
+  })
+
+  test("discoverMcpMetadataCandidates never starts MCP or requires GitHub token", () => {
+    const candidates = discoverMcpMetadataCandidates({
+      sources: [
+        { name: "github-mcp-server", url: "https://github.com/github/github-mcp-server#readme" },
+        { name: "modelcontextprotocol-servers", url: "https://github.com/modelcontextprotocol/servers#readme" },
+      ],
+    })
+    expect(candidates).toHaveLength(2)
+    expect(candidates.every((candidate) => candidate.install_allowed === false && candidate.start_allowed === false)).toBe(true)
   })
 })
