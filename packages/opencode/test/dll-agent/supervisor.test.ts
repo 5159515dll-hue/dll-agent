@@ -751,6 +751,91 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
     expect(entries.find((entry) => entry.payload.action === "commander_only")?.payload.role).toBe("commander")
   })
 
+  test("live smoke equivalent role-model command session then trivial no-tool prompt stays commander-only", () => {
+    const evidence = useEvidenceFile("routing-trivial-no-tool")
+    const sid = sessionID("routing_trivial_no_tool")
+    const messages = [
+      userMsg("msg_role_set", "/role-model-set commander deepseek/deepseek-v4-pro --scope session"),
+      asstMsg("Updated commander model.\nprevious=mimo/mimo-v2.5-pro\ncurrent=deepseek/deepseek-v4-pro\nsource=session"),
+      userMsg("msg_role_models", "/role-models"),
+      asstMsg([
+        "dll-agent role models:",
+        "- commander: deepseek/deepseek-v4-pro | source=session | fallback=- | enabled=true | hint=configured",
+        "- long-context-archivist: kimi/kimi-k2.6 | source=global | fallback=- | enabled=true | hint=configured",
+        "- final-auditor: openai/gpt-5.5-pro | source=global | fallback=- | enabled=true | hint=configured",
+      ].join("\n")),
+      userMsg("msg_user_no_tool_ok", "只回答 OK，不要执行工具。"),
+    ]
+    const decision = decide(messages, sid, 1)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.trivial_no_tool_task).toBe(true)
+    expect(decision.metrics.high_risk_task_signal).toBe(false)
+    const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
+    const commanderOnly = entries.find((entry) => entry.payload.action === "commander_only")
+    expect(commanderOnly?.payload.trigger_reason).toBe("trivial_no_tool_task")
+  })
+
+  test("stateless greeting stays commander-only and does not trigger reviewers or verifier", () => {
+    const evidence = useEvidenceFile("routing-stateless-greeting")
+    const sid = sessionID("routing_stateless_greeting")
+    const decision = decide([userMsg("msg_user_hello", "你好")], sid, 1)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.stateless_greeting_task).toBe(true)
+    expect(decision.metrics.stateless_chat_task).toBe(true)
+    expect(decision.metrics.high_risk_task_signal).toBe(false)
+    const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
+    const commanderOnly = entries.find((entry) => entry.payload.action === "commander_only")
+    expect(commanderOnly?.payload.trigger_reason).toBe("stateless_greeting_task")
+  })
+
+  test("stateless greeting is not polluted by generated reviewer and verification prose", () => {
+    const sid = sessionID("routing_stateless_generated_noise")
+    const decision = decide([
+      userMsg("msg_user_hello_noise", "你好"),
+      asstMsg("<task_result>\nVerification Report\n已完成 provider routing gate evidence result ledger 检查，final-auditor blocked."),
+      asstMsg("reviewer fallback summary\nblocking risk: supervisor auto-trigger false positive"),
+    ], sid, 1)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.stateless_greeting_task).toBe(true)
+    expect(decision.metrics.high_risk_task_signal).toBe(false)
+    expect(decision.metrics.final_claim).toBe(false)
+  })
+
+  test("informational introduction stays commander-only and is not polluted by dll-agent module names", () => {
+    const evidence = useEvidenceFile("routing-informational-intake")
+    const sid = sessionID("routing_informational_intake")
+    const decision = decide([
+      userMsg("msg_user_intro", "介绍一下dll-agent"),
+      asstMsg("dll-agent 包含 Provider/RoleModel、routing、gate、evidence、Result Ledger 等模块。"),
+    ], sid, 1)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.task_kind).toBe("informational")
+    expect(decision.metrics.interaction_level).toBe("L1")
+    expect(decision.metrics.high_risk_task_signal).toBe(false)
+    expect(decision.metrics.stateless_chat_task).toBe(true)
+    const entries = readEvidence(evidence).filter((entry) => entry.type === "model.routing_decision")
+    const commanderOnly = entries.find((entry) => entry.payload.action === "commander_only")
+    expect(commanderOnly?.payload.trigger_reason).toBe("task_intake:informational:L1")
+  })
+
+  test("trivial no-tool prompt does not hide unresolved supervisor state", () => {
+    const sid = sessionID("routing_trivial_blocked_state")
+    const state = loadState(sid)
+    state.required_reviews = ["requirements-inspector"]
+    state.blocked_completion = true
+    state.block_reason = "blocking reviewer not reconciled"
+    saveState(sid, state)
+
+    const decision = decide([userMsg("msg_user_no_tool_blocked", "只回答 OK，不要执行工具。")], sid, 1)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+    expect(decision.metrics.trivial_no_tool_task).toBe(false)
+  })
+
   test("high-risk provider/routing/gate task allows multiple reviewers", () => {
     const sid = sessionID("routing_high_risk_governance")
     const decision = decide([

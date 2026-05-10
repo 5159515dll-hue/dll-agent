@@ -8,12 +8,14 @@
 
 import type { RecoveryDecision } from "./recovery-loop"
 import { buildBlockedRecoveryReport, buildRecoveryHint, planRecoveryFromContinuationPacket } from "./recovery-loop"
+import type { Metrics } from "./triggers"
 import {
   type ContinuationGateResult,
   type ContinuationPacket,
   type SupervisorState,
 } from "./interfaces"
 import { isContinuationBudgetExhausted } from "./continuation-gate"
+import { canSuppressRoutineReview } from "./task-intake-classifier"
 
 export type SessionRuntimeAction =
   | {
@@ -132,6 +134,33 @@ export function buildContinuationRuntimeActions(input: {
   }
 
   return actions
+}
+
+export function shouldStopAfterTrivialNoToolAnswer(input: {
+  metrics: Metrics
+  state: SupervisorState
+  explicitNoToolPrompt?: boolean
+}) {
+  if (
+    !input.metrics.trivialNoToolTask &&
+    !input.metrics.statelessGreetingTask &&
+    !input.metrics.statelessChatTask &&
+    !canSuppressRoutineReview(input.metrics.taskClassification) &&
+    !input.explicitNoToolPrompt
+  ) return false
+  if (input.metrics.recentUserCorrection || input.metrics.userCorrections > 0) return false
+  if (input.metrics.repeatedToolFailure || input.metrics.toolFailures > 0) return false
+  if (input.metrics.permissionDenied > 0) return false
+  if (input.metrics.finalClaim) return false
+  if (input.metrics.reviewerConflictSignal) return false
+  if (input.metrics.highRiskTaskSignal) return false
+  if (input.metrics.multimodalSignal) return false
+  if (input.metrics.scopeExpandedSignal || input.metrics.phaseSwitchSignal) return false
+  if (input.state.blocked_completion || input.state.reviewer_conflict) return false
+  if (input.state.required_reviews.length > 0) return false
+  if ((input.state.queued_reviewers ?? []).length > 0) return false
+  if ((input.state.running_reviewers ?? []).length > 0) return false
+  return true
 }
 
 export * as SessionRuntimeAdapter from "./session-runtime-adapter"

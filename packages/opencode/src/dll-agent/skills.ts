@@ -22,6 +22,7 @@
 import { SKILL_REGISTRY, type SkillDefinition, type SkillRisk, type SkillSignal } from "./skill-registry"
 import { fullOutputs, summary as skillSummary, type SkillActivationOutput } from "./skill-loader"
 import { write as writeEvidence, redact } from "./evidence"
+import { canSuppressRoutineReview, classifyTaskIntake } from "./task-intake-classifier"
 import fs from "fs"
 import path from "path"
 import os from "os"
@@ -108,11 +109,22 @@ function matchSkill(
   if (matchAny(input.userText, t.keywords)) return { reason: "keyword match", bySignal: false }
   const fileHit = matchGlobs(input.files, t.fileGlobs)
   if (fileHit) return { reason: `file match: ${fileHit}`, bySignal: false }
-  if (t.repoMarkers && t.repoMarkers.some((m) => input.repoMarkers.includes(m)))
+  if (t.repoMarkers && t.repoMarkers.some((m) => input.repoMarkers.includes(m))) {
+    if (skill.id === "repo-doctor" && !canUseRepoDoctorMarker(input)) return undefined
     return { reason: "repo marker match", bySignal: false }
+  }
   if (t.intents && t.intents.some((i) => input.intents.includes(i)))
     return { reason: "explicit intent", bySignal: false }
   return undefined
+}
+
+function canUseRepoDoctorMarker(input: ActivationInput) {
+  const classification = classifyTaskIntake({ userText: input.userText })
+  if (!classification.repo_doctor_allowed && canSuppressRoutineReview(classification)) return false
+  if (input.signals?.some((s) => s === "tool_failures_high" || s === "tool_failures_repeated" || s === "permission_denied" || s === "verification_failed")) return true
+  if (input.intents.some((i) => i === "repo-doctor" || i === "diagnose")) return true
+  if (/项目.*乱|repo.*health|健康检查|baseline.*broken|项目.*坏|diagnose|repo doctor|跑不起来|启动失败|依赖.*问题|test|typecheck|build|doctor|检查|诊断/i.test(input.userText)) return true
+  return false
 }
 
 // ─── Fingerprint & Cooldown ──────────────────────────────────────────────
@@ -357,5 +369,3 @@ export function checkForbiddenCommand(
 export function find(idOrName: string): SkillDefinition | undefined {
   return SKILL_REGISTRY.find((s) => s.id === idOrName || s.name === idOrName)
 }
-
-

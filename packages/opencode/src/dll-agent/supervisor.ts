@@ -48,6 +48,7 @@ import { buildReviewerContextWithPacket, extractRelatedPaths, latestRealUser } f
 import { buildGuardDecision } from "./action-fingerprint-gate"
 import { buildRoleRunEnvelope } from "./role-run-envelope"
 import { roleToolPolicyFor } from "./role-tool-policy"
+import { canSuppressRoutineReview } from "./task-intake-classifier"
 import os from "os"
 
 export { assessRisk, modelContextLimit } from "./routing-policy"
@@ -300,7 +301,29 @@ export function decide(
   contextLimit?: number,
   availableAgents?: string[],
 ): TriggerDecision {
-  const metrics = computeMetrics(messages, contextLimit)
+  const rawMetrics = computeMetrics(messages, contextLimit)
+  const initialState = loadState(sessionID)
+  const hasUnresolvedSupervisorState = Boolean(
+    initialState.blocked_completion ||
+      initialState.reviewer_conflict ||
+      initialState.required_reviews.length > 0 ||
+      (initialState.queued_reviewers ?? []).length > 0 ||
+      (initialState.running_reviewers ?? []).length > 0,
+  )
+  const metrics = (rawMetrics.statelessChatTask || canSuppressRoutineReview(rawMetrics.taskClassification)) && hasUnresolvedSupervisorState
+    ? {
+        ...rawMetrics,
+        trivialNoToolTask: false,
+        statelessGreetingTask: false,
+        statelessChatTask: false,
+        taskClassification: rawMetrics.taskClassification
+          ? {
+              ...rawMetrics.taskClassification,
+              safety_overrides: [...rawMetrics.taskClassification.safety_overrides, "unresolved_supervisor_state"],
+            }
+          : rawMetrics.taskClassification,
+      }
+    : rawMetrics
   const reasons: Record<ReviewerRole, string> = {} as Record<ReviewerRole, string>
   const reviewers: ReviewerRole[] = []
   const fingerprints: Partial<Record<ReviewerRole, string>> = {}
@@ -494,10 +517,20 @@ export function decide(
       selectedModel: `${commanderModel.providerID}/${commanderModel.modelID}`,
       candidateModels: [`${commanderModel.providerID}/${commanderModel.modelID}`],
       riskLevel: risk,
-      triggerReason: "ordinary low-risk task or no correctness-required reviewer trigger",
+      triggerReason: metrics.statelessGreetingTask
+        ? "stateless_greeting_task"
+        : metrics.trivialNoToolTask
+        ? "trivial_no_tool_task"
+        : metrics.taskClassification?.interaction_level === "L1"
+        ? `task_intake:${metrics.taskClassification.task_kind}:L1`
+        : "ordinary low-risk task or no correctness-required reviewer trigger",
       skippedReviewers: [],
-      correctnessReason: "commander can proceed alone because no correction, repeated failure, evidence gap, high-risk, conflict, long-context, or multimodal trigger was present",
-      costReason: "avoid unnecessary multi-model review when correctness does not require it",
+      correctnessReason: metrics.statelessChatTask || canSuppressRoutineReview(metrics.taskClassification)
+        ? "no stateful task, no tool use, no file mutation, no verification requirement, and no blocking supervisor state"
+        : "commander can proceed alone because no correction, repeated failure, evidence gap, high-risk, conflict, long-context, or multimodal trigger was present",
+      costReason: metrics.statelessChatTask || canSuppressRoutineReview(metrics.taskClassification)
+        ? "avoid unnecessary reviewer/verifier for stateless short answer"
+        : "avoid unnecessary multi-model review when correctness does not require it",
       evidenceRefs: [],
       requiredForCorrectness: false,
     })
@@ -535,6 +568,11 @@ export function decide(
       phase_switch_signal: metrics.phaseSwitchSignal,
       multimodal_signal: metrics.multimodalSignal,
       high_risk_task_signal: metrics.highRiskTaskSignal,
+      trivial_no_tool_task: metrics.trivialNoToolTask,
+      stateless_greeting_task: metrics.statelessGreetingTask,
+      stateless_chat_task: metrics.statelessChatTask,
+      task_kind: metrics.taskClassification?.task_kind,
+      interaction_level: metrics.taskClassification?.interaction_level,
     },
   }
 }

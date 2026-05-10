@@ -8,6 +8,7 @@ import type {
 import { recordGateBlock } from "./gates"
 import { assessRisk } from "./routing-policy"
 import type { Metrics } from "./triggers"
+import type { TaskIntakeClassification, TaskKind } from "./task-intake-classifier"
 
 export function normalizeSupervisorReviewerState(state: SupervisorState) {
   state.completed_reviews = [...new Set(state.completed_reviews ?? [])]
@@ -51,6 +52,25 @@ export function freshSupervisorState(): SupervisorState {
 }
 
 export function metricsFromSupervisorSnapshot(snapshot: SupervisorMetricsSnapshot): Metrics {
+  const taskClassification: TaskIntakeClassification | undefined = snapshot.task_kind && snapshot.interaction_level
+    ? {
+        task_kind: snapshot.task_kind as TaskKind,
+        interaction_level: snapshot.interaction_level,
+        user_origin_only: true,
+        tool_required: false,
+        reviewer_required: false,
+        verification_required: false,
+        goal_contract_required: snapshot.interaction_level !== "L0" && snapshot.interaction_level !== "L1",
+        repo_doctor_allowed: snapshot.interaction_level !== "L0" && snapshot.interaction_level !== "L1",
+        continuation_allowed: snapshot.interaction_level !== "L0" && snapshot.interaction_level !== "L1",
+        final_gate_required: snapshot.interaction_level !== "L0" && snapshot.interaction_level !== "L1",
+        model_classifier_needed: false,
+        confidence: snapshot.interaction_level === "L0" || snapshot.interaction_level === "L1" ? "high" : "medium",
+        reason: "restored from supervisor metrics snapshot",
+        matched_rules: ["snapshot"],
+        safety_overrides: [],
+      }
+    : undefined
   return {
     userCorrections: snapshot.user_corrections,
     recentUserCorrection: snapshot.user_corrections > 0,
@@ -71,6 +91,10 @@ export function metricsFromSupervisorSnapshot(snapshot: SupervisorMetricsSnapsho
     phaseSwitchSignal: snapshot.phase_switch_signal ?? false,
     multimodalSignal: snapshot.multimodal_signal ?? false,
     highRiskTaskSignal: snapshot.high_risk_task_signal ?? false,
+    trivialNoToolTask: snapshot.trivial_no_tool_task ?? false,
+    statelessGreetingTask: snapshot.stateless_greeting_task ?? false,
+    statelessChatTask: snapshot.stateless_chat_task ?? false,
+    taskClassification,
   }
 }
 
