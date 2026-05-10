@@ -49,6 +49,19 @@ Implemented runtime rules:
 
 - Ordinary low-risk tasks write `commander_only` routing evidence and trigger zero reviewers.
 - `trivial_no_tool_task` covers short, explicit answer-only prompts such as "只回答 OK，不要执行工具。"; it stays commander-only, suppresses reviewer/verifier/task-completion/final-auditor dispatch, and writes `model.routing_decision` with `trigger_reason=trivial_no_tool_task`.
+- `stateless_greeting_task` covers short greetings or acknowledgements such as "你好", "hello", "hi", "在吗", "谢谢", "thanks", "ok", and "好的". It is commander-only, does not create verification requirements, does not activate repo-doctor, and writes `model.routing_decision` with `trigger_reason=stateless_greeting_task`.
+- `TaskIntakeClassifier` now classifies user-origin input into interaction levels before routing:
+  - `L0`: stateless greeting / no-op chat. Commander-only, zero reviewer, no repo-doctor, no complex Goal Contract, no verification, no continuation, no final-auditor, no tools, no MCP.
+  - `L1`: informational. Examples: "介绍一下 dll-agent", "什么是 xxx", "explain xxx". Commander-only by default, no tools, no typecheck/test/doctor verification, no full governance stack.
+  - `L2`: light engineering analysis. Read-only analysis, code structure explanation, or planning; may read files but does not write by default.
+  - `L3`: coding / debugging / verification. Uses Goal Contract, Recovery Loop, Result Ledger, and required verification.
+  - `L4`: high risk. Provider/routing/gate/evidence/permission, secrets/auth, destructive commands, push/release, system/global mutation, large refactors, MCP runtime, doctor failed, or high-cost provider work. Reviewer and strict permission/final/evidence gates are required and cannot be downgraded by model classification.
+- User-origin-only source filtering is mandatory. `/role-model-set`, `/role-models`, `/task-status`, TUI/status text, doctor reports, verification reports, reviewer outputs, fallback reviewer summaries, Result Ledger summaries, routing evidence summaries, rendered ContextHandoffPacket text, `<task_result>`, subtask resume text, model usage reports, and regression reports may be recorded as evidence/trajectory, but they cannot create user-origin routing triggers.
+- Policy manifests can extend deterministic intake rules without source changes:
+  - global: `~/.dll-agent/config/task-intake-policy.jsonc`;
+  - project: `.dll-agent/task-intake-policy.jsonc`;
+  - project entries overlay global entries. Supported keys include `greetings`, `informational`, `light_engineering_analysis`, `coding`, `debugging`, `verification`, `planning`, `permission`, `multimodal`, and `high_risk`.
+- Self-generated runtime text such as `<task_result>`, `<compact-review-context>`, Verification Report, reviewer fallback summaries, subtask resume text, Result Ledger summaries, routing evidence summaries, doctor reports, and TUI/status text is filtered out of user-origin trigger metrics. It remains valid evidence/trajectory data, but it cannot create high-risk, long-context, final-claim, or requirements-correction triggers.
 - User correction triggers `requirements-inspector`.
 - Repeated failure escalates from commander repair to `chief-engineer`, then role-cross/cross-review decision.
 - Final claim without evidence is blocked by evidence/final gate and may trigger verifier/final audit.
@@ -61,9 +74,11 @@ Implemented runtime rules:
 
 ## Trivial No-tool Guard
 
-`trivial_no_tool_task` is a narrow live-smoke guard, not a general cost reduction rule.
+`trivial_no_tool_task` and `stateless_greeting_task` are narrow live-smoke guards, not general cost reduction rules.
 
 It can suppress reviewers only when the latest user message is short, explicitly asks for a simple text answer, explicitly says not to use tools/commands, and the recent session has no file path, code-change request, verification request, error log, user correction, repeated failure, high-risk operation, multimodal input, final completion claim, doctor failure, or unresolved blocking reviewer state.
+
+For `stateless_greeting_task`, the explicit no-tool phrase is not required, but the same safety conditions apply: no active blocking state, no engineering intent, no code/file/test/doctor request, no error log, no high-risk keyword, no multimodal input, no repeated failure, no user correction, and no unresolved reviewer block.
 
 It never suppresses correctness-required review for:
 
@@ -125,6 +140,12 @@ Implemented_runtime_verified:
 
 - low-risk commander-only evidence;
 - live-smoke false-positive guard for explicit short no-tool prompts;
+- live-smoke false-positive guard for stateless greetings and acknowledgements;
+- task intake classifier with L0/L1/L2/L3/L4 interaction levels;
+- user-origin-only source filter for routing-relevant signals;
+- configurable task-intake policy manifest;
+- repo-doctor activation guard so repository markers alone do not activate repo-doctor for stateless chat;
+- self-generated text filtering before trigger metrics are computed;
 - high-risk multi-reviewer routing within budget;
 - unresolved correctness-required skip risk;
 - final gate visibility for unresolved routing risk;
@@ -134,6 +155,7 @@ Implemented_runtime_verified:
 Partial_runtime:
 
 - routing still depends on existing supervisor message stream rather than a dedicated tool-event bus;
+- model-based ambiguous classifier is a placeholder only; deterministic classification is implemented, but no live model classifier is called;
 - `trigger_multiple_reviewers` is represented by per-reviewer dispatch evidence plus high-risk supervisor metrics, not a separate central dispatch packet.
 
 Missing:

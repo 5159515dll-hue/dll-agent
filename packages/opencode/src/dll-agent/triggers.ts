@@ -1,4 +1,9 @@
 import type { MessageV2 } from "@/session/message-v2"
+import {
+  canSuppressRoutineReview,
+  classifyTaskIntake,
+  type TaskIntakeClassification,
+} from "./task-intake-classifier"
 
 export type Metrics = {
   userCorrections: number
@@ -29,6 +34,16 @@ export type Metrics = {
   /** High-risk governance/runtime area touched: provider/routing/gate/evidence/permission/quota/MCP/etc. */
   highRiskTaskSignal: boolean
   /**
+   * True for stateless greetings / acknowledgement chat such as "你好" or
+   * "thanks". These should remain commander-only unless there is unresolved
+   * supervisor state or another correctness-required trigger.
+   */
+  statelessGreetingTask: boolean
+  /** Broader stateless short chat task. Includes trivial no-tool answer prompts. */
+  statelessChatTask: boolean
+  /** User-origin deterministic task intake classification. */
+  taskClassification?: TaskIntakeClassification
+  /**
    * True only for short, explicit no-tool answer requests such as
    * "只回答 OK，不要执行工具。". This suppresses reviewer/verifier triggers for
    * stateless acknowledgement tasks without weakening correctness-required
@@ -58,8 +73,14 @@ function stripSelfInjections(text: string) {
   const tagPrefixes = [
     "[dll-agent ",
     "[dll-agent-",
+    "<compact-review-context",
+    "<task_result",
+    "<dll-agent-final-gate",
+    "<dll-agent-continuation",
   ]
   if (tagPrefixes.some((p) => firstNonEmpty.startsWith(p))) return ""
+
+  if (isSelfGeneratedReport(firstNonEmpty, text)) return ""
 
   // Local dll-agent slash commands are handled without an LLM but are still
   // persisted as session messages. Do not let their status text pollute the
@@ -84,9 +105,36 @@ function stripSelfInjections(text: string) {
     .filter((line) => {
       const t = line.trim()
       if (tagPrefixes.some((p) => t.startsWith(p))) return false
+      if (isSelfGeneratedReportLine(t)) return false
       return true
     })
     .join("\n")
+}
+
+function isSelfGeneratedReport(firstLine: string, text: string) {
+  if (isSelfGeneratedReportLine(firstLine)) return true
+  const strongMarkers = [
+    /<task_result[\s>]/i,
+    /<compact-review-context[\s>]/i,
+    /<dll-agent-final-gate[\s>]/i,
+    /<dll-agent-continuation[\s>]/i,
+    /^Verification Report\b/i,
+    /^Reviewer fallback summary\b/i,
+    /^reviewer result\b/i,
+    /^task-completion-archivist output\b/i,
+    /^final-auditor output\b/i,
+    /^role-cross output\b/i,
+    /^subtask resume\b/i,
+    /^result ledger summary\b/i,
+    /^routing evidence summary\b/i,
+    /^dll-agent doctor\b/i,
+    /^doctor report\b/i,
+  ]
+  return strongMarkers.some((re) => re.test(text.trim()))
+}
+
+function isSelfGeneratedReportLine(line: string) {
+  return /^(?:Verification Report|Reviewer fallback summary|reviewer result|task-completion-archivist output|final-auditor output|role-cross output|subtask resume|task_id:\s*ses_|result ledger summary|routing evidence summary|doctor report|TUI\/status panel|task selected|task verified|task blocked|runtime idle\/on-demand|Model usage \(local est\.\)|Quota|Capabilities|LSP|Todo)\b/i.test(line)
 }
 
 function isLocalCommandEchoOrResponse(firstLine: string, text: string) {
@@ -99,7 +147,7 @@ function isLocalCommandEchoOrResponse(firstLine: string, text: string) {
 }
 
 function hasFileOrPathIntent(text: string) {
-  return /(?:^|\s)(?:\.{0,2}\/|~\/|\/Users\/|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|md|json|jsonc|yaml|yml|toml|sh|sql|html|css|png|jpg|jpeg|pdf|docx|pptx|xlsx))\b/.test(text)
+  return /(?:^|\s)(?:\.{0,2}\/|~\/|\/Users\/|[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|md|json|jsonc|yaml|yml|toml|sh|sql|html|css|png|jpg|jpeg|pdf|docx|pptx|xlsx))\b/.test(text)
 }
 
 export function isTrivialNoToolPromptText(text: string) {
@@ -114,6 +162,28 @@ export function isTrivialNoToolPromptText(text: string) {
     /(不要|别|无需|不需要|禁止|do\s*not|don't|without|no)\s*(执行|使用|调用|运行|use|call|run)?\s*(工具|命令|tool|tools|command|commands|bash|shell)/i.test(normalized)
 
   return simpleAnswer && noTools
+}
+
+function hasCodeOrErrorIntent(text: string) {
+  return /```|(?:^|\n)\s*(?:error|failed|exception|traceback|stack trace|panic:|TS\d{4}|npm ERR!|bun test|pytest|typecheck|doctor)\b/i.test(text)
+}
+
+function hasEngineeringOrVerificationIntent(text: string) {
+  return /(改|修改|修复|实现|新增|删除|重构|检查|分析|读取|打开|执行命令|运行(?:命令|测试|脚本|程序)|测试|验证|typecheck|build|doctor|报错|错误|失败|日志|权限|凭据|secret|token|cookie|provider|routing|gate|evidence|result ledger|permission|quota|mcp|lsp|fix|implement|edit|write|delete|refactor|inspect|analyze|verify|run\s+(?:command|test|build)|test|error|failed|log)/i.test(text)
+}
+
+export function isStatelessGreetingPromptText(text: string) {
+  const normalized = text.trim().replace(/^["'“”]+|["'“”。.!?？！]+$/g, "").trim().toLowerCase()
+  if (!normalized || normalized.length > 40) return false
+  if (hasFileOrPathIntent(normalized)) return false
+  if (hasCodeOrErrorIntent(normalized)) return false
+  if (hasEngineeringOrVerificationIntent(normalized)) return false
+  return /^(你好|您好|hello|hi|hey|在吗|哈喽|早上好|上午好|中午好|下午好|晚上好|谢谢|多谢|thanks|thank you|ok|okay|好的|好|嗯|收到|辛苦了)$/.test(normalized)
+}
+
+export function isStatelessChatPromptText(text: string) {
+  const classification = classifyTaskIntake({ userText: text })
+  return isStatelessGreetingPromptText(text) || isTrivialNoToolPromptText(text) || canSuppressRoutineReview(classification)
 }
 
 export function messageText(message: MessageV2.WithParts | undefined) {
@@ -134,7 +204,12 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
   const lastAssistant = [...messages].reverse().find((message) => message.info.role === "assistant")
   const lastAssistantText = messageText(lastAssistant)
   const allText = recent.map(messageText).join("\n")
+  const userOriginText = recent
+    .filter((message) => message.info.role === "user")
+    .map(messageText)
+    .join("\n")
   const lastUserText = messageText(lastUser)
+  const classification = classifyTaskIntake({ userText: lastUserText })
 
   // 只把真正的方向/需求纠偏计入 requirements-inspector 触发。
   // "再次检查/仔细检查/有问题/失败/报错/Permission denied" 这类复查或运行时问题
@@ -196,9 +271,9 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
   const userCorrections = recent.filter((message) => message.info.role === "user" && correctionPattern.test(messageText(message))).length
   const recentUserCorrection = !!lastUser && correctionPattern.test(lastUserText)
   const finalClaim = finalClaimPattern.test(lastAssistantText)
-  const verificationEvidence = evidencePattern.test(allText)
   const realToolEvidence = verifiedToolEvidence(messages)
-  const reviewerConflictSignal = conflictPattern.test(allText)
+  const verificationEvidence = evidencePattern.test(userOriginText) || realToolEvidence
+  const reviewerConflictSignal = conflictPattern.test(userOriginText)
   const longContextSignal = (() => {
     // 防止审查员名称导致误触发：
     // 当文本以 [dll-agent supervisor auto-trigger] 或 [dll-agent finalization 开头，
@@ -206,20 +281,42 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     // 额外的保护：当 allText 很短（< 200 字符）且无非上下文关键词（排除单独出现 "context"），
     // 不触发，避免指挥官回复"审查员确认了 context..."一行触发无限循环。
     if (contextPercent >= 40) return true
-    if (longContextPattern.test(allText)) {
+    if (longContextPattern.test(userOriginText)) {
       // "context" 单独出现且文本很短 → 很可能是对审查员的引用，不是真正的长上下文任务
-      const isBareContextWord = /^context$/im.test(allText) && allText.length < 500
+      const isBareContextWord = /^context$/im.test(userOriginText) && userOriginText.length < 500
       if (isBareContextWord) return false
       // "长上下文" + "审查员" 同时出现 → 是对审查员的引用
-      if (/长上下文.*审查员/i.test(allText)) return false
+      if (/长上下文.*审查员/i.test(userOriginText)) return false
       return true
     }
     return false
   })()
-  const highRiskTaskSignal = highRiskTaskPattern.test(allText)
-  const multimodalSignal = multimodalPattern.test(allText)
+  const highRiskTaskSignal = classification.task_kind === "high_risk" || highRiskTaskPattern.test(userOriginText)
+  const multimodalSignal = classification.task_kind === "multimodal" || multimodalPattern.test(userOriginText)
+  const statelessGreetingTask =
+    classification.task_kind === "greeting" &&
+    !recentUserCorrection &&
+    userCorrections === 0 &&
+    toolErrors.length === 0 &&
+    ![...repeated.values()].some((count) => count >= 2) &&
+    !finalClaim &&
+    !reviewerConflictSignal &&
+    !longContextSignal &&
+    !highRiskTaskSignal &&
+    !multimodalSignal
   const trivialNoToolTask =
     isTrivialNoToolPromptText(lastUserText) &&
+    !recentUserCorrection &&
+    userCorrections === 0 &&
+    toolErrors.length === 0 &&
+    ![...repeated.values()].some((count) => count >= 2) &&
+    !finalClaim &&
+    !reviewerConflictSignal &&
+    !longContextSignal &&
+    !highRiskTaskSignal &&
+    !multimodalSignal
+  const statelessChatTask =
+    (canSuppressRoutineReview(classification) || statelessGreetingTask || trivialNoToolTask) &&
     !recentUserCorrection &&
     userCorrections === 0 &&
     toolErrors.length === 0 &&
@@ -260,6 +357,9 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     // Phase 8: Multimodal input signal
     multimodalSignal,
     highRiskTaskSignal,
+    statelessGreetingTask,
+    statelessChatTask,
+    taskClassification: classification,
     trivialNoToolTask,
   }
 }

@@ -135,6 +135,8 @@ function triggerMetrics(overrides: Partial<Metrics> = {}): Metrics {
     phaseSwitchSignal: false,
     multimodalSignal: false,
     highRiskTaskSignal: false,
+    statelessGreetingTask: false,
+    statelessChatTask: false,
     trivialNoToolTask: false,
     ...overrides,
   }
@@ -378,6 +380,10 @@ describe("Phase 9 architecture modularization helpers", () => {
       metrics: triggerMetrics({ trivialNoToolTask: true }),
       state: supervisorState({ required_reviews: ["requirements-inspector"] }),
     })).toBe(false)
+    expect(shouldStopAfterTrivialNoToolAnswer({
+      metrics: triggerMetrics({ statelessGreetingTask: true, statelessChatTask: true }),
+      state: supervisorState(),
+    })).toBe(true)
   })
 
   test("drainSupervisorDispatchBatch drains only trailing supervisor subtasks", () => {

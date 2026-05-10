@@ -15,6 +15,7 @@ import {
   type SupervisorState,
 } from "./interfaces"
 import { isContinuationBudgetExhausted } from "./continuation-gate"
+import { canSuppressRoutineReview } from "./task-intake-classifier"
 
 export type SessionRuntimeAction =
   | {
@@ -140,7 +141,13 @@ export function shouldStopAfterTrivialNoToolAnswer(input: {
   state: SupervisorState
   explicitNoToolPrompt?: boolean
 }) {
-  if (!input.metrics.trivialNoToolTask && !input.explicitNoToolPrompt) return false
+  if (
+    !input.metrics.trivialNoToolTask &&
+    !input.metrics.statelessGreetingTask &&
+    !input.metrics.statelessChatTask &&
+    !canSuppressRoutineReview(input.metrics.taskClassification) &&
+    !input.explicitNoToolPrompt
+  ) return false
   if (input.metrics.recentUserCorrection || input.metrics.userCorrections > 0) return false
   if (input.metrics.repeatedToolFailure || input.metrics.toolFailures > 0) return false
   if (input.metrics.permissionDenied > 0) return false

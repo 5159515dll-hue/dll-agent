@@ -28,6 +28,8 @@ function baseMetrics(overrides: Partial<Metrics> = {}): Metrics {
     phaseSwitchSignal: false,
     multimodalSignal: false,
     highRiskTaskSignal: false,
+    statelessGreetingTask: false,
+    statelessChatTask: false,
     trivialNoToolTask: false,
     ...overrides,
   }
@@ -114,9 +116,24 @@ describe("supervisor trigger rules", () => {
     expect(needsAutoVerifier(baseMetrics({ trivialNoToolTask: true, realToolEvidence: false, toolFailures: 0 }))).toBe(false)
   })
 
+  test("stateless greeting suppresses no-value reviewer and verifier triggers", () => {
+    const result = collectReviewers(baseMetrics({
+      statelessGreetingTask: true,
+      statelessChatTask: true,
+    }), [textMessage("你好")])
+    expect(result.reviewers).toEqual([])
+    expect(needsAutoVerifier(baseMetrics({
+      statelessGreetingTask: true,
+      statelessChatTask: true,
+      realToolEvidence: false,
+      toolFailures: 0,
+    }))).toBe(false)
+  })
+
   test("trivial flag cannot suppress correctness-required high-risk state", () => {
     const result = collectReviewers(baseMetrics({
       trivialNoToolTask: true,
+      statelessChatTask: true,
       highRiskTaskSignal: true,
       finalClaim: true,
     }), [textMessage("只回答 OK，不要执行工具。")])

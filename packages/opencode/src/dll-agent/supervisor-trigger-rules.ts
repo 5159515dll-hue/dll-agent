@@ -2,6 +2,7 @@ import type { MessageV2 } from "@/session/message-v2"
 import type { ReviewerRole, RiskLevel } from "./interfaces"
 import type { Metrics } from "./triggers"
 import { hasNonTextInput } from "./routing-policy"
+import { canSuppressRoutineReview } from "./task-intake-classifier"
 
 export interface SupervisorTriggerRuleCallbacks {
   addReviewer: (reviewer: ReviewerRole, reason: string) => void
@@ -18,7 +19,7 @@ export function applySupervisorTriggerRules(input: {
 }, callbacks: SupervisorTriggerRuleCallbacks) {
   const metrics = input.metrics
 
-  if (canSuppressForTrivialNoToolTask(metrics)) return
+  if (canSuppressForStatelessTask(metrics)) return
 
   if (metrics.recentUserCorrection || metrics.userCorrections >= 1) {
     callbacks.addReviewer(
@@ -114,12 +115,17 @@ export function applySupervisorTriggerRules(input: {
 }
 
 export function needsAutoVerifier(metrics: Metrics) {
-  if (canSuppressForTrivialNoToolTask(metrics)) return false
+  if (canSuppressForStatelessTask(metrics)) return false
   return metrics.finalClaim && !metrics.realToolEvidence && metrics.toolFailures === 0
 }
 
-function canSuppressForTrivialNoToolTask(metrics: Metrics) {
-  if (!metrics.trivialNoToolTask) return false
+function canSuppressForStatelessTask(metrics: Metrics) {
+  if (
+    !metrics.trivialNoToolTask &&
+    !metrics.statelessGreetingTask &&
+    !metrics.statelessChatTask &&
+    !canSuppressRoutineReview(metrics.taskClassification)
+  ) return false
   if (metrics.recentUserCorrection || metrics.userCorrections > 0) return false
   if (metrics.repeatedToolFailure || metrics.toolFailures > 0) return false
   if (metrics.permissionDenied > 0) return false

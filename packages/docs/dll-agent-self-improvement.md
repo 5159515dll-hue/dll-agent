@@ -535,6 +535,37 @@ RC 额外边界：
 | Phase 3 Autonomous Recovery Loop | ✅ 本轮实现 | 普通 tool/test/typecheck/config/provider/doctor/gate failure 会被分类、记录 fingerprint/budget、注入 repair/verification hint，并按 repeated failure 升级 chief-engineer / role-cross；secrets/destructive/budget exhaustion 输出 blocked report |
 | Phase 7.2 MCP on-demand runtime | ✅ 本轮实现 | `mcp-runtime.ts` 在 OpenCode `MCP.Service.add()` 前执行 binary/env/port/permission/sensitive-context/mutex/cooldown preflight；连接、失败、healthcheck、stop 写 evidence；stop 封装复用 `stopManagedServer()` 且拒绝停止当前进程；doctor 检查 runtime state 和 stale mutex |
 | Live smoke S1 trivial no-tool false positive | ✅ 本轮修复 | `/role-model-set commander ... --scope session` 后的“只回答 OK，不要执行工具。”识别为 `trivial_no_tool_task`，过滤本地 role-model command 输出，保持 commander-only，不触发 reviewer/verifier/MCP/tool；高风险、纠偏、repeated failure、final evidence 缺失、doctor failed 和 unresolved reviewer 仍不能被抑制 |
+| Live smoke S0 stateless greeting false positive | ✅ 本轮修复并 live_passed | “你好 / hello / hi / 在吗 / 谢谢”等无状态短问候识别为 `stateless_greeting_task`，保持 commander-only，不触发 long-context-archivist、requirements-inspector、chief-engineer、task-completion-archivist、final-auditor、executor auto-verifier、repo-doctor、MCP 或工具；自生成 `<task_result>`、Verification Report、reviewer fallback、subtask resume、Result Ledger、routing evidence、doctor/TUI 文本不再污染 trigger metrics。Live retest session `20260510-120122-08636405` 通过；OpenCode title request 仍按上游行为生成，任务响应为单 commander call |
+| Task Intake Classifier / Interaction Level Gate | ✅ 本轮实现 | 新增 `task-intake-classifier.ts`，按 user-origin input 输出 `task_kind` 与 `L0`-`L4` interaction level。`L0` 问候和 `L1` 普通问答 commander-only；`L2` 只读工程分析不默认 full governance；`L3` 代码/调试/验证接入 Goal Contract/Recovery/Verification；`L4` provider/routing/gate/evidence/permission/secrets/destructive/MCP/doctor failed 等高风险任务保留 reviewer/permission/final/evidence 严格要求 |
+
+### Stateless greeting false-positive guard
+
+`stateless_greeting_task` 只用于真正的短问候/确认消息，例如“你好”“hello”“hi”“在吗”“谢谢”“thanks”“ok”“好的”。它不会降低 correctness-required reviewer：
+
+- 用户纠偏、repeated failure、active blocking plan、continuation required、final claim 缺 evidence、reviewer block 未 reconciliation、doctor failed、高风险 provider/routing/gate/evidence/permission 修改、代码修改、验证请求、错误日志、secrets/permission/destructive 操作仍按原规则触发 reviewer/gate/recovery。
+- repo-doctor 不再仅因 `.git` / `package.json` marker 对 stateless chat 激活；需要工程意图、doctor/test/build/typecheck 请求、运行失败或 recovery signal。
+- false-positive blocked session 的安全清理方案仍是 partial：本轮未新增 `/task-clear-false-block` 命令；建议只在明确 stateless false positive 时清当前 session 的 supervisor blocked state，并保留 evidence/Result Ledger/Goal Contract。
+
+### Task Intake Classifier
+
+`TaskIntakeClassifier` 是 routing 前的稳定入口层。它只读取当前用户原始输入、用户附件 metadata、用户显式命令或用户明确提供的上下文；reviewer 输出、subtask 输出、verification report、doctor report、TUI/status、本地命令输出、Result Ledger summary、routing evidence summary、ContextHandoffPacket rendered text、`<task_result>`、model usage report 和 regression report 只能作为 evidence/trajectory，不能制造 user-origin routing triggers。
+
+Interaction levels:
+
+- `L0`: stateless greeting / no-op chat。Commander-only，0 reviewer，不建复杂 Goal Contract，不验证，不 continuation，不 final-auditor，不工具，不 MCP。
+- `L1`: informational。示例：“介绍一下 dll-agent”“什么是 xxx”“explain xxx”。Commander-only 默认路径，不运行 typecheck/test/doctor，不触发 full governance stack。
+- `L2`: light engineering analysis。只读分析、方案解释、代码结构说明；可读文件，但不自动写文件、不默认触发 full governance。
+- `L3`: coding / debugging / verification。代码修改、错误日志、测试/typecheck/build/doctor，接入 Goal Contract、Recovery Loop、Result Ledger 和 Verification。
+- `L4`: high risk。Provider/RoleModel/routing/gate/evidence/result-ledger/permission/secrets/destructive/push/release/system/global/MCP/doctor failed/high-cost provider。不能被模型分类器降级。
+
+Policy manifests allow local extension without editing source:
+
+- global: `~/.dll-agent/config/task-intake-policy.jsonc`
+- project: `.dll-agent/task-intake-policy.jsonc`
+
+Supported keys: `greetings`, `informational`, `light_engineering_analysis`, `coding`, `debugging`, `verification`, `planning`, `permission`, `multimodal`, `high_risk`.
+
+Model classifier status: `partial_runtime` placeholder only. The deterministic classifier is runtime verified; live model classification is intentionally not called every turn and cannot override L4 safety rules.
 
 ### ❌ 尚未实现
 

@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { metrics, messageText, verifiedToolEvidence } from "../../src/dll-agent/triggers"
+import {
+  isStatelessChatPromptText,
+  isStatelessGreetingPromptText,
+  metrics,
+  messageText,
+  verifiedToolEvidence,
+} from "../../src/dll-agent/triggers"
 import type { MessageV2 } from "../../src/session/message-v2"
 
 function userMsg(text: string): MessageV2.WithParts {
@@ -221,8 +227,8 @@ describe("DllAgentTriggers.metrics self-injection filter (P0)", () => {
     expect(m.reviewerConflictSignal).toBe(false)
   })
 
-  test("real reviewer conflict text still triggers", () => {
-    const m = metrics([asstMsg("两个 reviewer 给出相互矛盾的判断，证据不足。")])
+  test("real user-origin reviewer conflict text still triggers", () => {
+    const m = metrics([userMsg("两个 reviewer 给出相互矛盾的判断，证据不足。")])
     expect(m.reviewerConflictSignal).toBe(true)
   })
 
@@ -269,6 +275,60 @@ describe("DllAgentTriggers.metrics self-injection filter (P0)", () => {
     const m = metrics([userMsg("\"只回答 OK，不要执行工具。\"")])
     expect(m.highRiskTaskSignal).toBe(false)
     expect(m.trivialNoToolTask).toBe(true)
+  })
+
+  test("detects stateless greetings and acknowledgements", () => {
+    for (const text of ["你好", "hello", "hi", "在吗", "谢谢", "thanks", "好的"]) {
+      expect(isStatelessGreetingPromptText(text)).toBe(true)
+      expect(isStatelessChatPromptText(text)).toBe(true)
+      const m = metrics([userMsg(text)])
+      expect(m.statelessGreetingTask).toBe(true)
+      expect(m.statelessChatTask).toBe(true)
+      expect(m.highRiskTaskSignal).toBe(false)
+      expect(m.longContextSignal).toBe(false)
+      expect(m.finalClaim).toBe(false)
+    }
+  })
+
+  test("stateless greeting does not apply to engineering or verification tasks", () => {
+    expect(isStatelessGreetingPromptText("你好，帮我修复 provider routing")).toBe(false)
+    expect(isStatelessGreetingPromptText("hello, run tests")).toBe(false)
+    expect(isStatelessGreetingPromptText("谢谢，检查 packages/opencode/src/foo.ts")).toBe(false)
+  })
+
+  test("ordinary informational request stays L1 without reviewer signals", () => {
+    const m = metrics([userMsg("介绍一下dll-agent")])
+    expect(m.taskClassification?.task_kind).toBe("informational")
+    expect(m.taskClassification?.interaction_level).toBe("L1")
+    expect(m.statelessChatTask).toBe(true)
+    expect(m.highRiskTaskSignal).toBe(false)
+    expect(m.longContextSignal).toBe(false)
+    expect(m.finalClaim).toBe(false)
+  })
+
+  test("assistant generated engineering terms do not turn informational task high-risk", () => {
+    const m = metrics([
+      userMsg("介绍一下dll-agent"),
+      asstMsg("dll-agent 包含 Provider/RoleModel、routing、gate、evidence、Result Ledger 等模块。"),
+    ])
+    expect(m.taskClassification?.task_kind).toBe("informational")
+    expect(m.highRiskTaskSignal).toBe(false)
+    expect(m.longContextSignal).toBe(false)
+    expect(m.finalClaim).toBe(false)
+  })
+
+  test("self-generated task result and verification reports do not pollute routing signals", () => {
+    const m = metrics([
+      userMsg("你好"),
+      asstMsg("<task_result>\nVerification Report\n已完成 provider routing gate evidence result ledger 检查，final-auditor blocked."),
+      asstMsg("reviewer fallback summary\nblocking risk: supervisor auto-trigger false positive"),
+      asstMsg("subtask resume text\n用户说不对，重新检查 provider routing"),
+    ])
+    expect(m.statelessGreetingTask).toBe(true)
+    expect(m.highRiskTaskSignal).toBe(false)
+    expect(m.longContextSignal).toBe(false)
+    expect(m.finalClaim).toBe(false)
+    expect(m.recentUserCorrection).toBe(false)
   })
 })
 

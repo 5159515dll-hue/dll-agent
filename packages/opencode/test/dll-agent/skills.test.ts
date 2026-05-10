@@ -22,11 +22,21 @@ describe("DllAgentSkills.activate", () => {
   test("activates on .ts file matching repo markers", () => {
     const r = activate({
       ...baseInput,
+      userText: "检查一下项目状态",
       files: ["packages/opencode/src/foo.ts"],
       repoMarkers: [".git", "package.json"],
     })
     // Should match at least repo-doctor (repo markers) or ux-review (file glob)
     expect(r.activated.length).toBeGreaterThan(0)
+  })
+
+  test("does not activate repo-doctor for stateless greeting from repo marker alone", () => {
+    const r = activate({
+      ...baseInput,
+      userText: "你好",
+      repoMarkers: [".git", "package.json"],
+    })
+    expect(r.activated.map((a) => a.skill.id)).not.toContain("repo-doctor")
   })
 
   test("MAX_ACTIVE_PER_TURN cap respected", () => {

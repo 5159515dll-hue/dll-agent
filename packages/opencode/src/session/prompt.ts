@@ -49,7 +49,8 @@ import { decide as supervisorDecide, updateState as supervisorUpdateState, loadS
 import { checkEvidenceGate, checkReconciliationGate, finalGate, isGateRetryExhausted, buildGateBlockSummary } from "@/dll-agent/gates"
 import { checkCap as checkCostCap, trackLastCall } from "@/dll-agent/cost-cap"
 import { checkCrossReviewTrigger } from "@/dll-agent/cross-review-bridge"
-import { metrics as computeTriggerMetrics, messageText, isTrivialNoToolPromptText } from "@/dll-agent/triggers"
+import { metrics as computeTriggerMetrics, messageText, isTrivialNoToolPromptText, isStatelessChatPromptText } from "@/dll-agent/triggers"
+import { canSuppressRoutineReview, classifyTaskIntake } from "@/dll-agent/task-intake-classifier"
 import { activate as activateSkills, loadActive as loadActiveSkills, persist as persistSkills } from "@/dll-agent/skills"
 import type { SkillSignal } from "@/dll-agent/skill-registry"
 import { write as evidenceWrite } from "@/dll-agent/evidence"
@@ -1047,7 +1048,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           .map((part) => part.text)
           .join("\n")
           .trim()
-        if (goalText) {
+        const classification = classifyTaskIntake({ userText: goalText })
+        if (goalText && classification.goal_contract_required && !canSuppressRoutineReview(classification)) {
           ensureGoalContract({
             sessionID: input.sessionID,
             userGoal: goalText,
@@ -1663,7 +1665,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const metrics = computeTriggerMetrics(msgs)
             const state = supervisorLoadState(sessionID)
             const lastUserMsg = msgs.find((msg) => msg.info.id === lastUser.id)
-            const explicitNoToolPrompt = isTrivialNoToolPromptText(messageText(lastUserMsg))
+            const promptText = messageText(lastUserMsg)
+            const classification = classifyTaskIntake({ userText: promptText })
+            const explicitNoToolPrompt =
+              isTrivialNoToolPromptText(promptText) ||
+              isStatelessChatPromptText(promptText) ||
+              canSuppressRoutineReview(classification)
             if (shouldStopAfterTrivialNoToolAnswer({ metrics, state, explicitNoToolPrompt })) break
           }
 
@@ -2707,10 +2714,15 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
               const metrics = computeTriggerMetrics(msgs)
               const state = supervisorLoadState(sessionID)
               const lastUserMsg = msgs.find((msg) => msg.info.id === lastUser.id)
-              const explicitNoToolPrompt = isTrivialNoToolPromptText(messageText(lastUserMsg))
+              const promptText = messageText(lastUserMsg)
+              const classification = classifyTaskIntake({ userText: promptText })
+              const explicitNoToolPrompt =
+                isTrivialNoToolPromptText(promptText) ||
+                isStatelessChatPromptText(promptText) ||
+                canSuppressRoutineReview(classification)
               if (shouldStopAfterTrivialNoToolAnswer({ metrics, state, explicitNoToolPrompt })) {
                 evidenceWrite("supervisor.trivial_no_tool_finished", {
-                  reason: "commander finished explicit no-tool answer; no continuation/reviewer/verifier required",
+                  reason: "commander finished stateless/trivial answer; no continuation/reviewer/verifier required",
                   finish: handle.message.finish ?? result,
                 }, sessionID)
                 return "break" as const
@@ -2739,7 +2751,7 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                 const state = supervisorLoadState(sessionID)
                 if (shouldStopAfterTrivialNoToolAnswer({ metrics, state })) {
                   evidenceWrite("supervisor.trivial_no_tool_finished", {
-                    reason: "commander finished explicit no-tool answer; no continuation/reviewer/verifier required",
+                    reason: "commander finished stateless/trivial answer; no continuation/reviewer/verifier required",
                     finish: handle.message.finish,
                   }, sessionID)
                   return "break" as const
@@ -2773,13 +2785,17 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                 const lastAsstText = messageText(lastAsst)
                 const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
                 const currentTaskGoal = lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : ""
+                const classification = classifyTaskIntake({ userText: currentTaskGoal })
                 if (shouldStopAfterTrivialNoToolAnswer({
                   metrics,
                   state,
-                  explicitNoToolPrompt: isTrivialNoToolPromptText(currentTaskGoal),
+                  explicitNoToolPrompt:
+                    isTrivialNoToolPromptText(currentTaskGoal) ||
+                    isStatelessChatPromptText(currentTaskGoal) ||
+                    canSuppressRoutineReview(classification),
                 })) {
                   evidenceWrite("supervisor.trivial_no_tool_finished", {
-                    reason: "commander finished explicit no-tool answer; skip final/continuation gates for stateless answer",
+                    reason: "commander finished stateless/trivial answer; skip final/continuation gates for stateless answer",
                     path: "second-break",
                   }, sessionID)
                   break

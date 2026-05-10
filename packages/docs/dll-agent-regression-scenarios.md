@@ -35,10 +35,41 @@ Expected route:
 
 Regression status: `live_passed`. The live smoke verified session-scope commander switching, no `reasoning_effort=max`, no reviewer/verifier/MCP/tool false positive, and no global/project pollution.
 
+## Live Scenario S0: ordinary greeting
+
+Purpose: verify that a stateless greeting such as "你好" remains a single commander response and is not escalated by supervisor-generated text.
+
+Expected route:
+
+- commander answers the greeting;
+- reviewer count remains zero;
+- no long-context-archivist, requirements-inspector, chief-engineer, task-completion-archivist, final-auditor, executor auto-verifier, MCP, repo-doctor, or tool call is triggered;
+- no Goal Contract required verification is created for the greeting;
+- `model.routing_decision` records `commander_only` with `trigger_reason=stateless_greeting_task`;
+- self-generated `<task_result>`, Verification Report, reviewer fallback, subtask resume, Result Ledger, routing evidence, doctor, and TUI/status text does not feed back into trigger metrics.
+
+Regression status: `live_passed`. The live retest session `20260510-120122-08636405` / OpenCode session `ses_1eff3ef6fffe9Oj9FfmjrWe90h` recorded `commander_only` with `trigger_reason=stateless_greeting_task`, zero reviewer dispatch, zero tool parts, zero MCP requests, no repo-doctor activation, and no continuation/block state. OpenCode still generated its normal title request; the task response itself used a single commander call.
+
+## Regression Scenario S0b: ordinary informational question
+
+Purpose: prevent the follow-up false positive where "介绍一下 dll-agent" was treated as long-context / high-risk governance work after generated reports and reviewer prose entered the routing signal scan.
+
+Expected route:
+
+- `TaskIntakeClassifier` returns `task_kind=informational`, `interaction_level=L1`;
+- route remains commander-only by default;
+- no long-context-archivist, requirements-inspector, chief-engineer, task-completion-archivist, final-auditor, executor auto-verifier, repo-doctor, MCP, or tool call is triggered solely by the informational request;
+- generated assistant text mentioning Provider/RoleModel/routing/gate/evidence/Result Ledger cannot turn the task into high-risk;
+- no typecheck/test/doctor verification is required for the informational answer.
+
+Regression status: `deterministic_passed`. Covered by `task-intake-classifier.test.ts`, `triggers.test.ts`, and `supervisor.test.ts`. Live retest remains recommended before claiming a new live S0b pass.
+
 ## Phase 10.2 Required Live/Manual Status
 
 | Scenario | Status | Evidence |
 |---|---|---|
+| S0 ordinary greeting live scenario | live_passed | "你好" stayed commander-only with no reviewer/verifier/MCP/tool/repo-doctor false positive |
+| S0b ordinary informational question | deterministic_passed | "介绍一下 dll-agent" classifies as L1 informational and stays commander-only in deterministic routing tests |
 | S1 ordinary short no-tool role-model-set live scenario | live_passed | Session-scope commander switch plus "只回答 OK，不要执行工具。" stayed commander-only |
 | A secrets/permission boundary | manual_passed | Fixture permission dry-run blocked/asked for secret paths; no secret value read or printed |
 | B destructive command boundary | manual_passed | Fixture permission dry-run blocked/asked for rm/git push/sudo; no destructive command executed |

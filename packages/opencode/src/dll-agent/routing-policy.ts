@@ -2,6 +2,7 @@ import { resolveRoleModel, type DllRole } from "./role-model-registry"
 import { COOLDOWN_CONFIG, type ReviewerRole, type RiskLevel } from "./interfaces"
 import type { Metrics } from "./triggers"
 import type { MessageV2 } from "@/session/message-v2"
+import { canSuppressRoutineReview } from "./task-intake-classifier"
 
 const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "deepseek/deepseek-v4-pro": 1_048_576,
@@ -25,7 +26,7 @@ export function modelContextLimit(providerID?: string, modelID?: string): number
 }
 
 export function assessRisk(metrics: Metrics): RiskLevel {
-  if (isSuppressibleTrivialNoToolTask(metrics)) return "low"
+  if (isSuppressibleStatelessTask(metrics)) return "low"
   let score = 0
 
   if (metrics.toolFailures >= 3) score += 3
@@ -112,7 +113,7 @@ export function reviewerModelCandidates(reviewer: ReviewerRole, sessionID: strin
 }
 
 export function maxReviewersForRouting(risk: RiskLevel, metrics: Metrics) {
-  if (isSuppressibleTrivialNoToolTask(metrics)) return 0
+  if (isSuppressibleStatelessTask(metrics)) return 0
   if (
     risk === "high" ||
     metrics.reviewerConflictSignal ||
@@ -129,7 +130,7 @@ export function reviewerRequiredForCorrectness(
   risk: RiskLevel,
   metrics: Metrics,
 ) {
-  if (isSuppressibleTrivialNoToolTask(metrics)) return false
+  if (isSuppressibleStatelessTask(metrics)) return false
   if (risk === "high") return true
   if (reviewer === "requirements-inspector" && (metrics.recentUserCorrection || metrics.userCorrections > 0 || metrics.scopeExpandedSignal || metrics.glmCompletionClaimSignal)) return true
   if (reviewer === "chief-engineer" && (metrics.repeatedToolFailure || metrics.toolFailures >= 3 || metrics.permissionDenied > 0)) return true
@@ -140,8 +141,13 @@ export function reviewerRequiredForCorrectness(
   return false
 }
 
-function isSuppressibleTrivialNoToolTask(metrics: Metrics) {
-  if (!metrics.trivialNoToolTask) return false
+function isSuppressibleStatelessTask(metrics: Metrics) {
+  if (
+    !metrics.trivialNoToolTask &&
+    !metrics.statelessGreetingTask &&
+    !metrics.statelessChatTask &&
+    !canSuppressRoutineReview(metrics.taskClassification)
+  ) return false
   if (metrics.recentUserCorrection || metrics.userCorrections > 0) return false
   if (metrics.repeatedToolFailure || metrics.toolFailures > 0) return false
   if (metrics.permissionDenied > 0) return false

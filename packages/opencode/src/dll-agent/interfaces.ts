@@ -179,6 +179,13 @@ export interface SupervisorMetricsSnapshot {
   high_risk_task_signal?: boolean
   /** Live smoke P0: short explicit no-tool answer task */
   trivial_no_tool_task?: boolean
+  /** Live smoke P0: stateless greeting such as "你好" */
+  stateless_greeting_task?: boolean
+  /** Live smoke P0: stateless short chat that should not trigger reviewers */
+  stateless_chat_task?: boolean
+  /** Task intake classifier output summary */
+  task_kind?: string
+  interaction_level?: "L0" | "L1" | "L2" | "L3" | "L4"
 }
 
 // ─── Trigger 决策 ───────────────────────────────────────────────────────────
