@@ -57,9 +57,10 @@ Implemented runtime rules:
   - `L3`: coding / debugging / verification. Uses Goal Contract, Recovery Loop, Result Ledger, and required verification.
   - `L4`: high risk. Provider/routing/gate/evidence/permission, secrets/auth, destructive commands, push/release, system/global mutation, large refactors, MCP runtime, doctor failed, or high-cost provider work. Reviewer and strict permission/final/evidence gates are required and cannot be downgraded by model classification.
 - Intent judgement is category-based, not phrase-based:
-  - deterministic intake first checks intent category, subject type, requested side effects, verification needs, and hard safety signals;
-  - if deterministic confidence is low, the runtime plan is `single_model_judge` using the primary non-OpenAI commander model;
-  - if that single-model judgement is still low confidence, the plan escalates to `multi_model_consensus` across all distinct configured `/role-model-set` effective models except OpenAI, TTS, VoiceClone, and speech/audio models;
+  - deterministic intake first checks structural signals, requested side effects, verification needs, and hard safety signals;
+  - if deterministic confidence is low, live runtime runs `single_model_judge` before commander execution, using the primary non-OpenAI commander model;
+  - if that single-model judgement is still low confidence or cannot be parsed, live runtime escalates to `multi_model_consensus` across all distinct configured `/role-model-set` effective models except OpenAI, TTS, VoiceClone, and speech/audio models;
+  - the intent result is stored in supervisor state and written as `intent.judgement` evidence, then supervisor routing consumes that classification instead of rescanning natural-language phrases;
   - L4 hard safety rules always win before model judgement and cannot be downgraded by consensus.
 - `read_only_answer` finalization applies to user-origin read-only engineering analysis/explanation categories, not to exact sentences. It suppresses task-completion-archivist, final-auditor, and executor auto-verifier only when there is no mutation request, no verification request, no failure, no correction, no reviewer block, no doctor failure, no multimodal input, and no high-risk signal.
 - User-origin-only source filtering is mandatory. `/role-model-set`, `/role-models`, `/task-status`, TUI/status text, doctor reports, verification reports, reviewer outputs, fallback reviewer summaries, Result Ledger summaries, routing evidence summaries, rendered ContextHandoffPacket text, `<task_result>`, subtask resume text, model usage reports, and regression reports may be recorded as evidence/trajectory, but they cannot create user-origin routing triggers.
@@ -161,7 +162,7 @@ Implemented_runtime_verified:
 Partial_runtime:
 
 - routing still depends on existing supervisor message stream rather than a dedicated tool-event bus;
-- model-based ambiguous classifier is a placeholder only; deterministic classification is implemented, but no live model classifier is called;
+- live model-based ambiguous classifier is connected before commander execution: single non-OpenAI model first, then multi-model consensus only for low-confidence cases;
 - `trigger_multiple_reviewers` is represented by per-reviewer dispatch evidence plus high-risk supervisor metrics, not a separate central dispatch packet.
 
 Missing:

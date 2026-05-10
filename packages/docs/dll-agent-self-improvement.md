@@ -580,9 +580,9 @@ Policy manifests allow local extension without editing source:
 
 Supported keys: `greetings`, `informational`, `light_engineering_analysis`, `coding`, `debugging`, `verification`, `planning`, `permission`, `multimodal`, `high_risk`.
 
-Model classifier status: `partial_runtime` placeholder only. The deterministic classifier is runtime verified; live model classification is intentionally not called every turn and cannot override L4 safety rules.
+Model classifier status: `implemented_runtime_verified` for low-confidence live intake. The deterministic classifier still runs first; live model classification is called only when deterministic intake is low confidence or ambiguous, and it cannot override L4 safety rules.
 
-Intent judgement status: `implemented_deterministic_verified` for planning/participant selection. The runtime now has a single-model-first, low-confidence multi-model-consensus plan, but live model judgement dispatch remains intentionally gated so ordinary high-confidence L0/L1/L2 requests do not create extra model calls. Consensus participants are all distinct effective `/role-model-set` models except OpenAI and voice/audio providers.
+Intent judgement status: `implemented_runtime_verified`. Before commander execution, ambiguous user-origin input runs a single-model intent judge using the effective commander model; if that judgement is low confidence or unparsable, runtime escalates to all distinct effective `/role-model-set` models except OpenAI and voice/audio providers. The resulting classification is persisted in supervisor state, written to `intent.judgement` evidence, and consumed by supervisor routing.
 
 ## Autonomous Capability Acquisition Phase A / B1 / B2 / C / D1 / D2
 

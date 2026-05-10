@@ -189,7 +189,11 @@ function isPermissionOrSecretFailure(text: string) {
   return /permission denied|not allowed|could not request permission|denied|secret|token|cookie|ssh key|\.env|credential/i.test(text)
 }
 
-export function metrics(messages: MessageV2.WithParts[], contextLimit?: number): Metrics {
+export function metrics(
+  messages: MessageV2.WithParts[],
+  contextLimit?: number,
+  options: { taskClassification?: TaskIntakeClassification } = {},
+): Metrics {
   const recent = messages.slice(-12)
   const lastUser = [...messages].reverse().find((message) => message.info.role === "user")
   const lastAssistant = [...messages].reverse().find((message) => message.info.role === "assistant")
@@ -199,7 +203,7 @@ export function metrics(messages: MessageV2.WithParts[], contextLimit?: number):
     .map(messageText)
     .join("\n")
   const lastUserText = messageText(lastUser)
-  const classification = classifyTaskIntake({ userText: lastUserText })
+  const classification = options.taskClassification ?? classifyTaskIntake({ userText: lastUserText })
 
   // User intent is no longer inferred from hard-coded natural-language phrases.
   // Language-level intent should come from TaskIntake policy/model judgement.

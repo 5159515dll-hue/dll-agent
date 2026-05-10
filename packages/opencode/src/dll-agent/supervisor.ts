@@ -301,8 +301,13 @@ export function decide(
   contextLimit?: number,
   availableAgents?: string[],
 ): TriggerDecision {
-  const rawMetrics = computeMetrics(messages, contextLimit)
   const initialState = loadState(sessionID)
+  const latestUser = [...messages].reverse().find((message) => message.info.role === "user")
+  const intentJudgement = initialState.intent_judgement
+  const intentClassification = intentJudgement && intentJudgement.message_id === latestUser?.info.id
+    ? intentJudgement.classification
+    : undefined
+  const rawMetrics = computeMetrics(messages, contextLimit, { taskClassification: intentClassification })
   const hasUnresolvedSupervisorState = Boolean(
     initialState.blocked_completion ||
       initialState.reviewer_conflict ||

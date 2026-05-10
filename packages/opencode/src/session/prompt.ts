@@ -93,6 +93,16 @@ import {
   shouldStopAfterTrivialNoToolAnswer,
   type SessionRuntimeAction,
 } from "@/dll-agent/session-runtime-adapter"
+import {
+  buildIntentJudgePrompt,
+  buildIntentJudgementPlan,
+  classificationFromIntentJudgement,
+  mergeIntentJudgements,
+  parseModelIntentJudgement,
+  type IntentConsensusParticipant,
+  type ModelIntentJudgement,
+} from "@/dll-agent/intent-consensus"
+import { hasNonTextInput as hasRoutingNonTextInput } from "@/dll-agent/routing-policy"
 import { drainSupervisorDispatchBatch, planReviewerDispatchGroups } from "@/dll-agent/reviewer-dispatch"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
@@ -1497,6 +1507,150 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info, parts }
     }, Effect.scoped)
 
+    const runIntentPreflight = Effect.fn("SessionPrompt.runIntentPreflight")(function* (input: {
+      sessionID: SessionID
+      messages: MessageV2.WithParts[]
+      lastUser: MessageV2.User
+      session: Session.Info
+    }) {
+      if (!profileEnabled()) return
+      if (input.session.parentID) return
+      if (input.lastUser.agent !== "commander") return
+      const userMessage = input.messages.find((message) => message.info.id === input.lastUser.id)
+      if (!userMessage) return
+      const state = supervisorLoadState(input.sessionID)
+      if (state.intent_judgement?.message_id === input.lastUser.id) return
+      const runtimeCtx = yield* InstanceState.context
+      const userText = messageText(userMessage).trim()
+      const deterministic = classifyTaskIntake({
+        userText,
+        hasNonTextInput: hasRoutingNonTextInput(input.messages),
+        projectDir: runtimeCtx.worktree,
+      })
+      const plan = buildIntentJudgementPlan({
+        classification: deterministic,
+        sessionID: input.sessionID,
+        projectDir: runtimeCtx.worktree,
+      })
+
+      const saveRecord = (record: NonNullable<typeof state.intent_judgement>) => {
+        const next = supervisorLoadState(input.sessionID)
+        next.intent_judgement = record
+        next.updated_at = new Date().toISOString()
+        supervisorSaveState(input.sessionID, next)
+        evidenceWrite("intent.judgement", {
+          message_id: record.message_id,
+          source: record.source,
+          plan_action: record.plan_action,
+          model: record.model ?? null,
+          participants: record.participants,
+          excluded_models: record.excluded_models,
+          classification: {
+            task_kind: record.classification.task_kind,
+            interaction_level: record.classification.interaction_level,
+            confidence: record.classification.confidence,
+            finalization_policy: record.classification.finalization_policy,
+            tool_required: record.classification.tool_required,
+            reviewer_required: record.classification.reviewer_required,
+            verification_required: record.classification.verification_required,
+          },
+          reason: record.reason,
+        }, input.sessionID)
+      }
+
+      if (plan.action === "deterministic_accept" || plan.action === "hard_safety" || !plan.primary) {
+        saveRecord({
+          message_id: input.lastUser.id,
+          source: plan.action === "hard_safety" ? "hard_safety" : "deterministic",
+          plan_action: plan.action,
+          participants: plan.consensus?.participants.map((p) => p.model) ?? [],
+          excluded_models: plan.consensus?.excluded ?? [],
+          classification: deterministic,
+          raw_confidence: deterministic.confidence,
+          reason: plan.reason,
+          created_at: new Date().toISOString(),
+        })
+        return
+      }
+
+      const judgeWithModel = Effect.fn("SessionPrompt.intentJudgeWithModel")(function* (
+        participant: IntentConsensusParticipant,
+      ) {
+        const model = yield* getModel(ProviderID.make(participant.providerID), ModelID.make(participant.modelID), input.sessionID)
+        const agent = (yield* agents.get("commander")) ?? (yield* agents.get(input.lastUser.agent))
+        if (!agent) return { participant, raw: "" }
+        const raw = yield* llm
+          .stream({
+            agent,
+            user: input.lastUser,
+            system: [],
+            small: true,
+            tools: {},
+            model,
+            sessionID: input.sessionID,
+            retries: 1,
+            messages: [{
+              role: "user" as const,
+              content: buildIntentJudgePrompt({ userText, deterministic }),
+            }],
+          })
+          .pipe(
+            Stream.filter((event): event is Extract<LLM.Event, { type: "text-delta" }> => event.type === "text-delta"),
+            Stream.map((event) => event.text),
+            Stream.mkString,
+            Effect.catch(() => Effect.succeed("")),
+          )
+        return { participant, judgement: parseModelIntentJudgement(raw), raw }
+      })
+
+      const first = yield* judgeWithModel(plan.primary)
+      if (first.judgement && first.judgement.confidence !== "low") {
+        saveRecord({
+          message_id: input.lastUser.id,
+          source: "single_model",
+          plan_action: plan.action,
+          model: first.participant.model,
+          participants: [first.participant.model],
+          excluded_models: plan.consensus?.excluded ?? [],
+          classification: classificationFromIntentJudgement({
+            deterministic,
+            judgement: first.judgement,
+            source: "single_model",
+          }),
+          raw_confidence: first.judgement.confidence,
+          reason: first.judgement.reason,
+          created_at: new Date().toISOString(),
+        })
+        return
+      }
+
+      const participants = plan.consensus?.participants.length ? plan.consensus.participants : [plan.primary]
+      const all = yield* Effect.forEach(
+        participants,
+        (participant) => judgeWithModel(participant),
+        { concurrency: "unbounded" },
+      )
+      const judgements = all.map((item) => item.judgement).filter((item): item is ModelIntentJudgement => Boolean(item))
+      const merged = mergeIntentJudgements({ deterministic, judgements }) ?? first.judgement
+      const classification = classificationFromIntentJudgement({
+        deterministic,
+        judgement: merged,
+        source: "multi_model_consensus",
+      })
+      saveRecord({
+        message_id: input.lastUser.id,
+        source: "multi_model_consensus",
+        plan_action: "multi_model_consensus",
+        model: first.participant.model,
+        participants: all.map((item) => item.participant.model),
+        excluded_models: plan.consensus?.excluded ?? [],
+        classification,
+        raw_confidence: merged?.confidence ?? "low",
+        reason: merged?.reason ?? "intent model outputs could not be parsed; deterministic classification retained",
+        created_at: new Date().toISOString(),
+      })
+    })
+
     const roleModelCommandResponse = Effect.fn("SessionPrompt.roleModelCommandResponse")(function* (
       input: CommandInput,
       text: string,
@@ -1725,6 +1879,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
             }
           })
+
+          if (profileEnabled() && !session.parentID && lastUser.agent === "commander") {
+            try {
+              const alreadyAnswered = msgs.some((message) =>
+                message.info.role === "assistant" && message.info.parentID === lastUser.id
+              )
+              if (!alreadyAnswered) {
+                yield* runIntentPreflight({ sessionID, messages: msgs, lastUser, session })
+              }
+            } catch (intentErr) {
+              yield* slog.error("intent preflight error", { error: String(intentErr) })
+              evidenceWrite("intent.judgement_failed", {
+                message_id: lastUser.id,
+                error: String(intentErr),
+              }, sessionID)
+            }
+          }
 
           // ─── dll-agent supervisor integration ─────────────────────────────
           if (profileEnabled() && !session.parentID && lastUser.agent === "commander") {

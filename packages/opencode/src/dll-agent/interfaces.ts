@@ -9,6 +9,7 @@
  */
 
 import type { MessageV2 } from "@/session/message-v2"
+import type { IntentJudgementRecord } from "./intent-consensus"
 
 // ─── 基础枚举 ────────────────────────────────────────────────────────────────
 
@@ -146,6 +147,8 @@ export interface SupervisorState {
   /** Autonomous recovery budget tracking */
   recovery_phase_counts?: Record<string, number>
   recovery_total_count?: number
+  /** Latest user-origin semantic intent judgement, produced before commander execution. */
+  intent_judgement?: IntentJudgementRecord
   /** Session-level role model overrides: role name → { primary, fallback, enabled } */
   role_model_overrides?: Record<string, { primary: string; fallback?: string[]; enabled?: boolean }>
   /** 最后更新时间 */

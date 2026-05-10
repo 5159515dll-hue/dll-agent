@@ -817,6 +817,48 @@ describe("DllAgentSupervisor Correctness-Aware Model Routing Policy", () => {
     expect(commanderOnly?.payload.trigger_reason).toBe("trivial_no_tool_task")
   })
 
+  test("supervisor consumes live intent preflight classification for the latest user message", () => {
+    const sid = sessionID("intent_preflight")
+    const user = userMsg("msg_user_intent_preflight", "ambiguous natural-language request")
+    const state = loadState(sid)
+    state.intent_judgement = {
+      message_id: user.info.id,
+      source: "single_model",
+      plan_action: "single_model_judge",
+      model: "deepseek/deepseek-v4-pro",
+      participants: ["deepseek/deepseek-v4-pro"],
+      excluded_models: [],
+      raw_confidence: "high",
+      reason: "single model classified this as read-only engineering analysis",
+      created_at: new Date().toISOString(),
+      classification: {
+        task_kind: "light_engineering_analysis",
+        interaction_level: "L2",
+        user_origin_only: true,
+        tool_required: true,
+        reviewer_required: false,
+        verification_required: false,
+        goal_contract_required: false,
+        repo_doctor_allowed: true,
+        continuation_allowed: false,
+        final_gate_required: false,
+        model_classifier_needed: false,
+        finalization_policy: "read_only_answer",
+        confidence: "high",
+        reason: "single_model: read-only engineering analysis",
+        matched_rules: ["single_model:semantic_intent_judgement"],
+        safety_overrides: [],
+      },
+    }
+    saveState(sid, state)
+    const decision = decide([user], sid, 1)
+    expect(decision.metrics.interaction_level).toBe("L2")
+    expect(decision.metrics.task_kind).toBe("light_engineering_analysis")
+    expect(decision.metrics.read_only_answer_task).toBe(true)
+    expect(decision.reviewers).toEqual([])
+    expect(decision.verifierTask).toBeUndefined()
+  })
+
   test("trivial no-tool prompt does not hide unresolved supervisor state", () => {
     const sid = sessionID("routing_trivial_blocked_state")
     const state = loadState(sid)

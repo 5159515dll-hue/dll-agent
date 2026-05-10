@@ -56,13 +56,13 @@ Purpose: prevent the follow-up false positive where "介绍一下 dll-agent" was
 
 Expected route:
 
-- `TaskIntakeClassifier` returns `task_kind=informational`, `interaction_level=L1`;
+- `TaskIntakeClassifier` either returns a high-confidence structural/policy category or marks the request for live intent judgement; low-confidence natural-language input is judged by the effective commander model before commander execution;
 - route remains commander-only by default;
 - no long-context-archivist, requirements-inspector, chief-engineer, task-completion-archivist, final-auditor, executor auto-verifier, repo-doctor, MCP, or tool call is triggered solely by the informational request;
 - generated assistant text mentioning Provider/RoleModel/routing/gate/evidence/Result Ledger cannot turn the task into high-risk;
 - no typecheck/test/doctor verification is required for the informational answer.
 
-Regression status: `deterministic_passed`. Covered by `task-intake-classifier.test.ts`, `triggers.test.ts`, and `supervisor.test.ts`. Live retest remains recommended before claiming a new live S0b pass.
+Regression status: `runtime_verified`. Covered by `task-intake-classifier.test.ts`, `intent-consensus.test.ts`, `triggers.test.ts`, and `supervisor.test.ts`. Live retest remains recommended before claiming a new live S0b pass for a specific provider/model.
 
 ### S0c Read-only Engineering Explanation
 
@@ -70,12 +70,12 @@ Purpose: prevent read-only engineering explanations from being treated as verifi
 
 Expected route:
 
-- intent is classified by category: explanation/summary intent + engineering subject + no mutation/verification command;
+- intent is classified by category through structural rules first, then live single-model judgement for low-confidence natural language, with multi-model consensus only if the first judgement is low confidence;
 - route remains commander-only after the answer;
 - generated answer text cannot trigger task-completion-archivist, final-auditor, requirements-inspector, chief-engineer, cross-review, or executor auto-verifier by itself;
 - real correction, repeated failure, doctor failed, reviewer block, high-risk work, code mutation, explicit verification, secrets, destructive operations, or multimodal input still override the read-only finalization path.
 
-Regression status: `deterministic_passed`. Covered by category-combination tests, trigger metrics tests, supervisor routing tests, and intent-consensus participant tests.
+Regression status: `runtime_verified`. Covered by intent preflight parsing/consensus tests, trigger metrics tests, supervisor routing tests, and supervisor-state consumption tests.
 
 ## Phase 10.2 Required Live/Manual Status
 

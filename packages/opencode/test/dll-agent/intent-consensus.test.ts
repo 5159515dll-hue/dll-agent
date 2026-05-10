@@ -3,6 +3,9 @@ import {
   buildIntentJudgementPlan,
   buildIntentConsensusPlan,
   collectIntentConsensusParticipants,
+  classificationFromIntentJudgement,
+  mergeIntentJudgements,
+  parseModelIntentJudgement,
 } from "../../src/dll-agent/intent-consensus"
 import { classifyTaskIntake } from "../../src/dll-agent/task-intake-classifier"
 import type { EffectiveRoleModel } from "../../src/dll-agent/role-model-registry"
@@ -100,5 +103,114 @@ describe("intent consensus participant selection", () => {
       "kimi/kimi-k2.6",
       "zai/glm-5.1",
     ])
+  })
+
+  test("parses model intent judgement and converts it into runtime classification", () => {
+    const deterministic = classifyTaskIntake({ userText: "ambiguous request without structural signals" })
+    const parsed = parseModelIntentJudgement(JSON.stringify({
+      task_kind: "light_engineering_analysis",
+      interaction_level: "L2",
+      confidence: "high",
+      tool_required: true,
+      reviewer_required: false,
+      verification_required: false,
+      goal_contract_required: false,
+      repo_doctor_allowed: true,
+      continuation_allowed: false,
+      final_gate_required: false,
+      finalization_policy: "read_only_answer",
+      reason: "read-only project analysis",
+      missing_information: [],
+    }))
+    expect(parsed?.task_kind).toBe("light_engineering_analysis")
+    const classification = classificationFromIntentJudgement({
+      deterministic,
+      judgement: parsed,
+      source: "single_model",
+    })
+    expect(classification.interaction_level).toBe("L2")
+    expect(classification.finalization_policy).toBe("read_only_answer")
+    expect(classification.model_classifier_needed).toBe(false)
+  })
+
+  test("multi-model consensus chooses the majority intent without using OpenAI", () => {
+    const deterministic = classifyTaskIntake({ userText: "ambiguous request without structural signals" })
+    const merged = mergeIntentJudgements({
+      deterministic,
+      judgements: [
+        {
+          task_kind: "light_engineering_analysis",
+          interaction_level: "L2",
+          confidence: "medium",
+          tool_required: true,
+          reviewer_required: false,
+          verification_required: false,
+          goal_contract_required: false,
+          repo_doctor_allowed: true,
+          continuation_allowed: false,
+          final_gate_required: false,
+          finalization_policy: "read_only_answer",
+          reason: "read-only analysis",
+          missing_information: [],
+        },
+        {
+          task_kind: "light_engineering_analysis",
+          interaction_level: "L2",
+          confidence: "high",
+          tool_required: true,
+          reviewer_required: false,
+          verification_required: false,
+          goal_contract_required: false,
+          repo_doctor_allowed: true,
+          continuation_allowed: false,
+          final_gate_required: false,
+          finalization_policy: "read_only_answer",
+          reason: "read-only analysis confirmed",
+          missing_information: [],
+        },
+        {
+          task_kind: "coding",
+          interaction_level: "L3",
+          confidence: "medium",
+          tool_required: true,
+          reviewer_required: false,
+          verification_required: true,
+          goal_contract_required: true,
+          repo_doctor_allowed: true,
+          continuation_allowed: true,
+          final_gate_required: true,
+          finalization_policy: "engineering_verification",
+          reason: "minority engineering execution vote",
+          missing_information: [],
+        },
+      ],
+    })
+    expect(merged?.task_kind).toBe("light_engineering_analysis")
+    expect(merged?.confidence).toBe("high")
+  })
+
+  test("model judgement cannot downgrade deterministic L4 hard safety", () => {
+    const deterministic = classifyTaskIntake({ userText: "sudo rm -rf /tmp/dll-agent-test" })
+    const classification = classificationFromIntentJudgement({
+      deterministic,
+      judgement: {
+        task_kind: "informational",
+        interaction_level: "L1",
+        confidence: "high",
+        tool_required: false,
+        reviewer_required: false,
+        verification_required: false,
+        goal_contract_required: false,
+        repo_doctor_allowed: false,
+        continuation_allowed: false,
+        final_gate_required: false,
+        finalization_policy: "informational_answer",
+        reason: "unsafe downgrade attempt",
+        missing_information: [],
+      },
+      source: "single_model",
+    })
+    expect(classification.interaction_level).toBe("L4")
+    expect(classification.reviewer_required).toBe(true)
   })
 })
