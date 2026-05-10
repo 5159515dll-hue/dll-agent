@@ -567,9 +567,9 @@ Supported keys: `greetings`, `informational`, `light_engineering_analysis`, `cod
 
 Model classifier status: `partial_runtime` placeholder only. The deterministic classifier is runtime verified; live model classification is intentionally not called every turn and cannot override L4 safety rules.
 
-## Autonomous Capability Acquisition Phase A
+## Autonomous Capability Acquisition Phase A / B1
 
-Status: `implemented_runtime_verified` for design/schema/risk-classifier/doctor skeleton. This phase does not download, install, execute, start MCP, or call a live final-auditor model.
+Status: `implemented_runtime_verified` for Phase A design/schema/risk-classifier/doctor skeleton and Phase B1 local fixture quarantine/sandbox/rollback substrate. These phases do not download external software, install real packages, execute unknown binaries, start MCP, activate capabilities, or call a live final-auditor model.
 
 | Capability | Status | Notes |
 |---|---|---|
@@ -577,9 +577,12 @@ Status: `implemented_runtime_verified` for design/schema/risk-classifier/doctor 
 | acquisition manifest schema | implemented_runtime_verified | `capability-acquisition.ts` validates source, risk, permissions, activation, commands, smoke tests, and rollback |
 | final-auditor packet shape | implemented_config_verified | `buildCapabilityAuditPacket()` produces structured audit input; live final-auditor integration is later-phase |
 | acquisition evidence hooks | implemented_runtime_verified | `capability.*` evidence types use shared redaction path |
-| doctor acquisition checks | implemented_runtime_verified | doctor reports acquisition store/directories/manifests without mutating files |
-| quarantine/sandbox/rollback execution | partial_runtime | schema and validation exist; runtime install/smoke/rollback execution belongs to later phases |
-| commands/UX | missing | `/capability-install` and related commands are not wired in Phase A |
+| doctor acquisition checks | implemented_runtime_verified | doctor reports acquisition store/directories/manifests/quarantine/sandbox/global-install guard without mutating files |
+| quarantine store | implemented_runtime_verified | `capability-quarantine.ts` supports fixture candidate create/read/risk/audit/reject/delete under quarantine root |
+| fixture sandbox runtime | implemented_runtime_verified | `capability-sandbox.ts` copies local fixture files and runs non-executing required-file smoke checks only |
+| fixture rollback | implemented_runtime_verified | `capability-rollback.ts` requires dry-run and deletes only managed fixture quarantine/sandbox paths |
+| real download/install/start | missing | No external download, real package install, MCP start, Playwright start, or capability activation in Phase B1 |
+| commands/UX | missing | `/capability-install` and related commands are not wired in Phase B1 |
 
 Safety boundary: R2+ requires rollback before activation; R3 requires user authorization; R4 (`curl | sh`, `sudo`, global install, secrets, destructive delete, git push/release/upload, real browser profile, unknown binary) is hard-blocked by deterministic policy and cannot be auto-approved by final-auditor.
 

@@ -141,6 +141,7 @@ export function capabilityAcquisitionPaths(root = capabilityAcquisitionRoot()) {
   return {
     root,
     quarantine: path.join(root, "quarantine"),
+    sandbox: path.join(root, "sandbox"),
     installed: path.join(root, "installed"),
     disabled: path.join(root, "disabled"),
     cache: path.join(root, "cache"),
@@ -238,6 +239,14 @@ export function writeCapabilityEvidence(type: string, payload: unknown, sessionI
   writeEvidence(type, payload, sessionID)
 }
 
+export function parseCapabilityJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return JSON.parse(raw.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "").replace(/,(?=\s*[}\]])/g, ""))
+  }
+}
+
 export function buildCapabilityAuditPacket(input: {
   candidate: CapabilityDiscoveryCandidate | CapabilityAcquisitionRecord | CapabilityInstallManifest
   riskAssessment: CapabilityRiskAssessment
@@ -306,7 +315,7 @@ export function doctorCheckCapabilityAcquisition(root = capabilityAcquisitionRoo
   for (const file of manifestFiles) {
     try {
       const raw = fs.readFileSync(path.join(paths.manifests, file), "utf8")
-      const parsed = JSON.parse(raw.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "").replace(/,(?=\s*[}\]])/g, ""))
+      const parsed = parseCapabilityJson(raw)
       if (!validateCapabilityInstallManifest(parsed).valid) invalid++
     } catch {
       invalid++
@@ -320,6 +329,112 @@ export function doctorCheckCapabilityAcquisition(root = capabilityAcquisitionRoo
       : `${invalid}/${manifestFiles.length} capability acquisition manifest(s) are invalid`,
     nextAction: invalid === 0 ? null : "Fix invalid capability manifests before enabling autonomous acquisition",
     evidence: `manifests=${manifestFiles.length}, invalid=${invalid}`,
+  })
+
+  const quarantineDirs = fs.existsSync(paths.quarantine)
+    ? fs.readdirSync(paths.quarantine, { withFileTypes: true }).filter((item) => item.isDirectory())
+    : []
+  let orphanQuarantine = 0
+  let checksumMismatch = 0
+  let quarantineSecretsRisk = 0
+  for (const dir of quarantineDirs) {
+    const recordPath = path.join(paths.quarantine, dir.name, "quarantine.json")
+    if (!fs.existsSync(recordPath)) {
+      orphanQuarantine++
+      continue
+    }
+    try {
+      const raw = fs.readFileSync(recordPath, "utf8")
+      if (/(sk-[A-Za-z0-9_-]{12,}|github_pat_|ghp_|Bearer\s+[A-Za-z0-9._-]+|PRIVATE KEY|password\s*[:=]|cookie\s*[:=])/i.test(raw)) {
+        quarantineSecretsRisk++
+      }
+      const parsed = parseCapabilityJson(raw)
+      if (
+        isRecord(parsed) &&
+        typeof parsed.manifest_checksum === "string" &&
+        isRecord(parsed.manifest) &&
+        typeof parsed.manifest_json === "string" &&
+        parsed.manifest_checksum !== parsed.manifest_json
+      ) {
+        checksumMismatch++
+      }
+    } catch {
+      orphanQuarantine++
+    }
+  }
+  checks.push({
+    name: "capability-quarantine",
+    severity: orphanQuarantine === 0 && checksumMismatch === 0 && quarantineSecretsRisk === 0 ? "PASS" : "WARN",
+    message: orphanQuarantine === 0 && checksumMismatch === 0 && quarantineSecretsRisk === 0
+      ? `Quarantine candidates readable (${quarantineDirs.length})`
+      : `Quarantine issues: orphan=${orphanQuarantine}, checksum_mismatch=${checksumMismatch}, secrets_risk=${quarantineSecretsRisk}`,
+    nextAction: orphanQuarantine === 0 && checksumMismatch === 0 && quarantineSecretsRisk === 0
+      ? null
+      : "Inspect quarantine candidates before sandboxing or activation",
+    evidence: `quarantine=${quarantineDirs.length}`,
+  })
+
+  const sandboxDirs = fs.existsSync(paths.sandbox)
+    ? fs.readdirSync(paths.sandbox, { withFileTypes: true }).filter((item) => item.isDirectory())
+    : []
+  let failedSandbox = 0
+  let staleSandbox = 0
+  let missingRollback = 0
+  const staleBefore = Date.now() - 7 * 24 * 60 * 60 * 1000
+  for (const dir of sandboxDirs) {
+    const sandboxPath = path.join(paths.sandbox, dir.name)
+    const statePath = path.join(sandboxPath, "sandbox-state.json")
+    const rollbackPath = path.join(sandboxPath, "rollback-plan.json")
+    const stat = fs.statSync(sandboxPath)
+    if (stat.mtimeMs < staleBefore) staleSandbox++
+    if (!fs.existsSync(statePath)) continue
+    try {
+      const state = parseCapabilityJson(fs.readFileSync(statePath, "utf8"))
+      if (isRecord(state) && state.status === "failed") failedSandbox++
+      if (isRecord(state) && state.status === "passed" && !fs.existsSync(rollbackPath)) missingRollback++
+    } catch {
+      failedSandbox++
+    }
+  }
+  checks.push({
+    name: "capability-sandbox",
+    severity: failedSandbox === 0 && staleSandbox === 0 && missingRollback === 0 ? "PASS" : "WARN",
+    message: failedSandbox === 0 && staleSandbox === 0 && missingRollback === 0
+      ? `Sandbox state readable (${sandboxDirs.length})`
+      : `Sandbox issues: failed=${failedSandbox}, stale=${staleSandbox}, missing_rollback=${missingRollback}`,
+    nextAction: failedSandbox === 0 && staleSandbox === 0 && missingRollback === 0
+      ? null
+      : "Run rollback dry-run for stale or failed sandbox candidates",
+    evidence: `sandbox=${sandboxDirs.length}`,
+  })
+
+  let globalInstallAttempts = 0
+  for (const file of manifestFiles) {
+    try {
+      const raw = fs.readFileSync(path.join(paths.manifests, file), "utf8")
+      const parsed = parseCapabilityJson(raw)
+      const commandsRecord = isRecord(parsed) && isRecord(parsed.commands) ? parsed.commands : undefined
+      const commands = commandsRecord
+        ? ["install", "smoke", "start", "stop"].flatMap((key) => {
+          const value = commandsRecord[key]
+          return isCommandList(value) ? value.map((command) => command.join(" ")) : []
+        }).join("\n")
+        : raw
+      if (/\b(npm|pnpm|yarn)\b[^;\n]*(\s-g\b|--global)|\bpip3?\b[^;\n]*\sinstall\b(?![^;\n]*--target)|\bbrew\s+install\b|\bsudo\b/i.test(commands)) {
+        globalInstallAttempts++
+      }
+    } catch {
+      // Covered by manifest validation.
+    }
+  }
+  checks.push({
+    name: "capability-global-install-guard",
+    severity: globalInstallAttempts === 0 ? "PASS" : "FAIL",
+    message: globalInstallAttempts === 0
+      ? "No global install attempts detected in capability manifests"
+      : `${globalInstallAttempts} capability manifest(s) include global install or sudo commands`,
+    nextAction: globalInstallAttempts === 0 ? null : "Remove global install/sudo commands from capability manifests",
+    evidence: `global_install_attempts=${globalInstallAttempts}`,
   })
   return checks
 }

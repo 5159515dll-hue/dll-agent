@@ -1,8 +1,8 @@
 # dll-agent Autonomous Capability Acquisition
 
-Status: `Phase A implemented_runtime_verified`.
+Status: `Phase B1 implemented_runtime_verified` for local fixture quarantine/sandbox/rollback substrate.
 
-This system is the controlled path for future autonomous skill, MCP, tool, and software acquisition. Phase A defines the schema, risk classifier, audit packet shape, evidence hooks, and doctor checks. It does **not** download, install, execute, start MCP, or call a live model.
+This system is the controlled path for future autonomous skill, MCP, tool, and software acquisition. Phase A defines the schema, risk classifier, audit packet shape, evidence hooks, and doctor checks. Phase B1 adds only a local fixture quarantine/sandbox/rollback substrate. It does **not** download external software, install real packages, execute unknown binaries, start MCP, activate capabilities, or call a live model.
 
 ## Risk Levels
 
@@ -26,12 +26,12 @@ Implemented:
 Partial:
 
 - final-auditor integration is schema-only; no live auditor call.
-- quarantine/sandbox/rollback execution is not active yet.
+- quarantine/sandbox/rollback was not active at the Phase A checkpoint; Phase B1 now provides only the local fixture substrate described below.
 - commands such as `/capability-install` are not wired yet.
 
 Not implemented:
 
-- autonomous download/install/start.
+- autonomous external download/install/start.
 - persistent MCP acquisition.
 - external registry fetch.
 - live user authorization flow for capability install.
@@ -58,3 +58,33 @@ Doctor checks:
 - secret access declarations.
 
 Doctor Phase A checks are read-only and do not delete files, start processes, download packages, or touch secrets.
+
+## Phase B1 Quarantine / Sandbox / Rollback
+
+Implemented:
+
+- `capability-quarantine.ts`: creates, reads, updates, rejects, and deletes quarantined candidate manifests under the acquisition quarantine root.
+- `capability-sandbox.ts`: creates a fixture-only sandbox, copies local fixture files, runs non-executing smoke checks based on required file presence, and records pass/fail state.
+- `capability-rollback.ts`: builds rollback plans, validates managed paths, performs rollback dry-run, and executes rollback only for managed fixture quarantine/sandbox paths.
+- doctor checks orphan quarantine candidates, failed or stale sandbox directories, missing rollback plans for passed sandboxes, global install command attempts, and potential secrets leak markers.
+- evidence events cover `capability.quarantined`, `capability.sandbox_created`, `capability.sandbox_smoke_started`, `capability.sandbox_smoke_passed`, `capability.sandbox_smoke_failed`, `capability.rollback_planned`, `capability.rollback_dry_run`, `capability.rollback_executed`, and `capability.rollback_failed`.
+
+Boundary:
+
+- no real external download;
+- no real npm/pip/brew install;
+- no real GitHub release fetch;
+- no MCP start;
+- no Playwright start;
+- no live final-auditor call;
+- no capability activation;
+- no global environment mutation.
+
+Rollback rules:
+
+- rollback dry-run is required before execution;
+- execution can only remove managed fixture quarantine/sandbox paths;
+- session/evidence/cache/secrets and unmanaged paths are refused;
+- missing rollback plan prevents activation in later phases.
+
+Phase B2 may consider a low-risk real download pilot only after explicit authorization and a separate checkpoint.
