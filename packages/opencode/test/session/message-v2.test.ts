@@ -954,6 +954,60 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("passes OpenAI-compatible reasoning_content back for MiMo-style interleaved reasoning", async () => {
+    const assistantID = "m-assistant"
+    const mimoModel: Provider.Model = {
+      ...model,
+      id: ModelID.make("mimo-v2.5-pro"),
+      providerID: ProviderID.make("mimo"),
+      api: {
+        id: "mimo-v2.5-pro",
+        url: "https://token-plan-cn.xiaomimimo.com/v1",
+        npm: "@ai-sdk/openai-compatible",
+      },
+      capabilities: {
+        ...model.capabilities,
+        reasoning: true,
+        interleaved: { field: "reasoning_content" },
+      },
+    }
+    const input: MessageV2.WithParts[] = [
+      {
+        info: assistantInfo(assistantID, "m-parent", undefined, {
+          providerID: mimoModel.providerID,
+          modelID: mimoModel.id,
+        }),
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "reasoning",
+            text: "thinking",
+            time: { start: 0 },
+          },
+          {
+            ...basePart(assistantID, "a2"),
+            type: "text",
+            text: "answer",
+          },
+        ] as MessageV2.Part[],
+      },
+    ]
+
+    expect(
+      ProviderTransform.message(await MessageV2.toModelMessages(input, mimoModel), mimoModel, {}),
+    ).toStrictEqual([
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "answer" }],
+        providerOptions: {
+          openaiCompatible: {
+            reasoning_content: "thinking",
+          },
+        },
+      },
+    ])
+  })
+
   test("splits assistant messages on step-start boundaries", async () => {
     const assistantID = "m-assistant"
 

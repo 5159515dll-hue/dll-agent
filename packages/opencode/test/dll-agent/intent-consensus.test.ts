@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import fs from "fs"
+import path from "path"
 import {
   buildIntentJudgementPlan,
   buildIntentConsensusPlan,
@@ -133,6 +135,35 @@ describe("intent consensus participant selection", () => {
     expect(classification.model_classifier_needed).toBe(false)
   })
 
+  test("artifact editing intent cannot remain L2 read-only even if a model under-classifies it", () => {
+    const deterministic = classifyTaskIntake({ userText: "/tmp/example.deck" })
+    const parsed = parseModelIntentJudgement(JSON.stringify({
+      task_kind: "artifact_editing",
+      interaction_level: "L2",
+      confidence: "high",
+      tool_required: true,
+      reviewer_required: false,
+      verification_required: false,
+      goal_contract_required: false,
+      repo_doctor_allowed: true,
+      continuation_allowed: false,
+      final_gate_required: false,
+      finalization_policy: "read_only_answer",
+      reason: "the user wants an optimized artifact copy",
+      missing_information: [],
+    }))
+    expect(parsed?.interaction_level).toBe("L3")
+    const classification = classificationFromIntentJudgement({
+      deterministic,
+      judgement: parsed,
+      source: "single_model",
+    })
+    expect(classification.task_kind).toBe("artifact_editing")
+    expect(classification.interaction_level).toBe("L3")
+    expect(classification.finalization_policy).toBe("engineering_verification")
+    expect(classification.verification_required).toBe(true)
+  })
+
   test("multi-model consensus chooses the majority intent without using OpenAI", () => {
     const deterministic = classifyTaskIntake({ userText: "ambiguous request without structural signals" })
     const merged = mergeIntentJudgements({
@@ -212,5 +243,21 @@ describe("intent consensus participant selection", () => {
     })
     expect(classification.interaction_level).toBe("L4")
     expect(classification.reviewer_required).toBe(true)
+  })
+
+  test("session runtime records intent preflight even after commander execution has started", () => {
+    const source = fs.readFileSync(path.join(import.meta.dir, "../../src/session/prompt.ts"), "utf8")
+    expect(source).toContain('mode?: "full" | "record_only"')
+    expect(source).toContain('mode: alreadyAnswered ? "record_only" : "full"')
+    expect(source).toContain("deterministic intake recorded after commander execution already started")
+    expect(source).toContain("alreadyRecorded")
+  })
+
+  test("session prompt starts visible intent preflight before commander loop output", () => {
+    const source = fs.readFileSync(path.join(import.meta.dir, "../../src/session/prompt.ts"), "utf8")
+    const preflight = source.indexOf("intent preflight error before loop")
+    const loop = source.indexOf("return yield* loop({ sessionID: input.sessionID })")
+    expect(preflight).toBeGreaterThan(0)
+    expect(loop).toBeGreaterThan(preflight)
   })
 })

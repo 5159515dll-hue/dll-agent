@@ -20,6 +20,33 @@ const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
 const SAMPLE_BYTES = 4096
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 
+export function binaryReadRedirect(filepath: string): string | undefined {
+  const ext = path.extname(filepath).toLowerCase()
+  const capability = (() => {
+    if (ext === ".ppt" || ext === ".pptx") return "ppt/pptx"
+    if (ext === ".doc" || ext === ".docx") return "doc/docx"
+    if (ext === ".xls" || ext === ".xlsx") return "xlsx"
+    if (ext === ".odt" || ext === ".ods" || ext === ".odp") return "document-processing"
+    return undefined
+  })()
+  if (!capability) return undefined
+  const software = (() => {
+    if (capability === "ppt/pptx") return "python-pptx or LibreOffice"
+    if (capability === "doc/docx") return "python-docx or LibreOffice"
+    if (capability === "xlsx") return "openpyxl/pandas or LibreOffice"
+    return "document conversion/extraction software"
+  })()
+  return [
+    "<binary_read_redirect>",
+    `extension: ${ext}`,
+    "reason: binary/container document cannot be read as plain text",
+    `suggested_capability: ${capability}`,
+    `suggested_software: ${software}`,
+    "next_step: use the matching capability/software path; do not retry generic Read for this file",
+    "</binary_read_redirect>",
+  ].join("\n")
+}
+
 // `offset` and `limit` were originally `z.coerce.number()` — the runtime
 // coercion was useful when the tool was called from a shell but serves no
 // purpose in the LLM tool-call path (the model emits typed JSON). The JSON
@@ -241,7 +268,9 @@ export const ReadTool = Tool.define(
       }
 
       if (isBinaryFile(filepath, sample)) {
-        return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
+        const redirect = binaryReadRedirect(filepath)
+        const detail = redirect ? `\n\n${redirect}` : ""
+        return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}${detail}`))
       }
 
       const file = yield* Effect.promise(() =>

@@ -117,7 +117,8 @@ export interface ResultPacket {
 // ─── Storage ───────────────────────────────────────────────────────────────
 
 export function resultLedgerPath(sessionID: string) {
-  return path.join(os.homedir(), ".dll-agent", "sessions", sessionID, "results.jsonl")
+  const root = process.env.DLL_AGENT_CONFIG_ROOT || path.join(os.homedir(), ".dll-agent")
+  return path.join(root, "sessions", sessionID, "results.jsonl")
 }
 
 /**

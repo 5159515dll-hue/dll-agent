@@ -907,6 +907,29 @@ export const Model = Schema.Struct({
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type Model = Types.DeepMutable<Schema.Schema.Type<typeof Model>>
 
+function defaultOpenAICompatibleInterleaved(input: {
+  apiID: string
+  apiNpm: string
+  apiURL: string
+  existingModel: Model | undefined
+  providerID: string
+}) {
+  if (input.existingModel) return false
+  if (input.apiNpm !== "@ai-sdk/openai-compatible") return false
+  const providerID = input.providerID.toLowerCase()
+  const apiID = input.apiID.toLowerCase()
+  const apiURL = input.apiURL.toLowerCase()
+  if (
+    apiID.includes("deepseek") ||
+    providerID === "mimo" ||
+    apiID.includes("mimo") ||
+    apiURL.includes("xiaomimimo")
+  ) {
+    return { field: "reasoning_content" as const }
+  }
+  return false
+}
+
 export const Info = Schema.Struct({
   id: ProviderID,
   name: Schema.String,
@@ -1192,12 +1215,13 @@ const layer: Layer.Layer<
               if (model.id && model.id !== modelID) return modelID
               return existingModel?.name ?? modelID
             })
+            const apiURL = model.provider?.api ?? provider?.api ?? existingModel?.api.url ?? modelsDev[providerID]?.api ?? ""
             const parsedModel: Model = {
               id: ModelID.make(modelID),
               api: {
                 id: apiID,
                 npm: apiNpm,
-                url: model.provider?.api ?? provider?.api ?? existingModel?.api.url ?? modelsDev[providerID]?.api ?? "",
+                url: apiURL,
               },
               status: model.status ?? existingModel?.status ?? "active",
               name,
@@ -1227,9 +1251,7 @@ const layer: Layer.Layer<
                 interleaved:
                   model.interleaved ??
                   existingModel?.capabilities.interleaved ??
-                  (!existingModel && apiNpm === "@ai-sdk/openai-compatible" && apiID.includes("deepseek")
-                    ? { field: "reasoning_content" }
-                    : false),
+                  defaultOpenAICompatibleInterleaved({ apiID, apiNpm, apiURL, existingModel, providerID }),
               },
               cost: {
                 input: model?.cost?.input ?? existingModel?.cost?.input ?? 0,

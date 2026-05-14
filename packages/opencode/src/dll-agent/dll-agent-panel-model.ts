@@ -1,4 +1,5 @@
 import { buildCapabilityStatusReport, type CapabilityStatusReport } from "./capability-status"
+import type { ToolActivitySummary } from "./command-activity"
 import {
   buildCostStatusLine,
   buildQuotaStatusLine,
@@ -23,6 +24,17 @@ export interface DllAgentPanelModel {
   doctorStatus: string
 }
 
+export interface DllAgentPanelActivity {
+  todos_total?: number
+  todos_in_progress?: number
+  todos_pending?: number
+  todos_completed?: number
+  modified_files?: number
+  additions?: number
+  deletions?: number
+  tool_summary?: ToolActivitySummary
+}
+
 function valueOrUnknown(value: unknown) {
   if (value === undefined || value === null || value === "") return "未知"
   return String(value)
@@ -36,6 +48,13 @@ function hasRuntimeTask(report: ObservabilityPanelState) {
   if (report.verification.required.length > 0) return true
   if (report.reviewers.required.length > 0 || report.reviewers.running.length > 0 || report.reviewers.queued.length > 0) return true
   if (report.continuation.status !== "none" && report.continuation.status !== "unknown") return true
+  return false
+}
+
+function hasVisibleActivity(activity: DllAgentPanelActivity | undefined) {
+  if (!activity) return false
+  if ((activity.todos_total ?? 0) > 0) return true
+  if ((activity.modified_files ?? 0) > 0) return true
   return false
 }
 
@@ -71,6 +90,16 @@ function displayStatus(input: { supervisor: SupervisorPanelState; task: Observab
   return zhStatus(input.task?.final_status_detail)
 }
 
+function displayPanelStatus(input: {
+  supervisor: SupervisorPanelState
+  task: ObservabilityPanelState
+  activity?: DllAgentPanelActivity
+}) {
+  if (input.supervisor?.blocked_completion) return "阻断"
+  if (hasVisibleActivity(input.activity)) return "执行中"
+  return displayStatus({ supervisor: input.supervisor, task: input.task })
+}
+
 function displayDoctor(report: ObservabilityPanelState) {
   if (!report || report.doctor.status === "unknown") return "未运行"
   return zhStatus(report.doctor.status)
@@ -93,6 +122,7 @@ function intakeKindLabel(kind: unknown) {
     stateless_chat: "无状态对话",
     informational: "信息问答",
     light_engineering_analysis: "只读工程分析",
+    artifact_editing: "文档/产物编辑",
     coding: "代码修改",
     debugging: "调试",
     verification: "验证",
@@ -105,7 +135,58 @@ function intakeKindLabel(kind: unknown) {
   return map[String(kind ?? "")] ?? String(kind ?? "未知")
 }
 
-function intakeSummary(supervisor: SupervisorPanelState | undefined) {
+function intentProgressLine(supervisor: SupervisorPanelState | undefined, width: number) {
+  const status = supervisor?.intent_judgement_status
+  if (!status) return undefined
+  if (status.status === "single_model_running") {
+    return truncate(`正在判断意图：单模型｜${status.model ?? "当前指挥官模型"}｜请稍候`, width)
+  }
+  if (status.status === "multi_model_running") {
+    return truncate(`正在判断意图：多模型共识｜${status.participants?.length ?? 0} 个模型｜请稍候`, width)
+  }
+  if (status.status === "completed") {
+    const classification = supervisor?.intent_judgement?.classification
+    const level = classification?.interaction_level ?? supervisor?.metrics?.interaction_level
+    const kind = classification?.task_kind ?? supervisor?.metrics?.task_kind
+    const levelText = level ? `${level} ${intakeLevelLabel(level)}` : "已完成"
+    const kindText = kind ? `｜类别：${intakeKindLabel(kind)}` : ""
+    const sourceMap: Record<string, string> = {
+      deterministic: "确定性规则",
+      hard_safety: "安全硬规则",
+      single_model: "单模型",
+      multi_model_consensus: "多模型共识",
+    }
+    const source = sourceMap[String(supervisor?.intent_judgement?.source ?? "")] ?? "已记录"
+    return truncate(`意图已判断：${levelText}${kindText}｜来源：${source}`, width)
+  }
+  if (status.status === "failed") return truncate("意图判断：失败｜已回退到保守规则", width)
+  return undefined
+}
+
+function answerDeliveryLine(supervisor: SupervisorPanelState | undefined, width: number) {
+  const delivery = supervisor?.answer_delivery
+  if (!delivery) return undefined
+  const modeMap: Record<string, string> = {
+    stateless_answer: "无状态回答",
+    informational_answer: "普通问答",
+    read_only_answer: "只读分析",
+    engineering_verification: "工程验证",
+    high_risk_governance: "高风险治理",
+  }
+  const statusMap: Record<string, string> = {
+    candidate: "候选",
+    accepted: "已接受",
+    needs_internal_revision: "需内部修订",
+    blocked: "阻断",
+  }
+  const lock = delivery.public_answer_emitted && !delivery.public_followup_allowed ? "｜公开输出已锁定" : ""
+  return truncate(`答案：${statusMap[delivery.status] ?? delivery.status}｜${modeMap[delivery.mode] ?? delivery.mode}${lock}`, width)
+}
+
+function intakeSummary(
+  supervisor: SupervisorPanelState | undefined,
+  context?: { hasActivity?: boolean; hasRuntimeTask?: boolean },
+) {
   const metrics = supervisor?.metrics ?? {}
   const level = metrics.interaction_level
   const kind = metrics.task_kind
@@ -117,6 +198,13 @@ function intakeSummary(supervisor: SupervisorPanelState | undefined) {
     }
   }
   if (!level) {
+    if (context?.hasActivity || context?.hasRuntimeTask) {
+      return {
+        available: true,
+        label: "任务执行",
+        detail: "意图分析：未记录｜已根据任务/工具活动显示运行状态",
+      }
+    }
     return {
       available: false,
       label: "普通对话/待命",
@@ -167,9 +255,40 @@ function planLine(report: ObservabilityPanelState, width: number) {
   return truncate(`计划：阻塞 ${blockers}｜续接 ${zhStatus(report.continuation.status)}｜下一步：${next}`, width)
 }
 
-function finalLine(report: ObservabilityPanelState, supervisor: SupervisorPanelState | undefined, width: number) {
+function activityLine(activity: DllAgentPanelActivity | undefined, width: number) {
+  if (!activity || !hasVisibleActivity(activity)) return undefined
+  const todo = (activity.todos_total ?? 0) > 0
+    ? `计划：进行中 ${activity.todos_in_progress ?? 0}｜待办 ${activity.todos_pending ?? 0}｜完成 ${activity.todos_completed ?? 0}`
+    : "计划：未建立"
+  const files = (activity.modified_files ?? 0) > 0
+    ? `｜文件改动 ${activity.modified_files}（+${activity.additions ?? 0}/-${activity.deletions ?? 0}）`
+    : ""
+  return truncate(`${todo}${files}`, width)
+}
+
+function toolActivityLine(activity: DllAgentPanelActivity | undefined, width: number) {
+  const summary = activity?.tool_summary
+  if (!summary || summary.total === 0) return undefined
+  return truncate(
+    `工具：只读 ${summary.readonly_tools}｜写入 ${summary.writes}｜MCP ${summary.mcp}｜命令 ${summary.commands}｜失败 ${summary.failed}`,
+    width,
+  )
+}
+
+function finalLine(
+  report: ObservabilityPanelState,
+  supervisor: SupervisorPanelState | undefined,
+  width: number,
+  activity?: DllAgentPanelActivity,
+) {
   if (!report) return "任务：未知"
-  if (!hasRuntimeTask(report)) return truncate(`任务：${intakeSummary(supervisor).label}｜阶段：${report.phase}｜风险：${report.risk}`, width)
+  if (hasVisibleActivity(activity)) {
+    const label = (activity?.modified_files ?? 0) > 0 ? "工程执行/有文件写入" : "工程执行"
+    return truncate(`任务：${label}｜阶段：${report.phase}｜风险：${report.risk}`, width)
+  }
+  if (!hasRuntimeTask(report)) {
+    return truncate(`任务：${intakeSummary(supervisor).label}｜阶段：${report.phase}｜风险：${report.risk}`, width)
+  }
   return truncate(`任务：${zhStatus(report.final_status_detail)}｜阶段：${report.phase}｜风险：${report.risk}`, width)
 }
 
@@ -178,9 +297,12 @@ function goalLine(report: ObservabilityPanelState, width: number) {
   return truncate(`目标：${report.goal ?? "未建立目标"}`, width)
 }
 
-function verificationLine(report: ObservabilityPanelState, width: number) {
+function verificationLine(report: ObservabilityPanelState, width: number, activity?: DllAgentPanelActivity) {
   if (!report) return "验证：未知｜doctor：未知"
-  if (!hasRuntimeTask(report) && report.verification.required.length === 0) return `验证：未要求｜doctor：${displayDoctor(report)}`
+  if (!hasRuntimeTask(report) && report.verification.required.length === 0) {
+    if (hasVisibleActivity(activity)) return `验证：未记录｜doctor：${displayDoctor(report)}`
+    return `验证：未要求｜doctor：${displayDoctor(report)}`
+  }
   const v = report.verification
   return truncate(
     `验证：${zhStatus(v.status)}｜通过 ${v.passed}｜失败 ${v.failed}｜未跑 ${v.not_run}｜要求 ${v.required.length}｜doctor：${displayDoctor(report)}`,
@@ -231,6 +353,7 @@ export function buildDllAgentPanelModel(input: {
   capability?: CapabilityStatusReport
   cost: CostPanelState
   quota: ReturnType<typeof import("./tui-status-adapter").readQuotaFile>
+  activity?: DllAgentPanelActivity
   width: number
   compact: boolean
 }): DllAgentPanelModel {
@@ -241,16 +364,33 @@ export function buildDllAgentPanelModel(input: {
   ]
   const activeRole = activeRoles[0] ?? "commander"
   const hasBlocker = Boolean(input.supervisor?.blocked_completion || (input.task?.blockers.length ?? 0) > 0)
-  const isIdle = !hasBlocker && !hasRuntimeTask(input.task)
+  const hasActivity = hasVisibleActivity(input.activity)
+  const isIdle = !hasBlocker && !hasRuntimeTask(input.task) && !hasActivity
   const doctorStatus = displayDoctor(input.task)
-  const intake = intakeSummary(input.supervisor)
+  const hasRuntime = hasRuntimeTask(input.task)
+  const intake = intakeSummary(input.supervisor, { hasActivity, hasRuntimeTask: hasRuntime })
   const capability = input.capability
   const runningCapabilities = capability
     ? (capability.by_status.running ?? 0) + Object.keys(capability.runtime_states).length
     : 0
+  const progress = intentProgressLine(input.supervisor, width)
+  const answer = answerDeliveryLine(input.supervisor, width)
+  const hasRecordedIntent = Boolean(
+    input.supervisor?.metrics?.interaction_level
+      || input.supervisor?.metrics?.read_only_answer_task
+      || input.supervisor?.intent_judgement
+      || input.supervisor?.intent_judgement_status,
+  )
+  const idleStateDetail = hasRecordedIntent
+    ? "入口意图已分析"
+    : hasActivity
+      ? "运行态活动已检测"
+      : hasRuntime
+        ? "运行态任务已检测"
+        : "未建立工程任务"
   return {
     global: [
-      truncate(`dll-agent：${displayStatus({ supervisor: input.supervisor, task: input.task })}｜${input.projectLabel}｜${input.sessionLabel}`, width),
+      truncate(`dll-agent：${displayPanelStatus({ supervisor: input.supervisor, task: input.task, activity: input.activity })}｜${input.projectLabel}｜${input.sessionLabel}`, width),
       truncate(
         `模型：指挥官=${input.commander.primary} [${input.commander.source}]｜当前角色=${activeRole}｜doctor=${doctorStatus}｜${costLine(input.cost, width)}`,
         width,
@@ -258,13 +398,17 @@ export function buildDllAgentPanelModel(input: {
       quotaLine(input.quota, width),
     ].slice(0, input.compact ? 2 : 3),
     task: [
-      finalLine(input.task, input.supervisor, width),
+      progress,
+      answer,
+      finalLine(input.task, input.supervisor, width, input.activity),
       truncate(intake.detail, width),
+      activityLine(input.activity, width),
+      toolActivityLine(input.activity, width),
       goalLine(input.task, width),
       planLine(input.task, width),
-    ].slice(0, input.compact ? 3 : 4),
+    ].filter((line): line is string => Boolean(line)).slice(0, input.compact ? 3 : 5),
     verification: [
-      verificationLine(input.task, width),
+      verificationLine(input.task, width, input.activity),
       resultLine(input.task, width),
     ],
     modelRole: [
@@ -277,9 +421,9 @@ export function buildDllAgentPanelModel(input: {
       capabilityRiskLine(input.capability, width),
     ],
     idle: [
-      truncate(`状态：待命｜${intake.label}｜${intake.available ? "入口意图已分析" : "未建立工程任务"}`, width),
+      progress ?? truncate(`状态：${isIdle ? "待命" : "执行中"}｜${hasActivity ? "计划/文件活动" : intake.label}｜${idleStateDetail}`, width),
       truncate(`模型：${input.commander.primary} [${input.commander.source}]`, width),
-      truncate(`审查：未触发｜工具/MCP：未运行｜能力运行 ${runningCapabilities}`, width),
+      toolActivityLine(input.activity, width) ?? truncate(`审查：未触发｜工具/MCP：未运行｜能力运行 ${runningCapabilities}`, width),
     ],
     intake: [truncate(intake.detail, width)],
     isIdle,

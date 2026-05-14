@@ -57,6 +57,11 @@ import {
 } from "../../src/dll-agent/mcp-manager"
 
 import { toolDoctorChecks, type ToolDoctorResult } from "../../src/dll-agent/toolbox"
+import {
+  buildCapabilityFallbackPacket,
+  resolveCapabilitySkill,
+} from "../../src/dll-agent/capability-skill-resolver"
+import { binaryReadRedirect } from "../../src/tool/read"
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
 
@@ -564,6 +569,103 @@ describe("tool-prompt", () => {
     const manifest = buildGlobalEffective()
     const triggers = detectToolTriggers(manifest, "请帮我生成一个 PPT 演示文稿")
     expect(triggers).toContain("ppt-pptx")
+  })
+
+  test("tool-style skill requests resolve through dynamic capability metadata", () => {
+    const resolved = resolveCapabilitySkill({
+      requestedName: "ppt-pptx:tool",
+      skills: [
+        {
+          name: "PowerPoint",
+          description: "Create, edit, render, verify, and export PPTX slide decks.",
+        },
+      ],
+    })
+
+    expect(resolved.skill?.name).toBe("PowerPoint")
+    expect(resolved.matched_tool?.id).toBe("ppt-pptx")
+    expect(resolved.reason).toContain("metadata")
+  })
+
+  test("custom tools resolve skills through catalog skill_ref without source aliases", () => {
+    const customTool: ToolEntry = {
+      id: "custom-artifact",
+      name: "custom/artifact",
+      description: "Custom artifact processor",
+      kind: "tool",
+      risk_level: "low",
+      triggers: { keywords: [], file_extensions: [".artifact"], task_patterns: [] },
+      injection_policy: "on_demand",
+      skill_ref: "custom-artifact-skill",
+      prompt_index: "custom/artifact",
+      prompt_detail: "Custom artifact processing capability.",
+      security: { require_redaction: true, allow_network: false, require_consent: false },
+    }
+    const resolved = resolveCapabilitySkill({
+      requestedName: "custom-artifact:tool",
+      tools: [customTool],
+      skills: [
+        {
+          name: "custom-artifact-skill",
+          description: "Process custom artifacts",
+        },
+      ],
+    })
+
+    expect(resolved.skill?.name).toBe("custom-artifact-skill")
+    expect(resolved.candidate_names).toContain("custom-artifact-skill")
+  })
+
+  test("capability request without installed skill returns fallback packet instead of retry aliases", () => {
+    const resolved = resolveCapabilitySkill({
+      requestedName: "ppt/pptx",
+      skills: [],
+    })
+    const fallback = buildCapabilityFallbackPacket(resolved)
+
+    expect(resolved.skill).toBeUndefined()
+    expect(resolved.matched_tool?.id).toBe("ppt-pptx")
+    expect(fallback).toContain("<capability_fallback")
+    expect(fallback).toContain("do not retry skill aliases")
+    expect(fallback).toContain("explicit_absolute_path_first=true")
+    expect(fallback).toContain("before any glob/search")
+    expect(fallback).toContain("workflow.primary")
+    expect(fallback).toContain("workflow.validation")
+    expect(fallback).toContain("python3")
+  })
+
+  test("binary office documents redirect generic Read back to capability software", () => {
+    const redirect = binaryReadRedirect("/tmp/example.pptx")
+    expect(redirect).toContain("<binary_read_redirect>")
+    expect(redirect).toContain("suggested_capability: ppt/pptx")
+    expect(redirect).toContain("python-pptx")
+    expect(redirect).toContain("do not retry generic Read")
+  })
+
+  test("skill tool does not contain hard-coded capability alias table", () => {
+    const source = fs.readFileSync(path.join(import.meta.dir, "../../src/tool/skill.ts"), "utf8")
+    expect(source).not.toContain("SKILL_NAME_ALIASES")
+    expect(source).not.toContain('"ppt-pptx:tool"')
+  })
+
+  test("file tools prioritize explicit absolute paths before glob/search", () => {
+    const readPrompt = fs.readFileSync(path.join(import.meta.dir, "../../src/tool/read.txt"), "utf8")
+    const skillPrompt = fs.readFileSync(path.join(import.meta.dir, "../../src/tool/skill.txt"), "utf8")
+    expect(readPrompt).toContain("explicit absolute path")
+    expect(readPrompt).toContain("Do not use glob/search before checking the explicit path")
+    expect(skillPrompt).toContain("explicit absolute path")
+    expect(skillPrompt).toContain("Do not use glob/search before checking the explicit path")
+  })
+
+  test("capability fallback workflow is driven by declared file metadata, not fixed document extensions", () => {
+    const source = fs.readFileSync(
+      path.join(import.meta.dir, "../../src/dll-agent/capability-skill-resolver.ts"),
+      "utf8",
+    )
+    expect(source).toContain("hasDeclaredFileInput")
+    expect(source).not.toContain('".pptx"')
+    expect(source).not.toContain('".docx"')
+    expect(source).not.toContain('".xlsx"')
   })
 
   test("detectToolTriggers does NOT trigger unrelated tools", () => {

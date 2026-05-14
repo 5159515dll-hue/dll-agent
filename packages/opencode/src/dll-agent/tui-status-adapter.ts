@@ -232,9 +232,9 @@ export function readQuotaFile() {
   }
 }
 
-export function readSupervisorState() {
+export function readSupervisorState(sessionID?: string) {
   try {
-    const sid = process.env.DLL_AGENT_SESSION_ID
+    const sid = sessionID || process.env.DLL_AGENT_SESSION_ID
     if (!sid) return
     const file = path.join(os.homedir(), ".dll-agent", "sessions", sid, "supervisor.json")
     if (!fs.existsSync(file)) return
@@ -253,6 +253,42 @@ export function readSupervisorState() {
         metrics?: Record<string, any>
         queued_reviewers?: string[]
         running_reviewers?: string[]
+        intent_judgement_status?: {
+          message_id: string
+          status: string
+          action: string
+          model?: string
+          participants?: string[]
+          reason: string
+          started_at: string
+          updated_at: string
+        }
+        intent_judgement?: {
+          message_id: string
+          source: string
+          plan_action: string
+          classification: {
+            task_kind?: string
+            interaction_level?: string
+            confidence?: string
+            finalization_policy?: string
+          }
+          reason: string
+          created_at: string
+        }
+        answer_delivery?: {
+          user_message_id: string
+          assistant_message_id?: string
+          mode: string
+          status: string
+          public_answer_emitted: boolean
+          internal_review_allowed?: boolean
+          council_allowed?: boolean
+          public_followup_allowed: boolean
+          accepted_reason?: string
+          evidence_refs: string[]
+          updated_at: string
+        }
       }
     }
   } catch {
@@ -260,9 +296,9 @@ export function readSupervisorState() {
   }
 }
 
-export function readCostStatus() {
+export function readCostStatus(sessionID?: string) {
   try {
-    const sid = process.env.DLL_AGENT_SESSION_ID
+    const sid = sessionID || process.env.DLL_AGENT_SESSION_ID
     if (!sid) return
     const file = path.join(os.homedir(), ".dll-agent", "sessions", sid, "cost.json")
     if (!fs.existsSync(file)) return

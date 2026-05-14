@@ -4,6 +4,7 @@ import { Effect, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Ripgrep } from "../file/ripgrep"
 import { Skill } from "../skill"
+import { buildCapabilityFallbackPacket, resolveCapabilitySkill } from "../dll-agent/capability-skill-resolver"
 import * as Tool from "./tool"
 import DESCRIPTION from "./skill.txt"
 
@@ -22,9 +23,24 @@ export const SkillTool = Tool.define(
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
-          const info = yield* skill.get(params.name)
+          const all = yield* skill.all()
+          const resolved = resolveCapabilitySkill({ requestedName: params.name, skills: all })
+          let info = resolved.skill ? yield* skill.get(resolved.skill.name) : undefined
           if (!info) {
-            const all = yield* skill.all()
+            const fallback = buildCapabilityFallbackPacket(resolved)
+            if (fallback) {
+              return {
+                title: `Capability fallback: ${resolved.matched_tool!.name}`,
+                output: fallback,
+                metadata: {
+                  name: resolved.matched_tool!.name,
+                  dir: "",
+                  capability_id: resolved.matched_tool!.id,
+                  fallback: true,
+                  reason: resolved.reason,
+                },
+              }
+            }
             const available = all.map((item) => item.name).join(", ")
             throw new Error(`Skill "${params.name}" not found. Available skills: ${available || "none"}`)
           }
@@ -67,6 +83,9 @@ export const SkillTool = Tool.define(
             metadata: {
               name: info.name,
               dir,
+              capability_id: "",
+              fallback: false,
+              reason: "skill loaded",
             },
           }
         }).pipe(Effect.orDie),

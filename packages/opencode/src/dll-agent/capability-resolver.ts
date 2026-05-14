@@ -10,7 +10,7 @@
  *   auto_install   — 项目/用户目录内自动安装
  *   ask_permission — 需要用户确认（高风险）
  *   degrade        — 降级使用替代方案
- *   skip           — 不可用且无法修复
+ *   skip           — 安全策略明确禁止，或没有任何可审计获取路径
  *
  * 风险分级：
  *   低风险 → auto_install / lazy_start
@@ -180,8 +180,8 @@ export function resolveCapability(entry: CapabilityEntry): ResolverDecision {
       if (missingTokens.length > 0) {
         return {
           entry_id: entry.id,
-          action: "skip",
-          reason: `Missing tokens: ${missingTokens.join(", ")}`,
+          action: "ask_permission",
+          reason: `Missing tokens: ${missingTokens.join(", ")}. User authorization or credential setup is required; do not silently skip.`,
           risk_level: entry.risk_level,
           requires_user_consent: true,
         }

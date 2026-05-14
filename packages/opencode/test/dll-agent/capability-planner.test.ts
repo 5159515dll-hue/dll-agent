@@ -27,6 +27,7 @@ const registry = [
     source_type: "builtin",
     status: "available",
     runtime: { heavy: true },
+    triggers: { keywords: ["browser automation", "点击流"] },
   } as any),
   createMinimalEntry({
     id: "docx-tool",
@@ -37,6 +38,7 @@ const registry = [
     cost_level: "free",
     source_type: "builtin",
     status: "available",
+    triggers: { file_extensions: [".docx", ".doc"] },
   } as any),
   createMinimalEntry({
     id: "pdf-tool",
@@ -47,6 +49,7 @@ const registry = [
     cost_level: "free",
     source_type: "builtin",
     status: "available",
+    triggers: { keywords: ["pull request", "pr"] },
   } as any),
   createMinimalEntry({
     id: "gh-cli",
@@ -130,6 +133,64 @@ describe("planCapabilities", () => {
     const suggestion = result.install_suggestions.find((s) => s.entry_id === "unique-playwright")
     expect(suggestion).toBeDefined()
     expect(suggestion!.action).toBeTruthy()
+  })
+
+  test("missing capability with no install strategy requests acquisition instead of degrading silently", () => {
+    const regWithMissingSkill = [
+      createMinimalEntry({
+        id: "missing-artifact-skill",
+        kind: "skill",
+        name: "missing-artifact-skill",
+        capabilities: ["fixture-missing-read"],
+        source_type: "discovered",
+        status: "missing_dependency",
+        install_strategy: "none",
+        requires_install: false,
+      } as any),
+    ]
+    const result = planCapabilities(regWithMissingSkill, {
+      user_goal: "analyze artifact",
+      file_extensions: [".fixture-missing"],
+    })
+    const suggestion = result.install_suggestions.find((s) => s.entry_id === "missing-artifact-skill")
+    expect(suggestion?.action).toBe("ask_permission")
+  })
+
+  test("selects multiple complementary capabilities from registry metadata", () => {
+    const artifactRegistry = [
+      createMinimalEntry({
+        id: "primary-artifact-capability",
+        kind: "tool",
+        name: "primary-artifact-capability",
+        capabilities: ["artifact-read", "artifact-write", "artifact-transform"],
+        input_types: ["file-path", ".fixture-artifact"],
+        output_types: ["fixture-artifact", "text"],
+        source_type: "builtin",
+        status: "available",
+        triggers: { file_extensions: [".fixture-artifact"] },
+      } as any),
+      createMinimalEntry({
+        id: "validation-artifact-capability",
+        kind: "software",
+        name: "validation-artifact-capability",
+        capabilities: ["artifact-validation"],
+        input_types: ["fixture-artifact"],
+        output_types: ["preview-artifact", "validation-report"],
+        source_type: "local-scan",
+        status: "available",
+        triggers: { file_extensions: [".fixture-artifact"] },
+      } as any),
+    ]
+    const result = planCapabilities(artifactRegistry, {
+      user_goal: "optimize this artifact",
+      file_extensions: [".fixture-artifact"],
+    })
+
+    expect(result.selected.map((item) => item.entry.id)).toEqual(
+      expect.arrayContaining(["primary-artifact-capability", "validation-artifact-capability"]),
+    )
+    expect(result.workflow.some((step) => step.phase === "primary" && step.entry_id === "primary-artifact-capability")).toBe(true)
+    expect(result.workflow.some((step) => step.phase === "validation" && step.entry_id === "validation-artifact-capability")).toBe(true)
   })
 
   test("reports gaps for uncovered tags", () => {

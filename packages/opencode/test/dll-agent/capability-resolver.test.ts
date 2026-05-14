@@ -122,7 +122,7 @@ describe("resolveCapability", () => {
     expect(result.requires_user_consent).toBe(true)
   })
 
-  test("skip for missing tokens with no install", () => {
+  test("missing tokens request authorization instead of silently skipping", () => {
     const entry = createMinimalEntry({
       id: "test",
       kind: "tool",
@@ -135,7 +135,9 @@ describe("resolveCapability", () => {
       requires_install: false,
     })
     const result = resolveCapability(entry)
-    expect(result.action).toBe("skip")
+    expect(result.action).toBe("ask_permission")
+    expect(result.requires_user_consent).toBe(true)
+    expect(result.reason).toContain("do not silently skip")
   })
 
   test("ask_permission for user_local_binary with low confidence", () => {
@@ -178,11 +180,11 @@ describe("resolveAll", () => {
     ]
     const result = resolveAll(entries)
     expect(result.ready.length).toBe(1)
-    expect(result.pending.length).toBe(1)
-    expect(result.blocked.length).toBe(1)
+    expect(result.pending.length).toBe(2)
+    expect(result.blocked.length).toBe(0)
     expect(result.ready[0].entry_id).toBe("ready-1")
     expect(result.pending[0].entry_id).toBe("pending-1")
-    expect(result.blocked[0].entry_id).toBe("blocked-1")
+    expect(result.pending[1].entry_id).toBe("blocked-1")
   })
 })
 

@@ -75,6 +75,23 @@ describe("capability-orchestrator", () => {
     expect(result.toolPromptTags.length).toBeGreaterThan(0)
   })
 
+  test("unresolved capability gaps become explicit acquisition actions instead of silent skip", () => {
+    const result = orchestrateCapabilities({
+      projectDir: process.cwd(),
+      userGoal: "process an unsupported video file",
+      filesInvolved: ["clip.mp4"],
+      messageID: "msg_gap",
+      recordEvidence: false,
+    })
+
+    if (result.unresolvedGaps.length === 0) return
+    expect(result.actions.some((action) =>
+      action.type === "ask_permission" &&
+      action.entry_id.startsWith("capability-gap:") &&
+      action.reason.includes("Autonomous acquisition")
+    )).toBe(true)
+  })
+
   test("system summary is bounded", () => {
     const result = orchestrateCapabilities({
       projectDir: process.cwd(),

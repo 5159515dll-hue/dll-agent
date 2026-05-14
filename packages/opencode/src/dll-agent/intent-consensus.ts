@@ -184,6 +184,7 @@ const TASK_KINDS = new Set<TaskKind>([
   "stateless_chat",
   "informational",
   "light_engineering_analysis",
+  "artifact_editing",
   "coding",
   "debugging",
   "verification",
@@ -234,19 +235,24 @@ export function parseModelIntentJudgement(text: string): ModelIntentJudgement | 
     if (typeof level !== "string" || !INTERACTION_LEVELS.has(level as IntentInteractionLevel)) return undefined
     if (typeof confidence !== "string" || !CONFIDENCES.has(confidence as IntentConfidence)) return undefined
     if (typeof finalization !== "string" || !FINALIZATION_POLICIES.has(finalization as TaskFinalizationPolicy)) return undefined
+    const normalizedLevel = taskKind === "artifact_editing" && ["L0", "L1", "L2"].includes(level)
+      ? "L3"
+      : level
     return {
       task_kind: taskKind as TaskKind,
-      interaction_level: level as IntentInteractionLevel,
+      interaction_level: normalizedLevel as IntentInteractionLevel,
       confidence: confidence as IntentConfidence,
       tool_required: bool(parsed.tool_required, false),
       reviewer_required: bool(parsed.reviewer_required, false),
       verification_required: bool(parsed.verification_required, false),
-      goal_contract_required: bool(parsed.goal_contract_required, level !== "L0" && level !== "L1"),
-      repo_doctor_allowed: bool(parsed.repo_doctor_allowed, level !== "L0" && level !== "L1"),
-      continuation_allowed: bool(parsed.continuation_allowed, level !== "L0" && level !== "L1"),
-      final_gate_required: bool(parsed.final_gate_required, level !== "L0" && level !== "L1"),
+      goal_contract_required: bool(parsed.goal_contract_required, normalizedLevel !== "L0" && normalizedLevel !== "L1"),
+      repo_doctor_allowed: bool(parsed.repo_doctor_allowed, normalizedLevel !== "L0" && normalizedLevel !== "L1"),
+      continuation_allowed: bool(parsed.continuation_allowed, normalizedLevel !== "L0" && normalizedLevel !== "L1"),
+      final_gate_required: bool(parsed.final_gate_required, normalizedLevel !== "L0" && normalizedLevel !== "L1"),
       finalization_policy: finalization as TaskFinalizationPolicy,
-      reason: typeof parsed.reason === "string" ? parsed.reason.slice(0, 500) : "model intent judgement",
+      reason: typeof parsed.reason === "string"
+        ? `${parsed.reason.slice(0, 500)}${normalizedLevel !== level ? "; artifact editing normalized to L3" : ""}`
+        : `model intent judgement${normalizedLevel !== level ? "; artifact editing normalized to L3" : ""}`,
       missing_information: stringArray(parsed.missing_information).slice(0, 8),
     }
   } catch {
@@ -406,7 +412,7 @@ export function buildIntentJudgePrompt(input: {
     "Do not use tools. Do not browse. Do not request secrets. Do not execute commands.",
     "Hard safety rule: destructive commands, secrets/auth, global/system mutation, remote publish, live MCP/browser/profile access, and provider/gate/permission changes are L4 and must not be downgraded.",
     "Return one JSON object only with these fields:",
-    "task_kind: greeting | stateless_chat | informational | light_engineering_analysis | coding | debugging | verification | planning | permission | high_risk | multimodal | unknown",
+    "task_kind: greeting | stateless_chat | informational | light_engineering_analysis | artifact_editing | coding | debugging | verification | planning | permission | high_risk | multimodal | unknown",
     "interaction_level: L0 | L1 | L2 | L3 | L4",
     "confidence: low | medium | high",
     "tool_required, reviewer_required, verification_required, goal_contract_required, repo_doctor_allowed, continuation_allowed, final_gate_required: booleans",
@@ -417,8 +423,9 @@ export function buildIntentJudgePrompt(input: {
     "Interaction levels:",
     "L0 means stateless/no-op chat.",
     "L1 means answer-only informational request.",
-    "L2 means read-only engineering analysis or planning; reading project files may be useful but no mutation or verification is required.",
-    "L3 means coding, debugging, verification, test/build, or engineering execution.",
+    "L2 means read-only engineering analysis or planning; reading files may be useful but no mutation, generated artifact, export, or verification is required.",
+    "L3 means coding, debugging, verification, test/build, artifact editing/optimization, generated copy/export, or engineering execution.",
+    "Classify any task that asks to edit, optimize, transform, generate, export, or save a file/artifact as task_kind=artifact_editing and interaction_level=L3, even when the artifact is a document, deck, spreadsheet, image, or other non-code file.",
     "L4 means high-risk safety/governance/permission/destructive/provider/runtime action.",
     "",
     `Deterministic classifier seed: ${JSON.stringify({

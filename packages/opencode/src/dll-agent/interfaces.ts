@@ -9,7 +9,7 @@
  */
 
 import type { MessageV2 } from "@/session/message-v2"
-import type { IntentJudgementRecord } from "./intent-consensus"
+import type { IntentJudgementPlan, IntentJudgementRecord } from "./intent-consensus"
 
 // ─── 基础枚举 ────────────────────────────────────────────────────────────────
 
@@ -149,6 +149,40 @@ export interface SupervisorState {
   recovery_total_count?: number
   /** Latest user-origin semantic intent judgement, produced before commander execution. */
   intent_judgement?: IntentJudgementRecord
+  /** Visible preflight progress for TUI; diagnostic only, not used for routing decisions. */
+  intent_judgement_status?: {
+    message_id: string
+    status: "single_model_running" | "multi_model_running" | "completed" | "failed"
+    action: IntentJudgementPlan["action"]
+    model?: string
+    participants?: string[]
+    reason: string
+    started_at: string
+    updated_at: string
+  }
+  /**
+   * Tracks whether the current user-facing answer has already been delivered.
+   * This prevents internal reviewers/recovery/council work from producing
+   * repeated public answers for answer-only tasks.
+   */
+  answer_delivery?: {
+    user_message_id: string
+    assistant_message_id?: string
+    mode:
+      | "stateless_answer"
+      | "informational_answer"
+      | "read_only_answer"
+      | "engineering_verification"
+      | "high_risk_governance"
+    status: "candidate" | "accepted" | "needs_internal_revision" | "blocked"
+    public_answer_emitted: boolean
+    internal_review_allowed: boolean
+    council_allowed: boolean
+    public_followup_allowed: boolean
+    accepted_reason?: string
+    evidence_refs: string[]
+    updated_at: string
+  }
   /** Session-level role model overrides: role name → { primary, fallback, enabled } */
   role_model_overrides?: Record<string, { primary: string; fallback?: string[]; enabled?: boolean }>
   /** 最后更新时间 */
@@ -182,7 +216,7 @@ export interface SupervisorMetricsSnapshot {
   high_risk_task_signal?: boolean
   /** Live smoke P0: short explicit no-tool answer task */
   trivial_no_tool_task?: boolean
-  /** Live smoke P0: stateless greeting such as "你好" */
+  /** Live smoke P0: stateless greeting category */
   stateless_greeting_task?: boolean
   /** Live smoke P0: stateless short chat that should not trigger reviewers */
   stateless_chat_task?: boolean

@@ -148,7 +148,8 @@ export function DllAgentSessionPanel(props: { sessionID?: string; variant?: "bot
   const sidebar = createMemo(() => props.variant === "sidebar")
   const compact = createMemo(() => sidebar() || dimensions().width < 106)
   const narrow = createMemo(() => sidebar() || dimensions().width < 120)
-  const sessionID = createMemo(() => process.env.DLL_AGENT_SESSION_ID || props.sessionID)
+  const sessionID = createMemo(() => props.sessionID || process.env.DLL_AGENT_SESSION_ID)
+  const uiSessionID = createMemo(() => props.sessionID || process.env.DLL_AGENT_SESSION_ID)
   const session = createMemo(() => {
     const sid = sessionID()
     if (!sid) return "session: active"
@@ -160,29 +161,59 @@ export function DllAgentSessionPanel(props: { sessionID?: string; variant?: "bot
   const commander = createMemo(() => roleModel("commander", sessionID(), projectDir()))
 
   // Supervisor state signal
-  const [supervisor, setSupervisor] = createSignal(readSupervisorState())
-  const [costStatus, setCostStatus] = createSignal(readCostStatus())
+  const [supervisor, setSupervisor] = createSignal(readSupervisorState(sessionID()))
+  const [costStatus, setCostStatus] = createSignal(readCostStatus(sessionID()))
   const [quota, setQuota] = createSignal(readQuotaFile())
   const [taskStatus, setTaskStatus] = createSignal(readTaskObservabilityStatus(projectDir(), sessionID()))
   const [capabilityStatus, setCapabilityStatus] = createSignal(readCapabilityPanelStatus(projectDir()))
   const [commandActivity, setCommandActivity] = createSignal(buildCommandActivity({ sessionID: sessionID(), maxEvents: 30 }))
   const [commandExpanded, setCommandExpanded] = createSignal(false)
   const [commandOffset, setCommandOffset] = createSignal(0)
+  const sessionTodos = createMemo(() => {
+    const sid = uiSessionID()
+    return sid ? sync.data.todo[sid] ?? [] : []
+  })
+  const sessionDiff = createMemo(() => {
+    const sid = uiSessionID()
+    return sid ? sync.data.session_diff[sid] ?? [] : []
+  })
+  const toolActivitySummary = createMemo(() => {
+    const sid = uiSessionID()
+    const messages = sid ? sync.data.message[sid] ?? [] : []
+    return buildToolActivitySummary({
+      parts: messages.flatMap((message) => sync.data.part[message.id] ?? []),
+      evidenceRef: sid ? `session:${Locale.truncateMiddle(sid, 18)}` : "session tool parts",
+    })
+  })
+  const panelActivity = createMemo(() => {
+    const todos = sessionTodos()
+    const diff = sessionDiff()
+    return {
+      todos_total: todos.length,
+      todos_in_progress: todos.filter((item) => item.status === "in_progress").length,
+      todos_pending: todos.filter((item) => item.status === "pending").length,
+      todos_completed: todos.filter((item) => item.status === "completed").length,
+      modified_files: diff.length,
+      additions: diff.reduce((sum, item) => sum + (item.additions ?? 0), 0),
+      deletions: diff.reduce((sum, item) => sum + (item.deletions ?? 0), 0),
+      tool_summary: toolActivitySummary(),
+    }
+  })
 
   onMount(() => {
     let lastUpdated = ""
     const cleanup = idleAwareInterval(
       () => {
-        const sv = readSupervisorState()
+        const sv = readSupervisorState(sessionID())
         setSupervisor(sv)
-        setCostStatus(readCostStatus())
+        setCostStatus(readCostStatus(sessionID()))
         setQuota(readQuotaFile())
         setTaskStatus(readTaskObservabilityStatus(projectDir(), sessionID()))
         setCapabilityStatus(readCapabilityPanelStatus(projectDir()))
         setCommandActivity(buildCommandActivity({ sessionID: sessionID(), maxEvents: 30 }))
         lastUpdated = sv?.updated_at ?? ""
       },
-      10_000, // active: 10s
+      2_000, // active: intent preflight should be visible instead of silent
       30_000, // idle: 30s
       () => isIdleBySupervisorState(lastUpdated, 60_000),
     )
@@ -223,18 +254,11 @@ export function DllAgentSessionPanel(props: { sessionID?: string; variant?: "bot
       capability: capabilityStatus(),
       cost: costStatus(),
       quota: quota(),
+      activity: panelActivity(),
       width: contentWidth(),
       compact: compact(),
     }),
   )
-  const toolActivitySummary = createMemo(() => {
-    const sid = sessionID()
-    const messages = sid ? sync.data.message[sid] ?? [] : []
-    return buildToolActivitySummary({
-      parts: messages.flatMap((message) => sync.data.part[message.id] ?? []),
-      evidenceRef: sid ? `session:${Locale.truncateMiddle(sid, 18)}` : "session tool parts",
-    })
-  })
   const miniCommandLines = createMemo(() =>
     buildCommandActivityMiniLines({
       events: commandActivity(),

@@ -20,7 +20,7 @@
  */
 
 import type { CapabilityEntry, CapabilityRiskLevel, CapabilityCostLevel } from "./capability-schema"
-import { filterRegistry, findByCapability } from "./capability-registry"
+import { findByCapability } from "./capability-registry"
 
 // ─── Task Analysis Input ────────────────────────────────────────────────────────
 
@@ -48,6 +48,8 @@ export interface CapabilityPlan {
   selected: MatchedCapability[]
   /** Alternatives that could serve the same need */
   alternatives: MatchedCapability[]
+  /** Ordered multi-capability workflow, when more than one role is useful */
+  workflow: CapabilityWorkflowStep[]
   /** Capabilities that are needed but unavailable */
   gaps: CapabilityGap[]
   /** Suggested auto-install actions */
@@ -64,6 +66,14 @@ export interface MatchedCapability {
   reason: string
   /** Whether it's immediately usable */
   ready: boolean
+}
+
+export interface CapabilityWorkflowStep {
+  phase: "primary" | "support" | "validation" | "fallback"
+  entry_id: string
+  kind: CapabilityEntry["kind"]
+  reason: string
+  required: boolean
 }
 
 export interface CapabilityGap {
@@ -96,12 +106,6 @@ interface TagRule {
 }
 
 const TAG_RULES: TagRule[] = [
-  // Document processing
-  { tag: "docx-read", patterns: [/\.docx?\b|word.*文档|docx/i], file_extensions: [".docx", ".doc"], description: "Word document processing needed" },
-  { tag: "pdf-read", patterns: [/\.pdf\b|pdf/i], file_extensions: [".pdf"], description: "PDF document processing needed" },
-  { tag: "pptx-read", patterns: [/\.pptx?\b|ppt|幻灯片|演示文稿|presentation/i], file_extensions: [".pptx", ".ppt"], description: "PowerPoint processing needed" },
-  { tag: "xlsx-read", patterns: [/\.xlsx?\b|excel|表格|spreadsheet|\.csv\b/i], file_extensions: [".xlsx", ".xls", ".csv"], description: "Spreadsheet processing needed" },
-
   // Automation & Testing
   { tag: "browser-automation", patterns: [/browser|浏览器|playwright|puppeteer|e2e|端到端.*测试|截图.*验证|页面.*交互|点击流|前端审查|ui.*audit|console.*audit|network.*inspect/i], file_extensions: [".spec.ts", ".e2e.ts"], description: "Browser automation needed" },
   { tag: "typecheck", patterns: [/typecheck|类型检查|tsgo|noEmit|type.*check/i], file_extensions: [".ts", ".tsx"], description: "Type checking needed" },
@@ -143,6 +147,7 @@ function analyzeTask(
 ): { tags: string[]; reasons: Map<string, string> } {
   const tags = new Set<string>()
   const reasons = new Map<string, string>()
+  const registryMatchedExtensions = new Set<string>()
 
   // Phase 1: Semantic TAG_RULES
   for (const rule of TAG_RULES) {
@@ -212,6 +217,7 @@ function analyzeTask(
       for (const ext of fileExtensions) {
         const normalExt = ext.startsWith(".") ? ext : `.${ext}`
         if (trigger.file_extensions.includes(normalExt)) {
+          registryMatchedExtensions.add(normalExt)
           for (const cap of entry.capabilities) {
             if (!tags.has(cap)) {
               tags.add(cap)
@@ -221,6 +227,19 @@ function analyzeTask(
         }
       }
     }
+  }
+
+  // If a concrete file type is present but no registered capability declares
+  // support for it, create a generic capability gap from the extension itself.
+  // This keeps unknown future artifacts visible without listing every file type
+  // in source code.
+  for (const ext of fileExtensions ?? []) {
+    const normalExt = ext.startsWith(".") ? ext.toLowerCase() : `.${ext.toLowerCase()}`
+    if (registryMatchedExtensions.has(normalExt)) continue
+    const tag = `${normalExt.slice(1)}-read`
+    if (tags.has(tag)) continue
+    tags.add(tag)
+    reasons.set(tag, `File type ${normalExt} detected without a registered matching capability`)
   }
 
   return { tags: [...tags], reasons }
@@ -254,6 +273,109 @@ function scoreCapability(entry: CapabilityEntry, requiredTags: string[]): number
   if (entry.platforms.includes("any") || entry.platforms.includes(process.platform as any)) score += 5
 
   return Math.min(score, 100)
+}
+
+const PLAIN_OUTPUT_TYPES = new Set(["text", "json", "diagnostic", "diagnostics", "evidence", "review-output"])
+const VALIDATION_CAPABILITY_TOKENS = [
+  "verify",
+  "verification",
+  "validate",
+  "validation",
+  "audit",
+  "inspect",
+  "check",
+  "consistency",
+  "render",
+  "preview",
+]
+
+function isArtifactCapability(entry: CapabilityEntry): boolean {
+  const consumesFile = entry.input_types.some((item) => item === "file-path" || item.startsWith("."))
+  const producesArtifact = entry.output_types.some((item) => !PLAIN_OUTPUT_TYPES.has(item.toLowerCase()))
+  return consumesFile || producesArtifact
+}
+
+function isValidationCapability(entry: CapabilityEntry): boolean {
+  return !!entry.verify_commands?.length
+    || entry.capabilities.some((item) => {
+      const normalized = item.toLowerCase()
+      return VALIDATION_CAPABILITY_TOKENS.some((token) => normalized.includes(token))
+    })
+}
+
+function consumesSelectedOutput(entry: CapabilityEntry, selected: MatchedCapability[]): boolean {
+  const inputs = new Set(entry.input_types.map((item) => item.toLowerCase()))
+  return selected.some((match) =>
+    match.entry.id !== entry.id
+    && match.entry.output_types.some((item) => inputs.has(item.toLowerCase())),
+  )
+}
+
+function buildWorkflow(
+  selected: MatchedCapability[],
+  alternatives: MatchedCapability[],
+  gaps: CapabilityGap[],
+): CapabilityWorkflowStep[] {
+  const steps: CapabilityWorkflowStep[] = []
+  for (const match of selected) {
+    steps.push({
+      phase: "primary",
+      entry_id: match.entry.id,
+      kind: match.entry.kind,
+      reason: match.reason,
+      required: true,
+    })
+
+    if (isArtifactCapability(match.entry)) {
+      steps.push({
+        phase: "support",
+        entry_id: match.entry.id,
+        kind: match.entry.kind,
+        reason: "artifact capability may need extraction, transformation, and output generation steps",
+        required: false,
+      })
+    }
+
+    if (isValidationCapability(match.entry) || consumesSelectedOutput(match.entry, selected) || isArtifactCapability(match.entry)) {
+      steps.push({
+        phase: "validation",
+        entry_id: match.entry.id,
+        kind: match.entry.kind,
+        reason: match.entry.verify_commands?.length
+          ? "capability declares verification commands"
+          : "artifact output should be validated before final response",
+        required: false,
+      })
+    }
+  }
+
+  for (const match of alternatives) {
+    steps.push({
+      phase: "fallback",
+      entry_id: match.entry.id,
+      kind: match.entry.kind,
+      reason: `alternative capability: ${match.reason}`,
+      required: false,
+    })
+  }
+
+  for (const gap of gaps) {
+    steps.push({
+      phase: "fallback",
+      entry_id: `capability-gap:${gap.tag}`,
+      kind: "tool",
+      reason: gap.requirement,
+      required: true,
+    })
+  }
+
+  const seen = new Set<string>()
+  return steps.filter((step) => {
+    const key = `${step.phase}:${step.entry_id}:${step.reason}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 // ─── Main Planning Function ─────────────────────────────────────────────────────
@@ -323,7 +445,7 @@ export function planCapabilities(
   const installSuggestions: InstallSuggestion[] = []
   for (const m of selected) {
     if (!m.ready) {
-      const action = m.entry.install_strategy === "none" ? "degrade"
+      const action = m.entry.install_strategy === "none" ? "ask_permission"
         : m.entry.risk_level === "high" ? "ask_permission"
         : m.entry.install_strategy === "system_package_manager" ? "ask_permission"
         : "auto_install"
@@ -344,11 +466,13 @@ export function planCapabilities(
     `Found ${gaps.length} capability gaps`,
     `Generated ${installSuggestions.length} install suggestions`,
   ].join("; ")
+  const workflow = buildWorkflow(selected, alternatives, gaps)
 
   return {
     required_tags: tags,
     selected,
     alternatives,
+    workflow,
     gaps,
     install_suggestions: installSuggestions,
     rationale,

@@ -120,6 +120,12 @@ the panel displays `待命` / `普通对话/待命` / `计划：未建立` inste
 engineering completion states such as `UNVERIFIED_PARTIAL`. Detailed state is
 still available through `/task-status`.
 
+For accepted L0/L1/L2 answer-only requests, the panel can show an answer
+delivery line such as `答案：已接受｜只读分析｜公开输出已锁定`. This is read from
+`answer_delivery`; it is not inferred from prose. The line tells the user that
+the public answer has already been delivered and that internal recovery/reviewer
+text should not continue producing duplicate summaries for the same request.
+
 The command activity mini window is a read-only view over evidence, task trajectory, and Result Ledger command refs. It defaults to compact mode with the latest 3-5 command/tool summaries. Mouse click expands it; `Esc` collapses it. Expanded mode supports scrolling recent command rows and still hides long output and secret values.
 
 Theme policy:

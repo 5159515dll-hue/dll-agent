@@ -52,9 +52,21 @@ import { checkCrossReviewTrigger } from "@/dll-agent/cross-review-bridge"
 import { metrics as computeTriggerMetrics, messageText, isTrivialNoToolPromptText, isStatelessChatPromptText } from "@/dll-agent/triggers"
 import {
   canSuppressRoutineReview,
+  canUseAnswerOnlyFinalization,
   canUseReadOnlyAnswerFinalization,
   classifyTaskIntake,
 } from "@/dll-agent/task-intake-classifier"
+import {
+  acceptAnswerOnly,
+  acceptPublicResponse,
+  answerAlreadyAcceptedForUser,
+  answerModeFromClassification,
+  buildToolUseSummary,
+  canAcceptAnswerOnly,
+  currentAnswerClassification,
+  publicAnswerClosedForUser,
+  shouldSuppressSyntheticContinuation,
+} from "@/dll-agent/answer-delivery"
 import { activate as activateSkills, loadActive as loadActiveSkills, persist as persistSkills } from "@/dll-agent/skills"
 import type { SkillSignal } from "@/dll-agent/skill-registry"
 import { write as evidenceWrite } from "@/dll-agent/evidence"
@@ -103,7 +115,7 @@ import {
   type ModelIntentJudgement,
 } from "@/dll-agent/intent-consensus"
 import { hasNonTextInput as hasRoutingNonTextInput } from "@/dll-agent/routing-policy"
-import { drainSupervisorDispatchBatch, planReviewerDispatchGroups } from "@/dll-agent/reviewer-dispatch"
+import { drainSupervisorDispatchBatch, isSupervisorSubtask, planReviewerDispatchGroups } from "@/dll-agent/reviewer-dispatch"
 import type { ReviewerRole } from "@/dll-agent/interfaces"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
@@ -147,6 +159,22 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 
 const log = Log.create({ service: "session.prompt" })
 const elog = EffectLogger.create({ service: "session.prompt" })
+
+function isSyntheticUserMessage(message: MessageV2.WithParts | undefined) {
+  return Boolean(
+    message?.info.role === "user" &&
+    message.parts.length > 0 &&
+    message.parts.every((part) => "synthetic" in part && part.synthetic),
+  )
+}
+
+function isUserOriginMessage(message: MessageV2.WithParts | undefined): message is MessageV2.WithParts {
+  return Boolean(message?.info.role === "user" && !isSyntheticUserMessage(message))
+}
+
+function latestUserOriginMessage(messages: MessageV2.WithParts[]) {
+  return messages.findLast(isUserOriginMessage)
+}
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
@@ -814,6 +842,26 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
 
       if (!task.command) return
+
+      if (profileEnabled() && !session.parentID) {
+        const originMsg = latestUserOriginMessage(msgs)
+        const originUser = originMsg?.info.role === "user" ? originMsg.info : lastUser
+        const state = supervisorLoadState(sessionID)
+        if (shouldSuppressSyntheticContinuation(state, originUser.id)) {
+          try {
+            setQueuedReviewers(sessionID, [])
+            setRunningReviewers(sessionID, [])
+          } catch {}
+          evidenceWrite("answer.synthetic_continuation_suppressed", {
+            user_message_id: originUser.id,
+            subtask_agent: task.agent,
+            subtask_command: task.command,
+            answer_status: state.answer_delivery?.status ?? "unknown",
+            reason: "public response already closed; subtask output must not create another user-visible summary",
+          }, sessionID)
+          return result?.output
+        }
+      }
 
       const summaryUserMsg: MessageV2.User = {
         id: MessageID.ascending(),
@@ -1512,6 +1560,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       messages: MessageV2.WithParts[]
       lastUser: MessageV2.User
       session: Session.Info
+      mode?: "full" | "record_only"
     }) {
       if (!profileEnabled()) return
       if (input.session.parentID) return
@@ -1520,6 +1569,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       if (!userMessage) return
       const state = supervisorLoadState(input.sessionID)
       if (state.intent_judgement?.message_id === input.lastUser.id) return
+      if (
+        state.intent_judgement_status?.message_id === input.lastUser.id &&
+        state.intent_judgement_status.status !== "failed"
+      ) return
       const runtimeCtx = yield* InstanceState.context
       const userText = messageText(userMessage).trim()
       const deterministic = classifyTaskIntake({
@@ -1533,9 +1586,52 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         projectDir: runtimeCtx.worktree,
       })
 
+      const writeIntentStatus = (status: {
+        status: "single_model_running" | "multi_model_running" | "completed" | "failed"
+        action: ReturnType<typeof buildIntentJudgementPlan>["action"]
+        model?: string
+        participants?: string[]
+        reason: string
+      }) => {
+        const next = supervisorLoadState(input.sessionID)
+        const previous = next.intent_judgement_status
+        const now = new Date().toISOString()
+        next.intent_judgement_status = {
+          message_id: input.lastUser.id,
+          status: status.status,
+          action: status.action,
+          model: status.model,
+          participants: status.participants,
+          reason: status.reason,
+          started_at: previous?.message_id === input.lastUser.id ? previous.started_at : now,
+          updated_at: now,
+        }
+        next.updated_at = now
+        supervisorSaveState(input.sessionID, next)
+        evidenceWrite("intent.judgement_status", {
+          message_id: input.lastUser.id,
+          status: status.status,
+          action: status.action,
+          model: status.model ?? null,
+          participants: status.participants ?? [],
+          reason: status.reason,
+        }, input.sessionID)
+      }
+
       const saveRecord = (record: NonNullable<typeof state.intent_judgement>) => {
         const next = supervisorLoadState(input.sessionID)
         next.intent_judgement = record
+        const previous = next.intent_judgement_status
+        next.intent_judgement_status = {
+          message_id: record.message_id,
+          status: "completed",
+          action: record.plan_action,
+          model: record.model,
+          participants: record.participants,
+          reason: record.reason,
+          started_at: previous?.message_id === record.message_id ? previous.started_at : record.created_at,
+          updated_at: new Date().toISOString(),
+        }
         next.updated_at = new Date().toISOString()
         supervisorSaveState(input.sessionID, next)
         evidenceWrite("intent.judgement", {
@@ -1556,6 +1652,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           },
           reason: record.reason,
         }, input.sessionID)
+      }
+
+      if (input.mode === "record_only") {
+        saveRecord({
+          message_id: input.lastUser.id,
+          source: plan.action === "hard_safety" ? "hard_safety" : "deterministic",
+          plan_action: plan.action,
+          participants: plan.consensus?.participants.map((p) => p.model) ?? [],
+          excluded_models: plan.consensus?.excluded ?? [],
+          classification: deterministic,
+          raw_confidence: deterministic.confidence,
+          reason: `${plan.reason}; deterministic intake recorded after commander execution already started`,
+          created_at: new Date().toISOString(),
+        })
+        return
       }
 
       if (plan.action === "deterministic_accept" || plan.action === "hard_safety" || !plan.primary) {
@@ -1603,6 +1714,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         return { participant, judgement: parseModelIntentJudgement(raw), raw }
       })
 
+      writeIntentStatus({
+        status: "single_model_running",
+        action: plan.action,
+        model: plan.primary.model,
+        participants: [plan.primary.model],
+        reason: plan.reason,
+      })
       const first = yield* judgeWithModel(plan.primary)
       if (first.judgement && first.judgement.confidence !== "low") {
         saveRecord({
@@ -1625,6 +1743,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
 
       const participants = plan.consensus?.participants.length ? plan.consensus.participants : [plan.primary]
+      writeIntentStatus({
+        status: "multi_model_running",
+        action: "multi_model_consensus",
+        model: first.participant.model,
+        participants: participants.map((participant) => participant.model),
+        reason: "single-model intent judgement was low confidence; running non-OpenAI model consensus",
+      })
       const all = yield* Effect.forEach(
         participants,
         (participant) => judgeWithModel(participant),
@@ -1752,6 +1877,38 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         }
 
         if (input.noReply === true) return message
+        if (profileEnabled() && !session.parentID && message.info.role === "user" && message.info.agent === "commander") {
+          try {
+            const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID)
+            yield* runIntentPreflight({
+              sessionID: input.sessionID,
+              messages: msgs.length ? msgs : [message],
+              lastUser: message.info,
+              session,
+            })
+          } catch (intentErr) {
+            yield* elog.error("intent preflight error before loop", { error: String(intentErr) })
+            const failedState = supervisorLoadState(input.sessionID)
+            const previous = failedState.intent_judgement_status
+            const now = new Date().toISOString()
+            failedState.intent_judgement_status = {
+              message_id: message.info.id,
+              status: "failed",
+              action: previous?.message_id === message.info.id ? previous.action : "single_model_judge",
+              model: previous?.message_id === message.info.id ? previous.model : undefined,
+              participants: previous?.message_id === message.info.id ? previous.participants : [],
+              reason: String(intentErr),
+              started_at: previous?.message_id === message.info.id ? previous.started_at : now,
+              updated_at: now,
+            }
+            failedState.updated_at = now
+            supervisorSaveState(input.sessionID, failedState)
+            evidenceWrite("intent.judgement_failed", {
+              message_id: message.info.id,
+              reason: String(intentErr),
+            }, input.sessionID)
+          }
+        }
         return yield* loop({ sessionID: input.sessionID })
       },
     )
@@ -1808,12 +1965,43 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          const lastUserMsg = msgs.find((msg) => msg.info.id === lastUser.id)
+          const lastUserOriginMsg = latestUserOriginMessage(msgs)
+          const lastUserForDllAgent = lastUserOriginMsg?.info.role === "user" ? lastUserOriginMsg.info : lastUser
+          const latestUserIsSynthetic = isSyntheticUserMessage(lastUserMsg)
+
+          if (profileEnabled() && !session.parentID && lastUserForDllAgent.agent === "commander") {
+            const state = supervisorLoadState(sessionID)
+            if (
+              publicAnswerClosedForUser(state, lastUserForDllAgent.id) ||
+              answerAlreadyAcceptedForUser(state, lastUserForDllAgent.id)
+            ) {
+              const suppressed = tasks.filter(isSupervisorSubtask)
+              const pendingSuppressed = supervisorPendingSubtasks.splice(0)
+              const suppressedHintCount = gatePendingHints.splice(0).length
+              if (suppressed.length > 0 || pendingSuppressed.length > 0 || suppressedHintCount > 0) {
+                tasks = tasks.filter((task) => !isSupervisorSubtask(task))
+                try {
+                  setQueuedReviewers(sessionID, [])
+                  setRunningReviewers(sessionID, [])
+                } catch {}
+                evidenceWrite("answer.public_suppressed", {
+                  user_message_id: lastUserForDllAgent.id,
+                  synthetic_message_id: latestUserIsSynthetic ? lastUser.id : null,
+                  suppressed_subtasks: [...suppressed, ...pendingSuppressed].map((task) => task.agent),
+                  suppressed_gate_hints: suppressedHintCount,
+                  reason: "public response already closed for the real user-origin task; synthetic continuation must not repeat the answer",
+                }, sessionID)
+              }
+              if (tasks.length === 0 && gatePendingHints.length === 0 && supervisorPendingSubtasks.length === 0) break
+            }
+          }
 
           if (
             profileEnabled() &&
             !session.parentID &&
             lastFinished &&
-            lastFinished.parentID === lastUser.id &&
+            lastFinished.parentID === lastUserForDllAgent.id &&
             lastFinished.finish &&
             !["tool-calls", "unknown"].includes(lastFinished.finish) &&
             tasks.length === 0 &&
@@ -1822,8 +2010,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           ) {
             const metrics = computeTriggerMetrics(msgs)
             const state = supervisorLoadState(sessionID)
-            const lastUserMsg = msgs.find((msg) => msg.info.id === lastUser.id)
-            const promptText = messageText(lastUserMsg)
+            const promptText = messageText(lastUserOriginMsg)
             const classification = classifyTaskIntake({ userText: promptText })
             const explicitNoToolPrompt =
               isTrivialNoToolPromptText(promptText) ||
@@ -1880,18 +2067,46 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
           })
 
-          if (profileEnabled() && !session.parentID && lastUser.agent === "commander") {
+          if (profileEnabled() && !session.parentID && lastUserForDllAgent.agent === "commander") {
             try {
+              const state = supervisorLoadState(sessionID)
+              const alreadyRecorded =
+                state.intent_judgement?.message_id === lastUserForDllAgent.id ||
+                (
+                  state.intent_judgement_status?.message_id === lastUserForDllAgent.id &&
+                  state.intent_judgement_status.status !== "failed"
+                )
               const alreadyAnswered = msgs.some((message) =>
-                message.info.role === "assistant" && message.info.parentID === lastUser.id
+                message.info.role === "assistant" && message.info.parentID === lastUserForDllAgent.id
               )
-              if (!alreadyAnswered) {
-                yield* runIntentPreflight({ sessionID, messages: msgs, lastUser, session })
+              if (!latestUserIsSynthetic && !alreadyRecorded) {
+                yield* runIntentPreflight({
+                  sessionID,
+                  messages: msgs,
+                  lastUser: lastUserForDllAgent,
+                  session,
+                  mode: alreadyAnswered ? "record_only" : "full",
+                })
               }
             } catch (intentErr) {
               yield* slog.error("intent preflight error", { error: String(intentErr) })
+              const failedState = supervisorLoadState(sessionID)
+              const previous = failedState.intent_judgement_status
+              const now = new Date().toISOString()
+              failedState.intent_judgement_status = {
+                message_id: lastUserForDllAgent.id,
+                status: "failed",
+                action: previous?.message_id === lastUserForDllAgent.id ? previous.action : "single_model_judge",
+                model: previous?.message_id === lastUserForDllAgent.id ? previous.model : undefined,
+                participants: previous?.message_id === lastUserForDllAgent.id ? previous.participants : [],
+                reason: String(intentErr),
+                started_at: previous?.message_id === lastUserForDllAgent.id ? previous.started_at : now,
+                updated_at: now,
+              }
+              failedState.updated_at = now
+              supervisorSaveState(sessionID, failedState)
               evidenceWrite("intent.judgement_failed", {
-                message_id: lastUser.id,
+                message_id: lastUserForDllAgent.id,
                 error: String(intentErr),
               }, sessionID)
             }
@@ -1929,13 +2144,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               // produce a concrete automatic recovery action instead of stopping.
               try {
                 const taskGoal = messageText(
-                  msgs.find((msg) => msg.info.id === lastUser.id) ??
-                    msgs.findLast((msg) => msg.info.role === "user") ??
+                  lastUserOriginMsg ??
                     msgs[msgs.length - 1],
                 ).slice(0, 500)
-                const failure = extractLatestFailure(msgs, {
-                  ignoreReadOnlyToolFailures: canUseReadOnlyAnswerFinalization(classifyTaskIntake({ userText: taskGoal })),
+                const fallbackClassification = classifyTaskIntake({ userText: taskGoal })
+                const answerClassification = currentAnswerClassification({
+                  state: updatedState,
+                  userMessageId: lastUserForDllAgent.id,
+                  fallback: fallbackClassification,
                 })
+                const answerOnly = canUseAnswerOnlyFinalization(answerClassification)
+                const toolUse = buildToolUseSummary(msgs)
+                const failure = answerOnly && toolUse.writeOrCommandTools === 0 && toolUse.mcpTools === 0 && toolUse.blockingFailures === 0
+                  ? null
+                  : extractLatestFailure(msgs, {
+                    ignoreReadOnlyToolFailures: answerOnly || canUseReadOnlyAnswerFinalization(fallbackClassification),
+                  })
                 if (failure) {
                   updatedState.repair_counts ??= {}
                   updatedState.recovery_phase_counts ??= {}
@@ -1997,16 +2221,61 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 yield* slog.error("autonomous recovery loop error", { error: String(recoveryErr) })
               }
 
+              try {
+                const taskGoal = messageText(
+                  lastUserOriginMsg ??
+                    msgs[msgs.length - 1],
+                ).slice(0, 500)
+                const answerClassification = currentAnswerClassification({
+                  state: updatedState,
+                  userMessageId: lastUserForDllAgent.id,
+                  fallback: classifyTaskIntake({ userText: taskGoal }),
+                })
+                const toolUse = buildToolUseSummary(msgs)
+                const answerOnlySafe =
+                  canUseAnswerOnlyFinalization(answerClassification) &&
+                  !decision.metrics.reviewer_conflict_signal &&
+                  !decision.metrics.high_risk_task_signal &&
+                  !decision.metrics.multimodal_signal &&
+                  !decision.metrics.scope_expanded_signal &&
+                  !decision.metrics.phase_switch_signal &&
+                  decision.metrics.permission_denied === 0 &&
+                  decision.metrics.user_corrections === 0 &&
+                  toolUse.writeOrCommandTools === 0 &&
+                  toolUse.mcpTools === 0 &&
+                  toolUse.blockingFailures === 0
+                if (answerOnlySafe && (decision.reviewers.length > 0 || decision.verifierTask)) {
+                  evidenceWrite("answer.public_suppressed", {
+                    user_message_id: lastUserForDllAgent.id,
+                    suppressed_reviewers: decision.reviewers,
+                    suppressed_verifier: Boolean(decision.verifierTask),
+                    mode: answerClassification.finalization_policy,
+                    reason: "answer-only task suppresses reviewer/verifier dispatch without disabling correctness-required L3/L4 flows",
+                  }, sessionID)
+                  decision.reviewers.splice(0)
+                  decision.reasons = {} as Record<ReviewerRole, string>
+                  decision.fingerprints = {}
+                  decision.verifierTask = undefined
+                  decision.should_review = false
+                  updatedState.required_reviews = []
+                  updatedState.queued_reviewers = []
+                  updatedState.running_reviewers = []
+                  updatedState.blocked_completion = false
+                  updatedState.block_reason = null
+                  updatedState.reviewer_conflict = false
+                  updatedState.updated_at = new Date().toISOString()
+                  supervisorSaveState(sessionID, updatedState)
+                }
+              } catch (answerOnlyErr) {
+                yield* slog.error("answer-only suppression error", { error: String(answerOnlyErr) })
+              }
+
               // 2a. Capability orchestration — bridge the declarative capability
               // registry into the live session loop. This is intentionally before
               // skill activation and before tool resolution so selected skills/MCPs
               // can affect the next model call.
               try {
-                const recentUserText = msgs
-                  .slice(-5)
-                  .filter((m) => m.info.role === "user")
-                  .map((m) => messageText(m))
-                  .join("\n")
+                const recentUserText = lastUserOriginMsg ? messageText(lastUserOriginMsg) : ""
                 const filesInvolved: string[] = []
                 for (const m of msgs.slice(-24)) {
                   for (const p of m.parts) {
@@ -2020,7 +2289,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   sessionID,
                   projectDir: ctx.directory,
                   userGoal: recentUserText,
-                  messageID: lastUser.id,
+                  messageID: lastUserForDllAgent.id,
                   filesInvolved,
                   failureType: decision.metrics.repeated_tool_failure ? "repeated_tool_failure" : undefined,
                   allowMcpAutoConnect: true,
@@ -2041,11 +2310,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
               // 2b. Skill 激活（按需，最多 3 个）— 持久化供 bash tool 拦截 forbiddenCommands
               try {
-                const recentUserText = msgs
-                  .slice(-5)
-                  .filter((m) => m.info.role === "user")
-                  .map((m) => messageText(m))
-                  .join("\n")
+                const recentUserText = lastUserOriginMsg ? messageText(lastUserOriginMsg) : ""
                 const editedFiles: string[] = []
                 for (const m of msgs.slice(-12)) {
                   for (const p of m.parts) {
@@ -2084,7 +2349,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
               // 2c. Cross-review council check — 多模型对抗审查触发
               try {
-                const lastUserMsg = [...msgs].reverse().find((m) => m.info.role === "user")
                 // Phase 6: Compute real recoveryAttempts and scopeExpanded from supervisor state
                 const recoveryAttempts = updatedState.continuation_count ?? 0
                 // Scope expansion: compare file paths in recent tool calls against initial task scope
@@ -2112,7 +2376,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   scopeExpanded,
                   recoveryAttempts,
                   sessionId: sessionID,
-                  userGoal: lastUserMsg ? messageText(lastUserMsg).slice(0, 500) : "",
+                  userGoal: lastUserOriginMsg ? messageText(lastUserOriginMsg).slice(0, 500) : "",
                   filesChanged: [...editedFilePaths].slice(0, 10),
                 })
                 if (council.shouldConvene && council.reviewers.length > 0) {
@@ -2150,7 +2414,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     step + 1,
                     decision.fingerprints?.[reviewer],
                     decision.reasons[reviewer],
-                    lastUser.id,
+                    lastUserForDllAgent.id,
                   )
                   supervisorPendingSubtasks.push(sub)
                 }
@@ -2207,11 +2471,41 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }).state
                 const metrics = computeTriggerMetrics(msgs)
                 const lastAssistantText = messageText(lastAssistantMsg)
-                const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
+                const lastUserMsgForGoal = latestUserOriginMessage(msgs)
                 const currentTaskGoal = lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : ""
 
                 const costCheck = checkCostCap(sessionID, msgs)
                 let dedupHardBlock: { reason: string; hint: string | null; packetId?: string } | null = null
+                const answerClassification = currentAnswerClassification({
+                  state,
+                  userMessageId: lastUserForDllAgent.id,
+                  fallback: classifyTaskIntake({ userText: currentTaskGoal }),
+                })
+                if (canAcceptAnswerOnly({
+                  classification: answerClassification,
+                  metrics,
+                  state,
+                  messages: msgs,
+                })) {
+                  const accepted = acceptAnswerOnly({
+                    state,
+                    userMessageId: lastUserForDllAgent.id,
+                    assistantMessageId: lastAssistant?.id,
+                    classification: answerClassification,
+                    evidenceRefs: [`assistant:${lastAssistant?.id ?? "unknown"}`],
+                    reason: "answer-only task accepted: no writes, no MCP, no command failure, no high-risk or correction state",
+                  })
+                  supervisorSaveState(sessionID, accepted)
+                  evidenceWrite("answer.accepted", {
+                    user_message_id: lastUserForDllAgent.id,
+                    assistant_message_id: lastAssistant?.id ?? null,
+                    mode: accepted.answer_delivery?.mode,
+                    public_answer_emitted: true,
+                    tool_summary: buildToolUseSummary(msgs),
+                    reason: accepted.answer_delivery?.accepted_reason,
+                  }, sessionID)
+                  break
+                }
 
                 // Phase 4 — Deduplication Gate: block redundant result re-dispatch when a verified
                 // reusable ResultPacket already covers the current task.
@@ -2362,10 +2656,21 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                       block_reason: blockReason,
                       retries: state.gate_block_retries?.[blockReason],
                     })
+                    const closed = acceptPublicResponse({
+                      state,
+                      userMessageId: lastUserForDllAgent.id,
+                      assistantMessageId: lastAssistant?.id,
+                      mode: answerModeFromClassification(answerClassification),
+                      status: "blocked",
+                      evidenceRefs: [`assistant:${lastAssistant?.id ?? "unknown"}`],
+                      reason: "final gates exhausted retry budget; public blocked/partial response already emitted",
+                    })
+                    supervisorSaveState(sessionID, closed)
                     gatePendingHints.push(buildGateBlockSummary(blockReason, gateResult, state, true))
                     evidenceWrite("gate.retry_exhausted", {
                       block_reason: blockReason,
                       retries: state.gate_block_retries?.[blockReason],
+                      user_message_id: lastUserForDllAgent.id,
                     }, sessionID)
                     break
                   } else {
@@ -2430,6 +2735,18 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                   // Don't break — let commander continue and process the gate hint
                   }
                 } else {
+                  const closed = acceptPublicResponse({
+                    state,
+                    userMessageId: lastUserForDllAgent.id,
+                    assistantMessageId: lastAssistant?.id,
+                    mode: answerModeFromClassification(answerClassification),
+                    status: "accepted",
+                    evidenceRefs: [`assistant:${lastAssistant?.id ?? "unknown"}`],
+                    reason: "public response delivered after final runtime gates allowed loop exit",
+                    internalReviewAllowed: answerClassification.interaction_level === "L3" || answerClassification.interaction_level === "L4",
+                    councilAllowed: answerClassification.interaction_level === "L4",
+                  })
+                  supervisorSaveState(sessionID, closed)
                   yield* slog.info("exiting loop")
                   break
                 }
@@ -2895,8 +3212,7 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
             if (profileEnabled() && !session.parentID && result !== "compact" && handle.message.finish !== "tool-calls") {
               const metrics = computeTriggerMetrics(msgs)
               const state = supervisorLoadState(sessionID)
-              const lastUserMsg = msgs.find((msg) => msg.info.id === lastUser.id)
-              const promptText = messageText(lastUserMsg)
+              const promptText = messageText(lastUserOriginMsg)
               const classification = classifyTaskIntake({ userText: promptText })
               const explicitNoToolPrompt =
                 isTrivialNoToolPromptText(promptText) ||
@@ -2965,7 +3281,7 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                 const metrics = computeTriggerMetrics(msgs)
                 const lastAsst = msgs.findLast((m) => m.info.role === "assistant")
                 const lastAsstText = messageText(lastAsst)
-                const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")
+                const lastUserMsgForGoal = latestUserOriginMessage(msgs)
                 const currentTaskGoal = lastUserMsgForGoal ? messageText(lastUserMsgForGoal).slice(0, 500) : ""
                 const classification = classifyTaskIntake({ userText: currentTaskGoal })
                 if (shouldStopAfterTrivialNoToolAnswer({
@@ -2979,6 +3295,37 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                   evidenceWrite("supervisor.trivial_no_tool_finished", {
                     reason: "commander finished stateless/trivial answer; skip final/continuation gates for stateless answer",
                     path: "second-break",
+                  }, sessionID)
+                  break
+                }
+                const answerClassification = currentAnswerClassification({
+                  state,
+                  userMessageId: lastUserForDllAgent.id,
+                  fallback: classification,
+                })
+                if (canAcceptAnswerOnly({
+                  classification: answerClassification,
+                  metrics,
+                  state,
+                  messages: msgs,
+                })) {
+                  const accepted = acceptAnswerOnly({
+                    state,
+                    userMessageId: lastUserForDllAgent.id,
+                    assistantMessageId: lastAsst?.info.id,
+                    classification: answerClassification,
+                    evidenceRefs: [`assistant:${lastAsst?.info.id ?? "unknown"}`],
+                    reason: "answer-only task accepted on final path: no writes, no MCP, no high-risk or correction state",
+                  })
+                  supervisorSaveState(sessionID, accepted)
+                  evidenceWrite("answer.accepted", {
+                    user_message_id: lastUserForDllAgent.id,
+                    assistant_message_id: lastAsst?.info.id ?? null,
+                    mode: accepted.answer_delivery?.mode,
+                    public_answer_emitted: true,
+                    tool_summary: buildToolUseSummary(msgs),
+                    path: "second-break",
+                    reason: accepted.answer_delivery?.accepted_reason,
                   }, sessionID)
                   break
                 }
@@ -3085,17 +3432,40 @@ Continue execution or produce a blocked/partial report with evidence; do not cla
                     exhausted,
                   })
                   if (exhausted) {
+                    const closed = acceptPublicResponse({
+                      state,
+                      userMessageId: lastUserForDllAgent.id,
+                      assistantMessageId: lastAsst?.info.id,
+                      mode: answerModeFromClassification(answerClassification),
+                      status: "blocked",
+                      evidenceRefs: [`assistant:${lastAsst?.info.id ?? "unknown"}`],
+                      reason: "final gates exhausted retry budget; public blocked/partial response already emitted",
+                    })
+                    supervisorSaveState(sessionID, closed)
                     gatePendingHints.push(buildGateBlockSummary(blockReason, gateResult, state, true))
                     evidenceWrite("gate.retry_exhausted", {
                       block_reason: blockReason,
                       retries: state.gate_block_retries?.[blockReason],
                       path: "second-break",
+                      user_message_id: lastUserForDllAgent.id,
                     }, sessionID)
                     break
                   }
                   if (gateResult.synthetic_hint) gatePendingHints.push(gateResult.synthetic_hint)
                   continue
                 }
+                const closed = acceptPublicResponse({
+                  state,
+                  userMessageId: lastUserForDllAgent.id,
+                  assistantMessageId: lastAsst?.info.id,
+                  mode: answerModeFromClassification(answerClassification),
+                  status: "accepted",
+                  evidenceRefs: [`assistant:${lastAsst?.info.id ?? "unknown"}`],
+                  reason: "public response delivered after final runtime gates allowed loop exit",
+                  internalReviewAllowed: answerClassification.interaction_level === "L3" || answerClassification.interaction_level === "L4",
+                  councilAllowed: answerClassification.interaction_level === "L4",
+                })
+                supervisorSaveState(sessionID, closed)
               } catch {
                 // Gate error fallback to normal break
               }

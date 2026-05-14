@@ -9,10 +9,13 @@ import {
   buildCommandActivityExpandedLines,
   buildCommandActivityMiniLines,
   buildToolActivitySummary,
+  type CommandActivityEvent,
 } from "../../src/dll-agent/command-activity"
 
 const cleanupFiles: string[] = []
 const cleanupSessions: string[] = []
+const cleanupHomes: string[] = []
+const originalHome = process.env.HOME
 
 afterEach(() => {
   delete process.env.DLL_AGENT_EVIDENCE_FILE
@@ -20,6 +23,10 @@ afterEach(() => {
   for (const sid of cleanupSessions.splice(0)) {
     fs.rmSync(path.join(os.homedir(), ".dll-agent", "sessions", sid), { recursive: true, force: true })
   }
+  delete process.env.DLL_AGENT_CONFIG_ROOT
+  if (originalHome === undefined) delete process.env.HOME
+  else process.env.HOME = originalHome
+  for (const home of cleanupHomes.splice(0)) fs.rmSync(home, { recursive: true, force: true })
 })
 
 function sessionID() {
@@ -28,8 +35,16 @@ function sessionID() {
   return sid
 }
 
+function useTempHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "command-activity-home-"))
+  cleanupHomes.push(home)
+  process.env.HOME = home
+  process.env.DLL_AGENT_CONFIG_ROOT = path.join(home, ".dll-agent")
+}
+
 describe("command activity", () => {
   test("builds redacted command events from evidence and Result Ledger", () => {
+    useTempHome()
     const sid = sessionID()
     const evidenceFile = path.join(os.tmpdir(), `${sid}.jsonl`)
     cleanupFiles.push(evidenceFile)
@@ -101,6 +116,29 @@ describe("command activity", () => {
     expect(expanded.join("\n")).toContain("需要用户处理")
     expect(compact.every((line) => line.length <= 80)).toBe(true)
     expect(expanded.every((line) => line.length <= 120)).toBe(true)
+  })
+
+  test("aggregates repeated Param Incorrect events in command windows", () => {
+    const events: CommandActivityEvent[] = Array.from({ length: 12 }, (_, index) => ({
+      command_id: `param-${index}`,
+      timestamp: `2026-05-10T00:00:${String(index).padStart(2, "0")}.000Z`,
+      role: "system",
+      tool: "capability",
+      command_summary: "Param Incorrect",
+      status: "failed",
+      failure_type: "param_incorrect",
+      evidence_ref: `capability.actions@${index}`,
+      requires_user_action: false,
+      redaction_status: "redacted",
+    }))
+
+    const compact = buildCommandActivityMiniLines({ events: [...events], width: 120, limit: 4 })
+    const expanded = buildCommandActivityExpandedLines({ events: [...events], width: 160, limit: 10 })
+
+    expect(compact.join("\n")).toContain("Param Incorrect ×12")
+    expect(expanded.join("\n")).toContain("Param Incorrect ×12")
+    expect(compact.join("\n").match(/Param Incorrect/g)?.length).toBe(1)
+    expect(expanded.join("\n").match(/Param Incorrect/g)?.length).toBe(1)
   })
 
   test("summarizes live Read/Glob tool parts without command evidence", () => {

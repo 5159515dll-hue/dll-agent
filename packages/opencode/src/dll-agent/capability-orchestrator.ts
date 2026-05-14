@@ -15,7 +15,8 @@ import { mapAllBuiltins } from "./capability-mapping"
 import { getFullRegistry, snapshot, type RegistryMergeResult } from "./capability-registry"
 import { planCapabilities, type CapabilityGap, type CapabilityPlan, type TaskContext } from "./capability-planner"
 import { resolveAll, type ResolverDecision, type ResolverResult } from "./capability-resolver"
-import { cleanupStale, runtimeSummary, type CleanupResult } from "./capability-lifecycle"
+import { cleanupStale, type CleanupResult } from "./capability-lifecycle"
+import { runDiscovery, type DiscoveryResult } from "./capability-discovery"
 import { write as writeEvidence } from "./evidence"
 
 export const CAPABILITY_ORCHESTRATOR_VERSION = "1.0.0"
@@ -86,6 +87,7 @@ export interface CapabilityOrchestrationResult {
   unresolvedGaps: CapabilityGap[]
   blockedReasons: string[]
   cleanup?: CleanupResult
+  discovery?: DiscoveryResult
   systemSummary: string
 }
 
@@ -182,6 +184,16 @@ function actionFor(entry: CapabilityEntry, decision: ResolverDecision | undefine
   return { ...base, type: "blocked", auto_allowed: false }
 }
 
+function acquisitionActionForGap(gap: CapabilityGap): CapabilityAction {
+  return {
+    type: "ask_permission",
+    entry_id: `capability-gap:${gap.tag}`,
+    risk_level: "medium",
+    reason: `${gap.requirement}. Autonomous acquisition needs an approved source or manifest before download/install.`,
+    auto_allowed: false,
+  }
+}
+
 function buildMcpRequests(
   entries: CapabilityEntry[],
   input: CapabilityOrchestrationInput,
@@ -256,7 +268,7 @@ export function formatCapabilitySystemSummary(
 
 export function orchestrateCapabilities(input: CapabilityOrchestrationInput): CapabilityOrchestrationResult {
   const builtins = mapAllBuiltins(GLOBAL_DEFAULT_TOOLS, SKILL_REGISTRY)
-  const registry = getFullRegistry(builtins, input.projectDir)
+  let registry = getFullRegistry(builtins, input.projectDir)
   const taskContext: TaskContext = {
     user_goal: input.userGoal,
     file_extensions: fileExtensions(input.filesInvolved),
@@ -264,11 +276,19 @@ export function orchestrateCapabilities(input: CapabilityOrchestrationInput): Ca
     max_risk: input.maxRisk,
     platform: process.platform,
   }
-  const plan = planCapabilities(registry.entries, taskContext)
+  let plan = planCapabilities(registry.entries, taskContext)
+  let discovery: DiscoveryResult | undefined
+  if (plan.gaps.length > 0) {
+    discovery = runDiscovery(input.projectDir)
+    registry = getFullRegistry(builtins, input.projectDir)
+    plan = planCapabilities(registry.entries, taskContext)
+  }
   const entries = selectedEntries(plan)
   const resolver = resolveAll(entries)
   const decisions = resolverById(resolver)
-  const actions = entries.map((entry) => actionFor(entry, decisions.get(entry.id)))
+  const entryActions = entries.map((entry) => actionFor(entry, decisions.get(entry.id)))
+  const gapActions = plan.gaps.map(acquisitionActionForGap)
+  const actions = [...entryActions, ...gapActions]
   const mcpRequests = buildMcpRequests(entries, input, resolver)
   const skillIntents = [
     ...new Set([
@@ -281,6 +301,7 @@ export function orchestrateCapabilities(input: CapabilityOrchestrationInput): Ca
   const toolPromptTags = [...new Set(entries.map((entry) => entry.id))]
   const blockedReasons = [
     ...resolver.blocked.map((decision) => `${decision.entry_id}: ${decision.reason}`),
+    ...gapActions.map((action) => `${action.entry_id}: ${action.reason}`),
     ...mcpRequests
       .filter((request) => !request.auto_connect && request.requires_consent)
       .map((request) => `${request.entry_id}: ${request.reason}`),
@@ -308,6 +329,7 @@ export function orchestrateCapabilities(input: CapabilityOrchestrationInput): Ca
     unresolvedGaps: plan.gaps,
     blockedReasons,
     cleanup,
+    discovery,
   }
   const result: CapabilityOrchestrationResult = {
     ...withoutSummary,
@@ -323,6 +345,12 @@ export function orchestrateCapabilities(input: CapabilityOrchestrationInput): Ca
       mcp_requests: result.mcpRequests.map((m) => ({ name: m.name, auto_connect: m.auto_connect })),
       gaps: result.unresolvedGaps.map((g) => g.tag),
       blocked: result.blockedReasons,
+      discovery: result.discovery ? {
+        total: result.discovery.total,
+        new: result.discovery.new,
+        updated: result.discovery.updated,
+        by_source: result.discovery.by_source,
+      } : null,
     }, input.sessionID)
   }
 

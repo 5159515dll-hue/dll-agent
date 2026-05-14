@@ -63,6 +63,7 @@ Implemented runtime rules:
   - the intent result is stored in supervisor state and written as `intent.judgement` evidence, then supervisor routing consumes that classification instead of rescanning natural-language phrases;
   - L4 hard safety rules always win before model judgement and cannot be downgraded by consensus.
 - `read_only_answer` finalization applies to user-origin read-only engineering analysis/explanation categories, not to exact sentences. It suppresses task-completion-archivist, final-auditor, and executor auto-verifier only when there is no mutation request, no verification request, no failure, no correction, no reviewer block, no doctor failure, no multimodal input, and no high-risk signal.
+- Answer Delivery lifecycle separates public answer delivery from internal governance. For L0/L1/L2 answer-only tasks, the first accepted assistant response writes `answer_delivery.status=accepted`, `public_answer_emitted=true`, and `public_followup_allowed=false`. Later reviewer/recovery/supervisor text may still be recorded as internal evidence when applicable, but it cannot create another user-visible summary for the same user message.
 - User-origin-only source filtering is mandatory. `/role-model-set`, `/role-models`, `/task-status`, TUI/status text, doctor reports, verification reports, reviewer outputs, fallback reviewer summaries, Result Ledger summaries, routing evidence summaries, rendered ContextHandoffPacket text, `<task_result>`, subtask resume text, model usage reports, and regression reports may be recorded as evidence/trajectory, but they cannot create user-origin routing triggers.
 - Policy manifests can extend deterministic intake rules without source changes:
   - global: `~/.dll-agent/config/task-intake-policy.jsonc`;
@@ -98,6 +99,30 @@ It never suppresses correctness-required review for:
 - high-risk provider/routing/gate/evidence/result-ledger/permission/model-switching work;
 - code modification, file analysis, command execution, or verification requests;
 - secrets, permission, or destructive-operation boundaries.
+
+## Answer Delivery Lifecycle
+
+`answer_delivery` is a public-output latch for tasks whose interaction level does
+not require engineering verification:
+
+- `stateless_answer`: L0 greeting/no-op chat.
+- `informational_answer`: L1 ordinary question/answer.
+- `read_only_answer`: L2 read-only engineering analysis or codebase explanation.
+
+The latch is accepted only when the runtime state is still answer-only: no write
+tools, no shell command execution, no MCP, no blocking tool failure, no mutation
+request, no explicit verification request, no user correction, no repeated
+failure, no reviewer block, no doctor failure, no multimodal input, and no
+high-risk signal. Read/Glob/List style tools are allowed for L2 because they are
+the evidence-gathering path for read-only analysis.
+
+Once accepted, dll-agent suppresses queued supervisor subtasks and auto-verifier
+work for the same user message. This prevents repeated public summaries such as
+commander answer, chief-engineer answer, recovery answer, and final answer. The
+internal multi-model mechanisms are not removed: L3/L4 work, user corrections,
+repeated failures, reviewer conflicts, missing evidence, permission boundaries,
+and high-risk changes still use requirements-inspector, chief-engineer,
+final-auditor, role-cross, recovery, Result Ledger, and final gates.
 
 ## Routing Evidence
 

@@ -301,7 +301,7 @@ test("custom provider with npm package", async () => {
   })
 })
 
-test("custom DeepSeek openai-compatible model defaults interleaved reasoning field", async () => {
+test("custom OpenAI-compatible reasoning models default interleaved reasoning field when required", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
       await Bun.write(
@@ -323,6 +323,10 @@ test("custom DeepSeek openai-compatible model defaults interleaved reasoning fie
                 },
                 "custom-model": {
                   name: "Custom Model",
+                },
+                "mimo-v2.5-pro": {
+                  name: "MiMo v2.5 Pro",
+                  reasoning: true,
                 },
               },
               options: {
@@ -355,6 +359,7 @@ test("custom DeepSeek openai-compatible model defaults interleaved reasoning fie
       expect(provider.models["deepseek-r1"].capabilities.interleaved).toEqual({ field: "reasoning_content" })
       expect(provider.models["deepseek-details"].capabilities.interleaved).toEqual({ field: "reasoning_details" })
       expect(provider.models["custom-model"].capabilities.interleaved).toBe(false)
+      expect(provider.models["mimo-v2.5-pro"].capabilities.interleaved).toEqual({ field: "reasoning_content" })
       expect(
         providers[ProviderID.make("custom-anthropic-provider")].models["deepseek-r1"].capabilities.interleaved,
       ).toBe(false)

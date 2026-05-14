@@ -10,6 +10,7 @@ export interface CommandActivityEvent {
   tool: string
   command_summary: string
   status: CommandActivityStatus
+  count?: number
   duration_ms?: number
   exit_code?: number
   failure_type?: string
@@ -207,6 +208,42 @@ export function buildCommandActivity(input: {
     .slice(-(input.maxEvents ?? 50))
 }
 
+function aggregateEventKey(event: CommandActivityEvent) {
+  return [
+    event.role,
+    event.tool,
+    event.status,
+    event.failure_type ?? "",
+    event.command_summary.trim().toLowerCase(),
+  ].join("\u0000")
+}
+
+function aggregateEvents(events: CommandActivityEvent[]) {
+  const groups = new Map<string, CommandActivityEvent>()
+  for (const event of events) {
+    const key = aggregateEventKey(event)
+    const existing = groups.get(key)
+    if (!existing) {
+      groups.set(key, { ...event, count: event.count ?? 1 })
+      continue
+    }
+    const count = (existing.count ?? 1) + (event.count ?? 1)
+    if (event.timestamp >= existing.timestamp) {
+      groups.set(key, {
+        ...event,
+        count,
+        evidence_ref: count > 1 ? `${event.evidence_ref} (+${count - 1})` : event.evidence_ref,
+        requires_user_action: existing.requires_user_action || event.requires_user_action,
+      })
+      continue
+    }
+    existing.count = count
+    existing.evidence_ref = count > 1 ? `${existing.evidence_ref} (+${count - 1})` : existing.evidence_ref
+    existing.requires_user_action = existing.requires_user_action || event.requires_user_action
+  }
+  return [...groups.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+}
+
 function durationText(value: number | undefined) {
   if (value === undefined) return ""
   if (value < 1_000) return ` ${Math.round(value)}ms`
@@ -215,6 +252,10 @@ function durationText(value: number | undefined) {
 
 function exitText(value: number | undefined) {
   return value === undefined ? "" : ` exit:${value}`
+}
+
+function countText(value: number | undefined) {
+  return value && value > 1 ? ` ×${value}` : ""
 }
 
 function statusText(value: CommandActivityStatus) {
@@ -247,9 +288,10 @@ export function buildCommandActivityMiniLines(input: {
       width,
     )
     : undefined
-  if (input.events.length === 0) return [summary ?? "暂无命令活动｜证据：不可用"]
-  const events = input.events.slice(-(input.limit ?? 4)).reverse().map((event) => truncate(
-    `${event.command_summary}：${statusText(event.status)}${durationText(event.duration_ms)}${exitText(event.exit_code)}｜${event.role}/${event.tool}｜${event.evidence_ref}`,
+  const aggregated = aggregateEvents(input.events)
+  if (aggregated.length === 0) return [summary ?? "暂无命令活动｜证据：不可用"]
+  const events = aggregated.slice(-(input.limit ?? 4)).reverse().map((event) => truncate(
+    `${event.command_summary}${countText(event.count)}：${statusText(event.status)}${durationText(event.duration_ms)}${exitText(event.exit_code)}｜${event.role}/${event.tool}｜${event.evidence_ref}`,
     width,
   ))
   return summary ? [summary, ...events] : events
@@ -263,7 +305,7 @@ export function buildCommandActivityExpandedLines(input: {
   limit?: number
 }) {
   const width = Math.max(24, input.width)
-  const ordered = input.events.slice().reverse()
+  const ordered = aggregateEvents(input.events).slice().reverse()
   const start = Math.max(0, input.offset ?? 0)
   const items = ordered.slice(start, start + (input.limit ?? 10))
   const summary = input.toolSummary && input.toolSummary.total > 0
@@ -274,7 +316,7 @@ export function buildCommandActivityExpandedLines(input: {
     : undefined
   if (items.length === 0) return [summary ?? "暂无命令活动｜证据：不可用"]
   const events = items.map((event, index) => truncate(
-    `${start + index + 1}. ${event.timestamp} ${statusText(event.status)} ${event.role}/${event.tool} ${event.command_summary}${durationText(event.duration_ms)}${exitText(event.exit_code)} 证据=${event.evidence_ref}${event.requires_user_action ? " 需要用户处理" : ""}`,
+    `${start + index + 1}. ${event.timestamp} ${statusText(event.status)} ${event.role}/${event.tool} ${event.command_summary}${countText(event.count)}${durationText(event.duration_ms)}${exitText(event.exit_code)} 证据=${event.evidence_ref}${event.requires_user_action ? " 需要用户处理" : ""}`,
     width,
   ))
   return summary ? [summary, ...events] : events

@@ -2,7 +2,7 @@
 
 Status: `Phase B2/C/D1/D2 implemented_runtime_verified` for controlled local-fixture acquisition flow.
 
-This system is the controlled path for future autonomous skill, MCP, tool, and software acquisition. Phase A defines the schema, risk classifier, audit packet shape, evidence hooks, and doctor checks. Phase B1 adds only a local fixture quarantine/sandbox/rollback substrate. Phase B2/C/D1/D2 add a static-download pipeline, mock final-auditor policy gate, fixture sandbox smoke, and MCP metadata discovery. This checkpoint does **not** download arbitrary external software, install real packages, execute downloaded content, start MCP, activate capabilities, read GitHub tokens, or call a live model.
+This system is the controlled path for autonomous skill, MCP, tool, and software acquisition. Phase A defines the schema, risk classifier, audit packet shape, evidence hooks, and doctor checks. Phase B1 adds the local fixture quarantine/sandbox/rollback substrate. Phase B2/C/D1/D2 add a static-download pipeline, mock final-auditor policy gate, fixture sandbox smoke, and MCP metadata discovery. Runtime capability planning now treats missing abilities as acquisition work: low-risk registered installs can proceed automatically through guarded project-local install/verify, unresolved gaps become explicit acquisition actions, and missing credentials request authorization instead of being silently skipped. This checkpoint still does **not** execute arbitrary downloaded content, start high-risk MCP, read GitHub tokens, activate unverified third-party code, or install globally.
 
 ## Risk Levels
 
@@ -31,10 +31,10 @@ Partial:
 
 Not implemented:
 
-- autonomous external download/install/start.
-- persistent MCP acquisition.
-- external registry fetch.
-- live user authorization flow for capability install.
+- arbitrary external software execution.
+- high-risk MCP start without user authorization.
+- external registry fetch with private tokens.
+- full interactive `/capability-*` command layer.
 
 ## Safety Rules
 
@@ -45,6 +45,9 @@ Not implemented:
 - R4 remains hard-blocked by deterministic policy.
 - Third-party skills are untrusted until manifest, checksum, and role allowlist pass.
 - Software installs must be project-local or sandbox-local unless explicitly authorized.
+- Missing skills/MCP/software must not be silently skipped: the runtime should use an existing registered capability, auto-install a low-risk project-local dependency, run local discovery for gaps, or surface an explicit authorization/acquisition action.
+- Skill lookup is metadata-driven rather than alias-driven: tool-style requests such as `id:tool` are resolved through tool/capability catalog fields (`id`, `name`, `skill_ref`, triggers, descriptions, prompt index/detail) and currently installed skill metadata. Adding a new tool should require catalog/manifest metadata, not a source-code alias table.
+- Capability planning is multi-capability by default: a task can select primary, support, validation, and fallback capabilities from registry metadata. The planner must not assume a single skill/MCP/software is sufficient when multiple available capabilities improve correctness or verification.
 
 ## Doctor
 
@@ -71,13 +74,13 @@ Implemented:
 
 Boundary:
 
-- no real external download;
-- no real npm/pip/brew install;
+- no arbitrary external download;
+- no global npm/pip/brew install;
 - no real GitHub release fetch;
 - no MCP start;
 - no Playwright start;
 - no live final-auditor call;
-- no capability activation;
+- no unverified third-party capability activation;
 - no global environment mutation.
 
 Rollback rules:
@@ -136,3 +139,18 @@ Implemented:
 Boundary: metadata only; no MCP install/start, no Docker, no npm install, no token read.
 
 Next phase requires explicit authorization before any real external GitHub raw URL download or low-risk package pilot.
+
+## Runtime Acquisition Behavior
+
+Implemented:
+
+- Registered low-risk missing dependencies use `auto_install` when the install strategy is project-local or otherwise policy-approved.
+- Missing token/key requirements become `ask_permission`, not `skip`, because the user must be told what authorization is needed.
+- Missing capabilities with no install strategy become acquisition/authorization work, not silent degrade.
+- Remaining capability gaps are represented as explicit `capability-gap:*` acquisition actions and evidence, so the UI/doctor can show why the task cannot proceed automatically yet.
+- When initial planning finds gaps, the orchestrator runs local discovery and replans before reporting the gap.
+
+Boundaries:
+
+- No install may use `sudo`, `brew`, global npm/pip, `curl | sh`, `git push`, release/upload, real browser profile, or unknown binaries.
+- R3 MCP/software still requires user authorization; R4 remains hard-blocked.

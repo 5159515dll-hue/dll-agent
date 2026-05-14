@@ -3,6 +3,7 @@ export type TaskKind =
   | "stateless_chat"
   | "informational"
   | "light_engineering_analysis"
+  | "artifact_editing"
   | "coding"
   | "debugging"
   | "verification"

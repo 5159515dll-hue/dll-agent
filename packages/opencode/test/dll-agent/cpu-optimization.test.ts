@@ -218,6 +218,21 @@ describe("sidebar modelSpend single-scan optimization", () => {
   })
 })
 
+// ─── User-origin routing source guard ───────────────────────────────────
+
+describe("session prompt user-origin guard", () => {
+  test("dll-agent finalization uses real user-origin messages instead of synthetic continuations", () => {
+    const sourcePath = path.join(import.meta.dir, "../../src/session/prompt.ts")
+    const source = fs.readFileSync(sourcePath, "utf8")
+
+    expect(source).toContain("function isSyntheticUserMessage")
+    expect(source).toContain("function latestUserOriginMessage")
+    expect(source).toContain("publicAnswerClosedForUser")
+    expect(source).toContain("lastUserForDllAgent.id")
+    expect(source).not.toContain('const lastUserMsgForGoal = [...msgs].reverse().find((m) => m.info.role === "user")')
+  })
+})
+
 // ─── Timer cleanup verification ─────────────────────────────────────────
 
 describe("timer cleanup verification", () => {
@@ -232,12 +247,12 @@ describe("timer cleanup verification", () => {
 // ─── Adaptive refresh: active vs idle rates ─────────────────────────────
 
 describe("adaptive refresh rates", () => {
-  test("supervisor panel uses 10s active / 30s idle", async () => {
+  test("supervisor panel uses 2s active / 30s idle", async () => {
     const sourcePath = path.join(import.meta.dir, "../../src/cli/cmd/tui/component/dll-agent-panel.tsx")
     const source = fs.readFileSync(sourcePath, "utf8")
-    // Should use idleAwareInterval with 10_000 and 30_000
+    // Should use idleAwareInterval with 2_000 and 30_000 so intent preflight is visible.
     expect(source).toContain("idleAwareInterval")
-    expect(source).toContain("10_000")
+    expect(source).toContain("2_000")
     expect(source).toContain("30_000")
   })
 
